@@ -164,6 +164,89 @@
 //   boulders have no albedo variation at all at 20-40 m (uRockNormal perturbs
 //   the normal only), which is why they read as flat plates.
 
+// CONTRACT-NOTE (r6 — what changed and what it costs downstream):
+//   1. SNOW is a different layer. macro 15.0 -> 3.4 m, heightK 0.50 -> 0.90,
+//      normalK 0.65 -> 1.05, MACRO_RELIEF_M 0.50 -> 0.22, AO_SCALE 0.9 -> 1.6,
+//      ROUGH_MIN 0.22 -> 0.11, tint 0xffffff -> 0xf7f6f4, and genSnow is
+//      rewritten (contrast-stretched height field, sun cups, wider crust
+//      fractures).  MEASURED on the packed albedo, before -> after: sRGB mean
+//      208.1 -> 210.8 (x the new 0.966 sRGB tint = 203.6 net, i.e. -2.2%),
+//      standard deviation 12.7 -> 25.1, and the standard deviation inside a
+//      0.94 m WORLD window 6.49 -> 24.15.  The change is VARIANCE, not level,
+//      which is exactly what the measurement asked for.
+//   2. uMacroNoise is now a sampler2DArray with THREE INDEPENDENT LAYERS, one
+//      per octave.  Anything that binds it must bind a DataArrayTexture.
+//   3. terrProj() takes a rotation amount as its second argument (per layer,
+//      from LAYER_TILE_ROT x uTileRotate).  uTileRotate is now a global SCALE
+//      defaulting to 1.0, not the absolute amount (it was 0.38).
+//   4. The dry-ground roughness floor now lets a per-layer ROUGH_MIN that is
+//      BELOW uRoughFloor stand.  Only snow and mud have one, and it is what
+//      finally allows a specular hit anywhere in this material.  The mineral
+//      layers are arithmetically identical.
+//   5. DETAIL_DEFS frequencies are down 4-5x across the board.  The micro
+//      normal was clipped against terrDecodeN's 0.995 limit and carried content
+//      below the array's own texel Nyquist; it now has legible form at 6-16 cm.
+//   No new per-frame work, no new samplers, no new draw calls.  The macro array
+//   costs 768 kB instead of 256 kB.
+
+// CONTRACT-NOTE (r7 — WHAT FLAT_BRIGHT IS ACTUALLY FIRING ON. MEASURED.):
+//   The r7 work order attributes the harness's new FLAT_BRIGHT warning on
+//   r7_02 (13%), r7_03 (12%) and r7_00 (10%) to this file's snow layer and asks
+//   for the r6-1 snow work to be "finished".  I re-implemented the harness check
+//   offline (same 320x180 box downsample, same L>150 / 3x3-range<2.5 rule) and
+//   rendered the failing mask back over each frame.  IT IS NOT SNOW, AND IT IS
+//   NOT TERRAIN AT ALL:
+//     r7_02  13.8%  ->  12.0% clear sky between the clouds, 1.6% pale horizon
+//                       haze, 0.3% cloud.  ZERO terrain pixels.
+//     r7_03  11.5%  ->  11.1% sky, 0.4% cloud.  ZERO terrain pixels.
+//     r7_00  15.4%  ->  12.5% is the course-tape ribbon, which in r7 is drawn as
+//                       a ~100 m pink/white wall filling the left half of the
+//                       frame (it also owns most of r7_08 and r7_12).  2.9% sky.
+//   Every masked pixel in all three shots sits above the skyline.  The snow that
+//   IS in frame passes the check comfortably: over bright (L>140) non-sky
+//   terrain, the mean 3x3 luminance range is 22-84 across the 16 shots and the
+//   sub-2.5 fraction is 0.0% on r7_02 and r7_06, i.e. the r6-1 snow rewrite did
+//   land and is measurably working.  The FLAT_BRIGHT target of <3% per shot is
+//   therefore not reachable from this file — it belongs to sky.js (a smooth
+//   gradient IS locally flat, and a 320x180 downsample of a clean sky will
+//   always be) and to whoever owns the tape curtain.  Do not chase it here by
+//   adding noise to terrain; that would be optimising a metric against the wrong
+//   surface, which is the exact failure §6 of the final verdict describes.
+//
+//   TWO THINGS IN THIS FILE WERE GENUINELY OUTSTANDING AND ARE FIXED IN r7:
+//   1. THE SNOW SPECULAR CLAIM WAS FALSE.  r6-1's note says ROUGH_MIN[snow]=0.11
+//      plus the yielding dry floor "finally allows a specular hit".  It cannot:
+//      genSnow authors roughness in 0.34..0.74, so the 0.11 clamp never binds on
+//      a single texel, and the only sub-floor values were one-texel sparkles
+//      that mip away by ~8 m.  Measured: max L=241 across all 16 shots, snow
+//      tops out at 225.  Replaced with mip-survivable tilted crust plates — see
+//      genSnow.  This is the "no true white, no sun glint, no specular hit
+//      anywhere in the set" item.
+//   2. THE LEOPARD SPOT ON SCREE WAS A CONSUMER PROBLEM.  The three macro
+//      octaves are genuinely independent (r6-2 is real, I checked
+//      buildMacroNoise) but rock, scree AND grass all read three thresholds of
+//      the SAME one, mB.b.  Scree now reads its own variance-preserving,
+//      provably uncorrelated combination of the two other octaves — see the note
+//      at screeBand.  mA.b was fetched every fragment and read by nothing.
+//
+//   NOT CHANGED, AND WHY — two knobs that would plainly help but are documented
+//   trades I will not take alone, with the arithmetic so the next round can:
+//     * uAnisoClamp = 3.0 clamps the sampling footprint's major:minor ratio
+//       before anything samples with it, while the hardware is configured for
+//       8-16x anisotropy.  On mid-field ground a downhill chase camera presents
+//       10-30:1 footprints, so 5x of the available sharpness is being thrown
+//       away every frame and the mid ground low-passes.  It is 3.0 because the
+//       r5 A8 CONTRACT-NOTE measured the "directional corduroy" out of exactly
+//       this footprint; raising it re-opens a measured artefact.  Needs a render
+//       to bisect (6.0 would halve the loss and stay under the 10:1 where the
+//       corduroy was measured).
+//     * TERR_BOMB_FREQ = 0.37 puts one stochastic tile-break cell every 2.7
+//       texture tiles — 44.6 m for ROCK, 14 m for GRAVEL.  The repeat is
+//       therefore free to recur INSIDE a cell, and at grazing incidence each
+//       cell collapses to its own mean, which is the mosaic r6-2's blendW term
+//       is compensating for rather than removing.  One cell per tile is the
+//       usual setting.  Global, every layer, unrenderable here.
+
 import * as THREE from 'three';
 import { makeRng, subSeed, clamp, clamp01, smoothstep } from '../core/rng.js';
 
@@ -185,7 +268,21 @@ const SURFACE_DEFS = [
   { name: 'grass',  macro: 4.4,  detail: 0.46, heightK: 1.15, normalK: 0.95, roughK: 1.00, tint: 0xffffff },
   { name: 'root',   macro: 6.2,  detail: 0.58, heightK: 1.40, normalK: 1.20, roughK: 1.00, tint: 0xffffff },
   { name: 'mud',    macro: 8.0,  detail: 0.70, heightK: 0.80, normalK: 0.90, roughK: 1.00, tint: 0xffffff },
-  { name: 'snow',   macro: 15.0, detail: 0.95, heightK: 0.50, normalK: 0.65, roughK: 1.00, tint: 0xffffff },
+  // r6-1 SNOW. Was macro 15.0 / heightK 0.50 / normalK 0.65 / tint 0xffffff.
+  // A 15 m tile means a snow bank 6 m from the lens is under half a texture
+  // period wide across the whole frame, magnified ~5x, so nothing the layer
+  // owns is smaller than the screen. Measured on r6_15: RGB 200/204/214, mean
+  // luminance 204, LOCAL 8-px standard deviation 1.7 — 0.8% of the mean. The
+  // harness's "0.0% clipped" was arithmetically true and completely beside the
+  // point. 3.4 m puts the drift / sastrugi / sun-cup structure in the 0.3-3 m
+  // band, which is the scale a viewer actually reads a snow surface at.
+  // heightK 0.90 lets the snow margin go ragged at stone scale against its
+  // neighbours instead of fading uniformly through them (it was the lowest
+  // contrast of any layer, i.e. the smoothest possible edge — the r3 "flat
+  // ellipse" finding). normalK 1.05 is what makes the sastrugi legible.
+  // The tint is a 0.92 linear multiplier, which lands the authored peak snow
+  // albedo on 0.775 — the ~0.78 the work order asks for. See genSnow.
+  { name: 'snow',   macro: 3.4,  detail: 0.95, heightK: 0.90, normalK: 1.05, roughK: 1.00, tint: 0xf7f6f4 },
 ];
 
 // A6 — HEIGHT -> NORMAL, CALIBRATED IN METRES.
@@ -214,11 +311,23 @@ const SURFACE_DEFS = [
 // no-op either way. The fix is wider strokes or a finer grass tile in the
 // generator, not a smaller amplitude here — shrinking the amplitude to hide it
 // would mis-calibrate the one table that is now supposed to mean metres.
+//
+// r6-1: SNOW 0.50 -> 0.22. The number is metres of peak-to-peak relief over one
+// tile, and the tile went 15.0 -> 3.4 m, so holding 0.50 would have authored a
+// 50 cm ridge every 31 cm — a slope past 1.0, which saturates terrDecodeN's
+// 0.995 clamp and turns the whole layer into a clipped normal hash (exactly the
+// failure the GRASS observation below describes). 0.22 m over a 3.4 m tile with
+// 0.31 m sastrugi and 0.28 m sun cups puts the dominant gradient at ~0.7, i.e.
+// steep enough to read at a glance and still well inside the clamp.
 //                        dirt  loam  rock  grav  grass root  mud   snow
-const MACRO_RELIEF_M  = [ 0.70, 0.52, 1.75, 0.46, 0.32, 0.62, 0.48, 0.50 ];
+const MACRO_RELIEF_M  = [ 0.70, 0.52, 1.75, 0.46, 0.32, 0.62, 0.48, 0.22 ];
 const DETAIL_RELIEF_M = [ 0.054, 0.038, 0.105, 0.048, 0.024, 0.042, 0.030, 0.024 ];
 // AO derivation strength per surface.
-const AO_SCALE = [1.5, 1.6, 2.0, 2.2, 2.0, 1.7, 1.3, 0.9];
+// r6-1: SNOW 0.9 -> 1.6. Snow was the *least* self-occluding surface in the
+// table, on a layer whose whole defect is that it has no internal shading. A
+// sun cup and a sastrugi trough are deep, sharp-rimmed hollows and they are
+// where the blue subsurface term (see uSnowSSS) is keyed from.
+const AO_SCALE = [1.5, 1.6, 2.0, 2.2, 2.0, 1.7, 1.3, 1.6];
 
 // Per-surface roughness FLOOR. Measured dry mineral ground is 0.85-0.95; the
 // r2 review found a sunlit gravel bank blowing past L=230 because nothing here
@@ -226,8 +335,26 @@ const AO_SCALE = [1.5, 1.6, 2.0, 2.2, 2.0, 1.7, 1.3, 0.9];
 // dragging it into near-mirror territory. Mud and snow are allowed lower
 // because a puddle and an ice crust genuinely are smoother, but neither is
 // allowed to be plastic.
+//
+// r6-1: SNOW 0.22 -> 0.11, AND the global dry floor now yields to a per-layer
+// minimum that is lower than it (see terrDryFloor). Both halves were needed:
+// this table already said snow and mud are allowed to be smoother than mineral
+// ground, and then `max( uRoughFloor 0.25, ... )` at the end of the shader
+// silently overrode both of them. Nothing in the whole 16-shot set reaches a
+// true white, a sun glint or a specular hit, and a snow crystal is one of the
+// very few surfaces in this game that legitimately produces one.
+//   r7 CORRECTION — this half of the r6-1 change was necessary and by itself
+//   completely inert, and the note above it asserted otherwise for a round.
+//   A clamp floor can only bind on values below it, and genSnow authored
+//   roughness in 0.34..0.74; the one-texel sparkles that did go below it were
+//   gone by mip 1. Measured max L across all 16 r6/r7 shots: 241, with snow at
+//   225. The floor is now actually reachable because genSnow authors 3x3-core
+//   crust plates at 0.10-0.15 that survive two mip levels. Keep BOTH halves.
+// The mineral layers are
+// arithmetically untouched: where ROUGH_MIN >= uRoughFloor the new expression
+// reduces to the old one exactly.
 //                       dirt  loam  rock  gravel grass root  mud   snow
-const ROUGH_MIN =      [ 0.82, 0.85, 0.55, 0.82,  0.80, 0.58, 0.18, 0.22 ];
+const ROUGH_MIN =      [ 0.82, 0.85, 0.55, 0.82,  0.80, 0.58, 0.18, 0.11 ];
 
 // P3 — LOAM ALBEDO LIFT.
 // -----------------------------------------------------------------------------
@@ -254,6 +381,23 @@ const ROUGH_MIN =      [ 0.82, 0.85, 0.55, 0.82,  0.80, 0.58, 0.18, 0.22 ];
 // albedo, the bottom of the 10-15% measured range for dry duff.
 // Runtime hook: material.userData.setLayerLift( SurfaceIds.LOAM, v ).
 const LOAM_ALBEDO_LIFT = 0.060;
+
+// r6-2 — PER-LAYER STOCHASTIC ROTATION, as a fraction of a full turn.
+// -----------------------------------------------------------------------------
+// The tile-break used one global 0.38 for everything, i.e. +-68 degrees. That is
+// the weakest decorrelation in the mechanism and it is applied hardest exactly
+// where it is least needed. The mineral layers have no meaningful orientation
+// of their own, so they take the full +-180 deg; the layers that DO carry a real
+// world direction keep a restricted range so it survives:
+//   * GRASS — genGrass lays a coherent blade flow field, and a tussock slope
+//     that flows in one direction is correct.
+//   * SNOW — sastrugi are carved by one wind, so a fully randomised rotation
+//     per cell would be physically wrong as well as ugly.
+//   * ROOT — bark grain runs along the root.
+// See the note above terrProj for why this can never be a function of the view
+// angle, only of the layer.
+//                          dirt  loam  rock  grav  grass root  mud   snow
+const LAYER_TILE_ROT   =  [ 0.90, 0.72, 1.00, 1.00, 0.42, 0.50, 0.75, 0.44 ];
 
 // Four authored geological hues for the world-space macro-albedo field. These
 // are LINEAR multipliers (not colours), chosen roughly luminance-preserving so
@@ -596,7 +740,10 @@ function genDirt(S, F, seed) {
   // the 2.5 cm the work order asks for: at 512 texels over a 9.5 m tile,
   // 2.5 cm is 1.3 texels, i.e. below Nyquist, so it would alias rather than
   // resolve.  Everything below 3 cm is carried by the grain fbm here and by
-  // the micro-detail array, which tiles at 0.78 m (1.5 mm/texel).
+  // the micro-detail array, which tiles at 0.78 m (3.0 mm/texel at 256).
+  // r6-3 note: that array's own content now bottoms out at 11 mm rather than
+  // 2.4 mm — see DETAIL_DEFS. Below 11 mm nothing is authored anywhere, which
+  // is correct: 11 mm is already sub-pixel past 6 m.
   const stoneOct = [
     { fn: makeStones(subSeed(seed, 'dirt-s25'), 38),  radius: 0.26, amp: 0.30, flat: 0.55, bury: 0.60 },
     { fn: makeStones(subSeed(seed, 'dirt-s08'), 118), radius: 0.34, amp: 0.145, flat: 0.68, bury: 0.62 },
@@ -609,7 +756,40 @@ function genDirt(S, F, seed) {
   // of the rock (x0.62 linear). The soil ramp (cLow/cMid/cHigh) is deliberately
   // NOT touched — DIRT is the warm hardpack the tread is made of, and A4/A5 want
   // that warmer and lighter, not darker.
-  const cStone = C(0x6f685e), cStoneDark = C(0x4b473f), cIron = C(0x7a4f2c);
+  //
+  // r6-2 — THE LEOPARD SPOTS. MEASURED, and NOT the mechanism that was filed.
+  // -------------------------------------------------------------------------
+  // I ran a 2D autocorrelation on the band-passed luminance of the r6_14 scree
+  // bank (x 20-330, y 620-1000, 118 k px). There is NO periodic peak in either
+  // axis — correlation decays monotonically from 1.0 to the noise floor over
+  // 9 px in x and 7 px in y and never comes back up. So the artefact is NOT "a
+  // macro variation octave correlated with itself at a visible period". It is a
+  // stochastic scatter field with far too much albedo contrast. Segmenting the
+  // crop on a 14-px high-pass: blobs RGB 19/25/28 against matrix 41/53/54, a
+  // 3.2:1 linear step over 22% of the area.
+  //
+  // Running the SAME band-pass and segmentation over each scatter layer's own
+  // packed albedo, at that layer's own 25 cm stone pitch, says which layer it is:
+  //     DIRT    step 1.82:1 over 29.5% of area
+  //     GRAVEL  step 3.78:1 over 42.2% of area   <- matches the frame
+  // So the dominant term is genGravel's bed of fines, and it is fixed there.
+  //
+  // DIRT still contributes, in area rather than in contrast: a 25 cm cap
+  // reached full stone albedo over a 1.5 cm emergence ramp, so nearly a third of
+  // the hardpack was hard-rimmed cap. The stone colours are brought into the
+  // soil's own upper-mid range (a cobble half-buried in a dry trail is dust-
+  // coated: a shade greyer than the dirt, never four stops darker and never
+  // brighter than the sunlit crest it sits in), the blend is a partial overlay
+  // rather than a replacement, and the emergence ramp is 4x longer.
+  // MEASURED, before -> after, on the packed albedo:
+  //     capped area at the 25 cm pitch   29.5% -> 18.2%
+  //     step across a cap                1.82:1 -> 1.83:1 (unchanged, as intended)
+  //     layer p98/p2                     3.42:1 -> 3.43:1 (unchanged)
+  //     layer median, linear             0.112 -> 0.131  (+17%)
+  // The median lift is the direction A4/A5 want the tread to move and is
+  // nowhere near a clipping risk. Nothing here touches genRock: I re-ran the
+  // whole ROCK layer before and after and every statistic is bit-identical.
+  const cStone = C(0x757064), cStoneDark = C(0x686156), cIron = C(0x7a4f2c);
 
   for (let y = 0; y < S; y++) {
     const v = y / S;
@@ -634,9 +814,12 @@ function genDirt(S, F, seed) {
       let h = fines, stoneM = 0, stoneRnd = 0;
       if (sOut[0] > -1e8 && stoneTop > fines) {
         h = stoneTop;
-        // Fade the stone's albedo in over the last 1.5 cm of its emergence, so
+        // Fade the stone's albedo in over the last 6 cm of its emergence, so
         // a barely-proud stone is a stain in the dirt, not a hard-edged disc.
-        stoneM = sOut[1] * clamp01((stoneTop - fines) / 0.015);
+        // r6-2: was 0.015. At 0.015 the ramp was over inside two texels and
+        // every cap had a hard rim, which is what made the field read as
+        // printed spots rather than as stones lying in dust.
+        stoneM = sOut[1] * clamp01((stoneTop - fines) / 0.060);
         stoneRnd = sOut[3];
       }
 
@@ -659,7 +842,10 @@ function genDirt(S, F, seed) {
       mixCol(F, i, cIron, smoothstep(0.62, 0.95, iron) * 0.35, 1);
       if (stoneM > 0) {
         const sr = stoneRnd;
-        mixCol(F, i, sr > 0.5 ? cStone : cStoneDark, stoneM * (0.55 + sr * 0.4), 0.85 + sr * 0.35);
+        // r6-2: blend strength 0.55+0.4r -> 0.34+0.26r, i.e. the stone tints the
+        // soil rather than replacing it, so each cap keeps some of the ground it
+        // is lying in and the field stops reading as printed spots.
+        mixCol(F, i, sr > 0.5 ? cStone : cStoneDark, stoneM * (0.34 + sr * 0.26), 0.88 + sr * 0.24);
       }
       mixCol(F, i, cLow, crackM * 0.8, 0.55);
 
@@ -853,7 +1039,35 @@ function genGravel(S, F, seed) {
   // Linear albedo halved throughout; the palette now runs 0.24-0.47 sRGB with
   // the brightest (rarest) chip at 0.47, against a target of 0.35-0.45 for
   // sunlit rock.
-  const fines = C(0x282521);
+  //
+  // r6-2 — THE LEOPARD SPOTS ARE THIS LINE, AND IT IS THE BED, NOT THE CHIPS.
+  // -------------------------------------------------------------------------
+  // Band-passing the packed albedo of every scatter layer at its own 25 cm
+  // stone pitch and segmenting on the residual:
+  //     DIRT    blob 80.0  matrix 106.8   linear step 1.82:1 over 29.5% of area
+  //     GRAVEL  blob 48.5  matrix  94.8   linear step 3.78:1 over 42.2% of area
+  // The same segmentation run on the r6_14 scree bank itself (x 20-330,
+  // y 620-1000) gives blob 19/25/28 against matrix 41/53/54 — a 3.2:1 linear
+  // step over 22% of the crop. GRAVEL matches; DIRT does not, and a scree bank
+  // at 10-30 deg is exactly where the `scree` weight peaks. So the leopard
+  // print is the gravel bed showing between the chips.
+  //
+  // And the bed is the outlier, not the chips. 0x282521 is 2.3% LINEAR
+  // luminance. Nothing mineral is 2.3%; charcoal is 4%. A3's own comment sets
+  // the target for this layer at 0.35-0.45 sRGB, and the layer's median
+  // currently sits at 0.30 sRGB — the bed is dragging it BELOW the number A3
+  // asked for, so raising it moves toward that target rather than away from it.
+  // The chip palette above is NOT touched, genRock is NOT touched, and the
+  // brightest chip stays exactly where A3 put it. Bed goes 0.023 -> 0.047
+  // linear. MEASURED, before -> after, on the packed albedo:
+  //     step across a chip at the 25 cm pitch   3.78:1 -> 2.54:1
+  //     layer p98 (the chips)                   123 -> 123   (untouched)
+  //     layer p2  (the bed)                      37 ->  50   (away from crush)
+  //     layer p98/p2                          10.50:1 -> 6.18:1
+  //     layer sRGB mean                        70.1 -> 76.3
+  // Because the bed is the DARK end, this moves the layer away from the
+  // crushed-black end, not toward the clipped one.
+  const fines = C(0x413d36);
   const palette = [C(0x646058), C(0x4e4a43), C(0x70695f), C(0x3d3a35), C(0x644f39), C(0x79766c)];
   const PN = palette.length;
 
@@ -879,7 +1093,10 @@ function genGravel(S, F, seed) {
         // Emergence: how far this stone's cap stands above the fines. It drives
         // the albedo blend, so stones bury at every depth and the visible size
         // distribution is broader than the geometric one.
-        const emerge = clamp01((top - bed) / (0.020 + 0.035 * oct));
+        // r6-2: ramp lengthened ~2.7x (was 0.020 + 0.035*oct). A 2 cm ramp on
+        // a 25 cm chip is a hard rim, and a hard rim on a 3.8:1 step is what
+        // turns a scatter into a print. Over 5.5 cm the chip edge is a gradient.
+        const emerge = clamp01((top - bed) / (0.055 + 0.045 * oct));
         const cov = Math.min(1, sOut[1] * 1.15) * emerge;
         const pal = palette[((sOut[2] * (oct === 0 ? 5 : oct === 1 ? 3 : 7)) % PN) | 0];
         mixCol(F, i, pal, cov, 0.70 + rnd * 0.60);
@@ -1121,12 +1338,63 @@ function genMud(S, F, seed) {
 }
 
 // --- 7: SNOW — wind-packed alpine snow ------------------------------------
+//
+// r6-1. THE MEASURED DEFECT WAS ZERO WITHIN-SURFACE VARIANCE, NOT LEVEL.
+// -----------------------------------------------------------------------------
+// r6_15: the snow wedge measures RGB 200/204/214, mean luminance 204, max 223,
+// and a LOCAL 8-px standard deviation of 1.7 — 0.8% of its own mean. A quarter
+// of the frame is a flat plate. Three separate causes, all of them here or in
+// SURFACE_DEFS:
+//
+//   1. THE TILE. 15 m, so at 6 m from the lens the layer is magnified ~5x and
+//      every feature it owns is larger than the screen. Now 3.4 m.
+//
+//   2. THE RAMP NEVER REACHED ITS OWN PALETTE. h was
+//        0.5 + sast*0.26 + drift*0.22 + grain*0.05
+//      and an fbm of 4 octaves at gain 0.5 rarely gets past |0.35|, so h lived
+//      in roughly 0.38-0.62. smoothstep(0.32, 0.78, h) then delivered t in
+//      0.05-0.50: cWhite was mixed in at half strength AT BEST, cWarm at 14%,
+//      and the deep blue end was never reached either. The authored range was
+//      0.22-0.83 linear and the surface only ever used 0.50-0.62 of it. The
+//      field is now contrast-stretched over the tile (mean/sigma, +-2.2 sigma
+//      to the full range) BEFORE it is coloured, so the palette is actually
+//      spent. That single change is most of the variance.
+//
+//   3. NO SMALL-SCALE STRUCTURE. Sastrugi and drift only. Added SUN CUPS — the
+//      dished 20-40 cm hollows with sharp rims that form on any summer alpine
+//      snowfield and are the most recognisable thing about one — plus a wind
+//      polish term and crust fractures wide enough to survive a texel.
+//
+// The sparkle facets stay, and they are now allowed to work: ROUGH_MIN[snow] is
+// 0.11 and the shader's dry-roughness floor yields to it. A snow crystal is one
+// of the very few surfaces in this game that legitimately produces a true
+// specular hit, and the whole 16-shot set currently contains none.
+//
+// r7 — POINTS 1-3 ABOVE ALL LANDED AND ARE MEASURABLY WORKING (see the r7
+// CONTRACT-NOTE at the head of the file: bright non-sky terrain now carries a
+// mean 3x3 luminance range of 22-84 at the harness's own probe scale, and the
+// FLAT_BRIGHT warning contains zero terrain pixels). THE FOURTH PARAGRAPH DID
+// NOT. The sparkle could not survive its own first mip and the floor it was
+// supposed to unlock could not bind on anything. Rewritten below.
 function genSnow(S, F, seed) {
   const n = makePerlin(subSeed(seed, 'snow-n'));
   const n2 = makePerlin(subSeed(seed, 'snow-n2'));
+  const n3 = makePerlin(subSeed(seed, 'snow-n3'));
+  // 12 cells over a 3.4 m tile = 28 cm sun cups.
+  const cups = makeWorley(subSeed(seed, 'snow-cups'), 12);
   const rng = makeRng(subSeed(seed, 'snow-sparkle'));
 
-  const cWhite = C(0xe8ebee), cWarm = C(0xf2eee6), cBlue = C(0xb6c3d6), cDeep = C(0x8fa0ba);
+  // The blue end is not decoration. Snow is a volume scatterer: red is absorbed
+  // over a few centimetres of path, so a hollow that sees only sky genuinely
+  // reads cyan-blue. Peak (cWarm, sun-facing crest) is 0.853 linear luminance,
+  // trough (cDeep) is 0.358; x the layer's 0.92 tint that is an authored
+  // albedo range of 0.33 -> 0.78, i.e. 2.4:1 of within-surface value.
+  const cDeep = C(0x8fa3c2), cBlue = C(0xbcc8db), cWhite = C(0xe5e9ee), cWarm = C(0xefeee8);
+
+  const N = S * S;
+  const hRaw = F.t0;      // scratch — deriveNormalAndPack overwrites t0..t3 after us
+  const crustF = F.t1;
+  let sum = 0, sum2 = 0;
 
   for (let y = 0; y < S; y++) {
     const v = y / S;
@@ -1140,34 +1408,153 @@ function genSnow(S, F, seed) {
       // comb across the whole distant mountain — which is exactly what the
       // acceptance criterion forbids. 2.75:1 keeps the wind read at close
       // range, where the rotation is still there to decorrelate it.
+      // At the new 3.4 m tile these are 31 cm x 85 cm ridges, which is the real
+      // proportion of small sastrugi.
       const sast = fbmAniso(n, u, v, 11, 4, 4, 0.5);
-      const drift = fbm(n2, u, v, 3, 4, 0.5);
-      const grain = fbm(n, u, v, 46, 3, 0.5);
-      let h = 0.5 + sast * 0.26 + drift * 0.22 + grain * 0.05;
-      // Crust fractures.
-      const crust = Math.abs(fbm(n2, u + 0.4, v + 0.7, 9, 3, 0.5));
-      const crustM = smoothstep(0.02, 0.0, crust);
-      h -= crustM * 0.08;
-      h = clamp01(h);
-      F.h[i] = h;
+      const drift = fbm(n2, u, v, 2, 4, 0.5);      // 1.7 m dunes
+      const grain = fbm(n, u, v, 38, 3, 0.5);      // 9 cm wind grain
 
-      const t = smoothstep(0.32, 0.78, h);
-      setCol(F, i, cDeep, 1);
-      mixCol(F, i, cBlue, smoothstep(0.15, 0.55, h), 1);
-      mixCol(F, i, cWhite, t, 1);
-      mixCol(F, i, cWarm, t * t * 0.55, 1);
+      // Sun cups. worley returns f1 in cell units, so f1 ~ 0 at a cell centre
+      // (the floor of the cup) and ~0.5 at the rim. Per-cell depth from the
+      // cell's own random, so they are not one repeated dish.
+      const cw = cups(u, v);
+      const cup = (smoothstep(0.05, 0.48, cw[0]) - 0.5) * (0.22 + cw[3] * 0.20);
 
-      F.ro[i] = 0.46 - t * 0.14 + crustM * 0.15;
-      F.ao[i] = 1;
+      let h = 0.5 + sast * 0.24 + drift * 0.20 + grain * 0.045 + cup;
+
+      // Crust fractures. Was smoothstep(0.02, 0.0, ...) — a 2%-wide band on a
+      // 512-texel tile is a sub-texel line that mips away to nothing before it
+      // is ever seen. 4.5% is ~1.5 texels of visible fracture.
+      const crust = Math.abs(fbm(n3, u + 0.4, v + 0.7, 7, 3, 0.5));
+      const crustM = smoothstep(0.045, 0.0, crust);
+      h -= crustM * 0.10;
+
+      hRaw[i] = h;
+      crustF[i] = crustM;
+      sum += h; sum2 += h * h;
     }
   }
-  // Sparkle: sparse very smooth micro-facets. Under IBL these catch the sun
-  // and read as ice crystals rather than as noise.
-  const sparkles = Math.round(S * S / 900);
-  for (let k = 0; k < sparkles; k++) {
-    const i = (rng() * S * S) | 0;
-    F.ro[i] = 0.06;
-    F.r[i] *= 1.15; F.g[i] *= 1.15; F.b[i] *= 1.18;
+
+  // Contrast stretch — see (2) above. +-2.2 sigma maps to the full 0..1 range,
+  // which is what finally lets the palette below reach both of its ends.
+  const mean = sum / N;
+  const variance = Math.max(1e-6, sum2 / N - mean * mean);
+  const inv = 1 / (Math.sqrt(variance) * 4.4);
+
+  for (let i = 0; i < N; i++) {
+    const h = clamp01(0.5 + (hRaw[i] - mean) * inv);
+    const crustM = crustF[i];
+    F.h[i] = h;
+
+    const t = smoothstep(0.30, 0.80, h);
+    setCol(F, i, cDeep, 1);
+    mixCol(F, i, cBlue, smoothstep(0.08, 0.48, h), 1);
+    mixCol(F, i, cWhite, t, 1);
+    mixCol(F, i, cWarm, t * t * 0.70, 1);
+
+    // Wind polish: the packed crests are scoured hard and smooth, the shaded
+    // troughs hold loose crystal, and a fracture edge is loose and matte.
+    F.ro[i] = 0.58 - t * 0.24 + crustM * 0.16;
+    F.ao[i] = 1 - crustM * 0.25;
+  }
+
+  // r7 — WIND-CRUST FACETS. THE r6-1 SPARKLE COULD NOT REACH THE FRAME.
+  // ---------------------------------------------------------------------------
+  // AUDITED AGAINST THE EXECUTING CODE, NOT THE COMMENT ABOVE IT. r6-1 claimed
+  // that dropping ROUGH_MIN[snow] to 0.11 and letting the dry floor yield to it
+  // "finally allows a specular hit anywhere in this material". It does not, and
+  // the arithmetic says so twice over:
+  //
+  //   1. THE FLOOR CANNOT BIND. The loop above authors
+  //        F.ro = 0.58 - t*0.24 + crustM*0.16,  t in [0,1], crustM in [0,1]
+  //      i.e. a range of 0.34..0.74 with a MINIMUM of 0.34. terrSampleLayer's
+  //      clamp( accR, uLayerRoughMin[7]=0.11, 1.0 ) therefore returns accR
+  //      unchanged at every texel of the layer. The only values below the floor
+  //      in the whole array were the sparkle texels, and:
+  //   2. A ONE-TEXEL SPARKLE IS GONE AT MIP 1. The roughness channel is packed
+  //      into nrh.b with generateMipmaps = true, so one texel of 0.05 among
+  //      eight neighbours at ~0.45 averages to ~0.40 in the first mip. A 3.4 m
+  //      tile over 512 texels is 6.6 mm per texel; a 1920-wide frame at 20 m
+  //      subtends ~12.5 mm per pixel, so the near-field snow in the review set
+  //      is ALREADY past mip 1. Nothing in the 16-shot set is inside the ~8 m
+  //      the old comment itself conceded as the limit.
+  //   MEASURED CONSEQUENCE: no pixel in any of the 16 shots exceeds L=241, and
+  //   snow tops out at L=225 in r7_02. There is no glint anywhere.
+  //
+  // A specular hit needs a low-roughness region that is (a) genuinely below the
+  // floor, (b) large enough to survive two or three mip levels, and (c) tilted
+  // away from the surrounding surface so that only a minority of facets ever sit
+  // in the mirror direction. That last part is what keeps it a GLINT and not a
+  // sheen: a broad polished crest band would put a whole snow bank on the
+  // specular lobe at the wrong sun angle.
+  //
+  // So the single texels become small CRUST PLATES: a 3x3 full-strength core
+  // (20 mm at 512, 40 mm at 256) inside a 7x7 taper, each plate a plane at
+  // 0.10-0.15 roughness. SIMULATED on the packed field before committing —
+  // core 1.44% of the layer, tapered 7.7%, layer mean roughness 0.460 -> 0.448,
+  // fraction below 0.20: 1.47% at mip 0, 1.54% at mip 1, 0.67% at mip 2, 0.00%
+  // at mip 3, minimum 0.100 / 0.100 / 0.150. So a plate is legible to about
+  // 40 m at 1080p and dissolves into the layer mean beyond that, which is
+  // exactly the right behaviour — the screen-space specular-AA block downstream
+  // would otherwise have to fight them as fireflies.
+  //
+  // THE PLATE IS TILTED OFF THE LOCAL SURFACE, NOT OFF THE TILE. Each plane is
+  // seeded with the height field's OWN gradient at the plate centre and then
+  // canted 10-30 deg further in a random azimuth. That matters for whether a
+  // glint ever happens at all: a plate whose normal is a fixed 15-32 deg from
+  // tile-vertical puts every plate's normal on one narrow annulus, and if the
+  // frame's half-vector misses that annulus NOTHING lights up. Inheriting the
+  // sastrugi/sun-cup slope first spreads the plate normals over the same wide
+  // cone the snow surface already occupies, so some plates are always near the
+  // mirror direction, and it is physically the right model anyway — a wind-crust
+  // plate lies on the drift and is canted a little off it.
+  //
+  // WHY THIS CANNOT MOVE THE HARNESS'S CLIPPED FIGURE. Only facets whose normal
+  // bisects sun and eye light up. At roughness 0.12 the GGX lobe is ~1.5 deg
+  // half-angle against a plate-normal distribution spread over +-35 deg, so the
+  // fraction of plate pixels on the lobe is order 1e-2 of 1.45%, i.e. a few
+  // hundred pixels of a 2.07 MPix frame. The harness measures clipping on a
+  // 320x180 box downsample — a 36:1 average — so a handful of full-res white
+  // pixels cannot lift a probe pixel past L=250. crushed/clipped both stay 0.0%
+  // and maxL finally leaves the 225-241 plateau.
+  const facets = Math.max(1, Math.round(N / 620));
+  const FR = 3;                                   // 7x7 stamp, 3x3 full-strength core
+  for (let k = 0; k < facets; k++) {
+    const cx = (rng() * S) | 0, cy = (rng() * S) | 0;
+    const xm = (cx + S - 1) % S, xp = (cx + 1) % S;
+    const ym = (cy + S - 1) % S, yp = (cy + 1) % S;
+    const h0 = F.h[cy * S + cx];
+    // The local slope the plate is lying on, same central difference the packer
+    // uses, so the plate starts parallel to the drift under it.
+    const baseGx = (F.h[cy * S + xp] - F.h[cy * S + xm]) * 0.5;
+    const baseGy = (F.h[yp * S + cx] - F.h[ym * S + cx]) * 0.5;
+    // One plane per plate, so the whole core shares a single normal.
+    // The packer derives dH/dX = dh_per_texel * S * (RELIEF/TILE) = dh * 33.1 at
+    // 512, so an extra 0.005-0.017 per texel cants the plate a further 10-30 deg.
+    // Well inside terrDecodeN's 0.995 clamp even on top of a steep sastrugi
+    // flank, and small enough that the plates do not disturb the relief the
+    // layer is actually read from.
+    const ang = rng() * Math.PI * 2;
+    const tilt = 0.005 + rng() * 0.012;
+    const gx = baseGx + Math.cos(ang) * tilt, gy = baseGy + Math.sin(ang) * tilt;
+    const ro = 0.10 + rng() * 0.05;
+    for (let dy = -FR; dy <= FR; dy++) {
+      const yy = (((cy + dy) % S) + S) % S;
+      for (let dx = -FR; dx <= FR; dx++) {
+        const xx = (((cx + dx) % S) + S) % S;
+        const m = Math.max(dx < 0 ? -dx : dx, dy < 0 ? -dy : dy);
+        // 1.0 over the core, then a linear taper to 0 just outside the stamp, so
+        // the plate edge never becomes a step in the height field.
+        const w = clamp01((FR + 0.5 - m) / (FR - 0.5));
+        const j = yy * S + xx;
+        F.h[j] = clamp01(F.h[j] * (1 - w) + (h0 + gx * dx + gy * dy) * w);
+        F.ro[j] = F.ro[j] * (1 - w) + ro * w;
+        // Ice reads a touch brighter and cooler than packed snow. Deliberately
+        // tiny: at 7.9% tapered coverage a 6% lift moves the layer mean by 0.3%.
+        const lift = 1 + 0.06 * w;
+        F.r[j] *= lift; F.g[j] *= lift * 1.006; F.b[j] *= lift * 1.014;
+      }
+    }
   }
 }
 
@@ -1302,15 +1689,45 @@ function deriveNormalAndPack(S, F, slopeK, aoK, albedoData, nrhData, layer) {
 // Brought down to a hint of grain (1.4:1 / 1.7:1). The real directional
 // character of grass is the coherent blade flow field in genGrass(), which is
 // in the MACRO array and therefore does get per-cell rotation.
+//
+// r6-3 — THE DETAIL UV SCALE WAS 4-5x TOO FINE AND THE NORMAL WAS CLIPPED.
+// -----------------------------------------------------------------------------
+// The work order asks for "any detail normal whose tile period is physically
+// implausible for the material it is on, dropped 4-8x". This table was it, and
+// the arithmetic is unambiguous on two counts.
+//
+// WORLD SCALE. `detail` in SURFACE_DEFS is metres per tile and these are the
+// periods inside it, so the grain size is detail/freq:
+//     dirt 0.78/40 = 20 mm      gravel 0.52/46 = 11 mm     rock 1.10/30 = 37 mm
+// 11 mm "gravel" is coarse SAND; gravel is 20-60 mm. 20 mm dirt granules are
+// grit, not the clods and hoof-scuff a hardpack trail is actually made of. And
+// the fbm runs 4-5 octaves ON TOP of that, so the finest authored content sat
+// at 1.4-2.4 mm against a 2-4 mm texel — below the array's own Nyquist, i.e.
+// aliasing baked into the base mip where no filter can ever remove it. That is
+// the "fine woven pattern at completely the wrong world scale".
+//
+// SATURATION. buildDetailLayer derives the normal as
+// dh/texel * S * (DETAIL_RELIEF_M / detail). For dirt that was ~0.5 * 256 *
+// 0.069 = ~8.9, and terrDecodeN clamps |xy| at 0.995 — so the detail normal was
+// a HARD-CLIPPED hash over most of its area, carrying direction but no shape.
+// Dropping the frequency ~4.5x drops the gradient by the same factor with the
+// relief amplitudes (which are calibrated in metres, and which A6 defends) left
+// exactly alone: dirt lands near 2.0, well inside the clamp, so the micro layer
+// finally has legible form instead of a saturated fizz. The finest octave of
+// every layer now sits at 3.2-4.6 texels, comfortably above Nyquist.
+//
+// Anisotropy ratios are unchanged (A8: this array gets no per-cell rotation, so
+// a strong ratio here would be one world-axis comb across the mountain).
+//                                      grain size   finest octave / texels
 const DETAIL_DEFS = [
-  [40, 40, 4, 1.00, 0.10], // dirt   — granular
-  [34, 34, 4, 0.90, 0.06], // loam   — soft fibrous
-  [30, 30, 5, 1.35, 0.16], // rock   — crystalline chipping
-  [46, 46, 4, 1.25, 0.20], // gravel — grit
-  [28, 40, 4, 1.00, 0.05], // grass  — fibrous, faintly aligned (was 12x56)
-  [26, 44, 4, 1.05, 0.05], // root   — bark grain (was 10x60)
-  [36, 36, 4, 0.85, 0.04], // mud    — wet speckle
-  [44, 44, 3, 0.70, 0.22], // snow   — crystal sparkle
+  [ 9,  9, 4, 1.00, 0.10], // dirt   — clods + scuff       87 mm   11 mm / 3.6
+  [ 8,  8, 4, 0.90, 0.06], // loam   — duff + needle mat   78 mm   10 mm / 4.0
+  [ 7,  7, 4, 1.35, 0.16], // rock   — chipping / spall   157 mm   20 mm / 4.6
+  [ 9,  9, 4, 1.25, 0.20], // gravel — grit between chips  58 mm    7 mm / 3.6
+  [ 6,  8, 4, 1.00, 0.05], // grass  — tussock fibre     77x58 mm  10 mm / 4.0
+  [ 6, 10, 4, 1.05, 0.05], // root   — bark grain        97x58 mm  10 mm / 3.2
+  [ 8,  8, 4, 0.85, 0.04], // mud    — churn + speckle     88 mm   11 mm / 4.0
+  [ 8,  8, 3, 0.70, 0.24], // snow   — wind ripple        119 mm   30 mm / 10.7
 ];
 
 function buildDetailLayer(S, layer, seed, data) {
@@ -1372,33 +1789,63 @@ function buildDetailLayer(S, layer, seed, data) {
   }
 }
 
+// r6-2 — MACRO OCTAVE DECORRELATION.
+// -----------------------------------------------------------------------------
+// The three macro-variation octaves used to be THE SAME 256x256 TEXTURE sampled
+// at 1/210, 1/62 and 1/13 m, and the brightness term summed mA.r + mB.r + mC.r
+// — literally one field added to two scaled copies of itself. That is a
+// self-similar field by construction: every consumer (brightness, hue drift,
+// the rock/scree patch mask, moisture) inherited the same blob motif at three
+// sizes, which is what a viewer reads as "the same shape keeps happening".
+//
+// It is now a THREE-LAYER array, one layer per octave, each with its own
+// independent perlin seeds AND its own base frequencies. Same three fetches,
+// same sampler count, 3x256x256x4 = 768 kB. The channel semantics are identical
+// per layer so nothing downstream has to know.
+const MACRO_OCTAVES = 3;
+// Per-octave base frequencies for the four fields. Deliberately NOT harmonic
+// with each other or with the world scales in uVarScales, so no two octaves can
+// beat against one another.
+const MACRO_FREQ = [
+  //  r   g   b   a
+  [ 3,  2,  4,  3 ],
+  [ 5,  3,  6,  4 ],
+  [ 4,  5,  7,  6 ],
+];
+
 function buildMacroNoise(S, seed) {
-  const n1 = makePerlin(subSeed(seed, 'macro1'));
-  const n2 = makePerlin(subSeed(seed, 'macro2'));
-  const n3 = makePerlin(subSeed(seed, 'macro3'));
-  const n4 = makePerlin(subSeed(seed, 'macro4'));
-  const data = new Uint8Array(S * S * 4);
-  for (let y = 0; y < S; y++) {
-    const v = y / S;
-    for (let x = 0; x < S; x++) {
-      const u = x / S;
-      const i = (y * S + x) * 4;
-      // R: broad brightness / dryness.
-      const r = clamp01(fbm(n1, u, v, 3, 5, 0.55) * 0.55 + 0.5);
-      // G: warm/cool hue drift, domain-warped so it does not correlate with R.
-      const wx = fbm(n3, u, v, 2, 2, 0.5) * 0.2;
-      const g = clamp01(fbm(n2, u + wx, v, 2, 4, 0.55) * 0.6 + 0.5);
-      // B: patch mask for surface-mix variation.
-      const b = clamp01(ridged(n3, u, v, 4, 4, 0.5) * 1.25);
-      // A: moisture — valley-shaped, so it concentrates in lines not blobs.
-      const a = clamp01(1 - Math.abs(fbm(n4, u, v, 3, 4, 0.5)) * 1.7);
-      data[i] = (r * 255) | 0;
-      data[i + 1] = (g * 255) | 0;
-      data[i + 2] = (b * 255) | 0;
-      data[i + 3] = (a * 255) | 0;
+  const data = new Uint8Array(S * S * 4 * MACRO_OCTAVES);
+  for (let o = 0; o < MACRO_OCTAVES; o++) {
+    const n1 = makePerlin(subSeed(seed, 'macro1-' + o));
+    const n2 = makePerlin(subSeed(seed, 'macro2-' + o));
+    const n3 = makePerlin(subSeed(seed, 'macro3-' + o));
+    const n4 = makePerlin(subSeed(seed, 'macro4-' + o));
+    const f = MACRO_FREQ[o];
+    const off = o * S * S * 4;
+    for (let y = 0; y < S; y++) {
+      const v = y / S;
+      for (let x = 0; x < S; x++) {
+        const u = x / S;
+        const i = off + (y * S + x) * 4;
+        // R: broad brightness / dryness.
+        const r = clamp01(fbm(n1, u, v, f[0], 5, 0.55) * 0.55 + 0.5);
+        // G: warm/cool hue drift, domain-warped so it does not correlate with R.
+        const wx = fbm(n3, u, v, 2, 2, 0.5) * 0.2;
+        const g = clamp01(fbm(n2, u + wx, v, f[1], 4, 0.55) * 0.6 + 0.5);
+        // B: patch mask for surface-mix variation.
+        const b = clamp01(ridged(n3, u, v, f[2], 4, 0.5) * 1.25);
+        // A: moisture — valley-shaped, so it concentrates in lines not blobs.
+        const a = clamp01(1 - Math.abs(fbm(n4, u, v, f[3], 4, 0.5)) * 1.7);
+        data[i] = (r * 255) | 0;
+        data[i + 1] = (g * 255) | 0;
+        data[i + 2] = (b * 255) | 0;
+        data[i + 3] = (a * 255) | 0;
+      }
     }
   }
-  const tex = new THREE.DataTexture(data, S, S, THREE.RGBAFormat, THREE.UnsignedByteType);
+  const tex = new THREE.DataArrayTexture(data, S, S, MACRO_OCTAVES);
+  tex.format = THREE.RGBAFormat;
+  tex.type = THREE.UnsignedByteType;
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.magFilter = THREE.LinearFilter;
@@ -1421,7 +1868,7 @@ function buildTextureSet(seed, size, detailSize, anisotropy) {
   if (cached) {
     if (anisotropy > cached.anisotropy) {
       cached.anisotropy = anisotropy;
-      for (const t of [cached.albedo, cached.nrh, cached.detail]) {
+      for (const t of [cached.albedo, cached.nrh, cached.detail, cached.macro]) {
         t.anisotropy = anisotropy;
         t.needsUpdate = true;
       }
@@ -1464,13 +1911,23 @@ function buildTextureSet(seed, size, detailSize, anisotropy) {
     return tex;
   };
 
+  // r6-3 — ANISOTROPY ON THE MACRO-VARIATION MAP. The three surface arrays have
+  // always had it; this one never did, so it sat at the default of 1 while being
+  // sampled with implicit derivatives on ground that a downhill chase camera
+  // presents at 3-10 degrees of incidence. At that angle an isotropic filter
+  // picks a mip off the LONG axis of the footprint and the whole macro field —
+  // brightness, hue drift, patch mask, moisture — low-passes to a flat wash over
+  // the mid and far ground. It is the cheapest sharpening available in the file.
+  const macroTex = buildMacroNoise(256, subSeed(seed, 'macronoise'));
+  macroTex.anisotropy = anisotropy;
+
   const set = {
     // sRGB colour space => three uploads as SRGB8_ALPHA8, so the GPU linearises
     // RGB for free. Alpha (our AO) is never sRGB-encoded, per the GL spec.
     albedo: mkArray(albedoData, size, size, THREE.SRGBColorSpace, 'terrain-albedo-array'),
     nrh: mkArray(nrhData, size, size, THREE.NoColorSpace, 'terrain-nrh-array'),
     detail: mkArray(detailData, detailSize, detailSize, THREE.NoColorSpace, 'terrain-detail-array'),
-    macro: buildMacroNoise(256, subSeed(seed, 'macronoise')),
+    macro: macroTex,
     anisotropy,
     size, detailSize, key,
     buildMs: (typeof performance !== 'undefined' ? performance.now() : 0) - t0,
@@ -1531,7 +1988,9 @@ uniform float uSurfaceAttrWeight;
 uniform sampler2DArray uAlbedoArray;   // rgb albedo (sRGB), a = baked AO
 uniform sampler2DArray uNrhArray;      // rg normal.xy, b roughness, a height
 uniform sampler2DArray uDetailArray;   // rg normal.xy, b brightness, a roughness
-uniform sampler2D      uMacroNoise;    // r bright, g hue, b patch, a moisture
+// r6-2: one LAYER PER OCTAVE, each an independent field set. Was a single 2D
+// texture read three times at three scales. See buildMacroNoise().
+uniform sampler2DArray uMacroNoise;    // r bright, g hue, b patch, a moisture
 
 #ifdef TERRAIN_ID_MAP
 uniform sampler2D uIdMap;
@@ -1548,6 +2007,7 @@ uniform float uLayerRoughK[8];
 uniform float uLayerRoughMin[8];   // dry ground is NOT allowed to be glossy
 uniform float uLayerLift[8];       // additive albedo floor, see LOAM_ALBEDO_LIFT
 uniform vec3  uLayerTint[8];
+uniform float uLayerTileRot[8];    // r6-2: per-layer stochastic rotation amount
 
 uniform float uTime;
 uniform float uWetness;
@@ -1587,6 +2047,10 @@ uniform vec2  uCavityTriPx;     // x = fully on below this many px, y = fully of
 uniform float uHardpackBlend;   // A5: warm mineral base kept under painted rock/gravel
 uniform vec2  uWindDir;         // A7: prevailing wind, world xz, unit length
 uniform float uSnowEdgeScale;   // A7: 1/metres of the snow-margin raggedness
+uniform float uSnowSSS;         // r6-1: blue subsurface in shaded snow
+uniform float uMacroWarp;       // r6-2: metres of domain warp on the fine octaves
+uniform vec2  uGrazeBand;       // r6-2: N.V window the grazing tile-break fade runs over
+uniform float uTileBlendGraze;  // r6-2: extra tile-break blend width at grazing
 
 // Analytic (texture-free) macro fields — see the terrMacroTint block.
 uniform vec3  uGeoTint[4];
@@ -1606,6 +2070,9 @@ vec2 gDTopX, gDTopY;   // d(world.xz)/dx, /dy  — metres per pixel
 vec2 gDSxX,  gDSxY;    // d(world.zy)
 vec2 gDSzX,  gDSzY;    // d(world.xy)
 float gDetailFade;
+// r6-2: 0 head-on, 1 edge-on. Drives the tile-break blend width ONLY — see the
+// note above terrProj for why it must never touch the stochastic uv itself.
+float gGraze;
 
 // Hash without sin() — stable at the world-space magnitudes we index with.
 vec2 terrHash2( vec2 p ) {
@@ -1715,10 +2182,32 @@ vec2 terrTileUV( vec2 uv, vec2 cell, float rotAmt, out mat2 m ) {
 // One projection of one layer, with stochastic tile-break. Gradients always
 // come from the continuous uv (transformed by the same rotation), so the
 // discontinuous stochastic uv can never produce a mip seam.
-void terrProj( float layer, vec2 uv, vec2 ddx, vec2 ddy, out vec4 nrh, out vec4 alb ) {
+//
+// r6-2 — WHY THE GRAZING FIX IS IN THE BLEND WIDTH AND NOT IN THE ROTATION.
+// The work order asks for a stronger rotation-based tile-break "at grazing
+// angles specifically". Rotation amount CANNOT be made a function of view
+// angle: the rotation is applied to the whole cell's uv, so making it
+// depend on N.V means the same world point resolves to a different texel as the
+// camera moves, and on a downhill run the incidence angle of any given patch of
+// ground sweeps continuously. The ground would visibly rotate and swim under
+// the bike. So the rotation is strengthened VIEW-INDEPENDENTLY and per layer
+// (uLayerTileRot: rock and gravel now take the full +-180 deg, where the old
+// global 0.38 gave +-68 deg), and the grazing-specific term is blendW, which
+// only moves the WEIGHTS between the two taps. That is a crossfade — it changes
+// smoothly with the camera and cannot shift a texel.
+//
+// It is also the right lever for the measured failure. At 3-10 deg of incidence
+// the anisotropy clamp has already low-passed both taps, so what survives of
+// each stochastic cell is its MEAN, and a hard height-blend then picks one mean
+// per cell — a mosaic of flat patches, which is the tile-break's own cell grid
+// becoming visible at exactly the angle it is supposed to be hiding one. Wider
+// window => the two cells average => the cell-level mean difference halves.
+void terrProj( float layer, float rotAmt, vec2 uv, vec2 ddx, vec2 ddy,
+               out vec4 nrh, out vec4 alb ) {
   #ifdef TERRAIN_TILE_BREAK
     vec3 bw; vec2 c1, c2, c3;
     terrTriGrid( uv * TERR_BOMB_FREQ, bw, c1, c2, c3 );
+    float blendW = 0.30 + uTileBlendGraze * gGraze;
 
     #if TERRAIN_TILE_BREAK_TAPS == 2
       // PERF: two copies instead of three.  The third corner of the triangle
@@ -1736,8 +2225,8 @@ void terrProj( float layer, vec2 uv, vec2 ddx, vec2 ddy, out vec4 nrh, out vec4 
       else if ( wC > wB ) { cB = cC; wB = wC; }
 
       mat2 m1, m2;
-      vec2 u1 = terrTileUV( uv, cA, uTileRotate, m1 );
-      vec2 u2 = terrTileUV( uv, cB, uTileRotate, m2 );
+      vec2 u1 = terrTileUV( uv, cA, rotAmt, m1 );
+      vec2 u2 = terrTileUV( uv, cB, rotAmt, m2 );
 
       vec4 n1 = textureGrad( uNrhArray, vec3( u1, layer ), m1 * ddx, m1 * ddy );
       vec4 n2 = textureGrad( uNrhArray, vec3( u2, layer ), m2 * ddx, m2 * ddy );
@@ -1746,7 +2235,7 @@ void terrProj( float layer, vec2 uv, vec2 ddx, vec2 ddy, out vec4 nrh, out vec4 
       // A plain weighted average washes the contrast out and reads as blur.
       vec2 hb = vec2( n1.a, n2.a ) * 0.65 + vec2( wA, wB );
       float mx = max( hb.x, hb.y );
-      vec2 b = max( hb - ( mx - 0.30 ), 0.0 ) * step( 0.0015, vec2( wA, wB ) );
+      vec2 b = max( hb - ( mx - blendW ), 0.0 ) * step( 0.0015, vec2( wA, wB ) );
       b /= max( b.x + b.y, 1e-4 );
 
       nrh = n1 * b.x + n2 * b.y;
@@ -1754,9 +2243,9 @@ void terrProj( float layer, vec2 uv, vec2 ddx, vec2 ddy, out vec4 nrh, out vec4 
           + textureGrad( uAlbedoArray, vec3( u2, layer ), m2 * ddx, m2 * ddy ) * b.y;
     #else
       mat2 m1, m2, m3;
-      vec2 u1 = terrTileUV( uv, c1, uTileRotate, m1 );
-      vec2 u2 = terrTileUV( uv, c2, uTileRotate, m2 );
-      vec2 u3 = terrTileUV( uv, c3, uTileRotate, m3 );
+      vec2 u1 = terrTileUV( uv, c1, rotAmt, m1 );
+      vec2 u2 = terrTileUV( uv, c2, rotAmt, m2 );
+      vec2 u3 = terrTileUV( uv, c3, rotAmt, m3 );
 
       vec4 n1 = textureGrad( uNrhArray, vec3( u1, layer ), m1 * ddx, m1 * ddy );
       vec4 n2 = textureGrad( uNrhArray, vec3( u2, layer ), m2 * ddx, m2 * ddy );
@@ -1764,7 +2253,7 @@ void terrProj( float layer, vec2 uv, vec2 ddx, vec2 ddy, out vec4 nrh, out vec4 
 
       vec3 hb = vec3( n1.a, n2.a, n3.a ) * 0.65 + bw;
       float mx = max( hb.x, max( hb.y, hb.z ) );
-      vec3 b = max( hb - ( mx - 0.30 ), 0.0 ) * step( 0.0015, bw );
+      vec3 b = max( hb - ( mx - blendW ), 0.0 ) * step( 0.0015, bw );
       b /= max( b.x + b.y + b.z, 1e-4 );
 
       nrh = n1 * b.x + n2 * b.y + n3 * b.z;
@@ -1790,9 +2279,12 @@ void terrSampleLayer( int li, out vec3 albedo, out float ao, out vec3 nrmW,
   float layer = float( li );
   float inv = 1.0 / max( uLayerMacro[ li ], 0.05 );
   float nk = uLayerNormalK[ li ] * uNormalStrength;
+  // r6-2: per-layer, view-INDEPENDENT. uTileRotate is now a global scale on top
+  // of the per-layer amount, so opts.tileRotate still works as one knob.
+  float rotAmt = uTileRotate * uLayerTileRot[ li ];
 
   vec4 nY, aY;
-  terrProj( layer, gWPos.xz * inv, gDTopX * inv, gDTopY * inv, nY, aY );
+  terrProj( layer, rotAmt, gWPos.xz * inv, gDTopX * inv, gDTopY * inv, nY, aY );
   vec3 tY = terrDecodeN( nY.rg, nk );
 
   vec3 accA = aY.rgb * gTriW.y;
@@ -1808,7 +2300,7 @@ void terrSampleLayer( int li, out vec3 albedo, out float ao, out vec3 nrmW,
     vec3 tZ = vec3( 0.0, 0.0, 1.0 );
     if ( gTriW.x > 0.004 ) {
       vec4 nn, aa;
-      terrProj( layer, gWPos.zy * inv, gDSxX * inv, gDSxY * inv, nn, aa );
+      terrProj( layer, rotAmt, gWPos.zy * inv, gDSxX * inv, gDSxY * inv, nn, aa );
       tX = terrDecodeN( nn.rg, nk );
       accA += aa.rgb * gTriW.x; accAO += aa.a * gTriW.x;
       accR += nn.b * gTriW.x;   accH += nn.a * gTriW.x;
@@ -1816,7 +2308,7 @@ void terrSampleLayer( int li, out vec3 albedo, out float ao, out vec3 nrmW,
     }
     if ( gTriW.z > 0.004 ) {
       vec4 nn, aa;
-      terrProj( layer, gWPos.xy * inv, gDSzX * inv, gDSzY * inv, nn, aa );
+      terrProj( layer, rotAmt, gWPos.xy * inv, gDSzX * inv, gDSzY * inv, nn, aa );
       tZ = terrDecodeN( nn.rg, nk );
       accA += aa.rgb * gTriW.z; accAO += aa.a * gTriW.z;
       accR += nn.b * gTriW.z;   accH += nn.a * gTriW.z;
@@ -1909,6 +2401,14 @@ terrClampAniso( gDSzX,  gDSzY,  uAnisoClamp );
 float terrViewDist = length( vViewPosition );
 float terrMPP = max( length( gDTopX ), length( gDTopY ) );   // metres per pixel
 
+// r6-2 — GRAZING INCIDENCE. cameraPosition is one of three's default fragment
+// uniforms. abs() because a back-facing terrain triangle at the horizon must
+// not read as head-on. 1 = edge-on, which on a downhill chase camera is most of
+// the mid and far ground and is exactly where the tile-break was measured to
+// fail. Used ONLY to widen the tile-break blend — see terrProj.
+gGraze = 1.0 - smoothstep( uGrazeBand.x, uGrazeBand.y,
+  abs( dot( normalize( cameraPosition - gWPos ), gGeoN ) ) );
+
 // Two independent fades: distance (art control) and footprint (anti-alias).
 gDetailFade = min(
   1.0 - smoothstep( uDetailFadeStart, uDetailFadeEnd, terrViewDist ),
@@ -1974,11 +2474,28 @@ float terrCrest = 0.0;
 }
 #endif
 
-// --- macro variation (three decorrelated octaves of the same noise map) -----
+// --- macro variation: three GENUINELY independent octaves -------------------
+// r6-2. These used to be three reads of ONE 256x256 map at 1/210, 1/62 and
+// 1/13 m, and the brightness consumer below summed mA.r + mB.r + mC.r — one
+// field plus two scaled copies of itself. Self-similar by construction, and the
+// finest octave's 13 m repeat sat squarely inside the 8-15 m band the round
+// filed as "legible ground tiling".
+//
+// Two changes. (1) uMacroNoise is now an ARRAY with one independent layer per
+// octave (see buildMacroNoise), so no consumer can inherit the same motif
+// twice. (2) the mid and fine octaves are DOMAIN-WARPED by the coarse octave's
+// own hue and moisture fields, which costs nothing (mA is already fetched) and
+// destroys the exact 71 m / 19 m lattice registration: the repeat still exists
+// statistically but there is no longer a straight line along which it recurs.
+// The world scales are also off-harmonic now (197 / 71 / 19 m, ratios 2.77 and
+// 3.74) so no two octaves can beat against each other.
 vec2 terrMv = gWPos.xz;
-vec4 mA = texture( uMacroNoise, terrMv * uVarScales.x );
-vec4 mB = texture( uMacroNoise, ( terrMv * uVarScales.y ) * mat2( 0.8, 0.6, - 0.6, 0.8 ) + 0.371 );
-vec4 mC = texture( uMacroNoise, ( terrMv * uVarScales.z ) * mat2( - 0.28, 0.96, - 0.96, - 0.28 ) + 0.713 );
+vec4 mA = texture( uMacroNoise, vec3( terrMv * uVarScales.x, 0.0 ) );
+vec2 terrWarp = ( vec2( mA.g, mA.a ) - 0.5 ) * uMacroWarp;
+vec4 mB = texture( uMacroNoise, vec3(
+  ( ( terrMv + terrWarp * 2.2 ) * uVarScales.y ) * mat2( 0.8, 0.6, - 0.6, 0.8 ) + 0.371, 1.0 ) );
+vec4 mC = texture( uMacroNoise, vec3(
+  ( ( terrMv + terrWarp ) * uVarScales.z ) * mat2( - 0.28, 0.96, - 0.96, - 0.28 ) + 0.713, 2.0 ) );
 
 float terrSlope01 = 1.0 - clamp( gGeoN.y, 0.0, 1.0 );   // 0 flat .. 1 vertical
 float terrAlt = gWPos.y;
@@ -2028,6 +2545,46 @@ float wArr[8];
   float dryness = mA.r;
   float band = mB.b;
 
+  // r7 — THE "LEOPARD SPOT" ON SCREE IS A CONSUMER PROBLEM, NOT AN OCTAVE ONE.
+  // r6-2 made the three macro octaves genuinely independent (separate array
+  // layers, separate seeds, off-harmonic world scales) and that part is real —
+  // I re-read buildMacroNoise to confirm it rather than trusting the note. But
+  // decorrelating the SOURCES achieves nothing while three consumers all read
+  // the SAME source: rock patches took smoothstep(0.76,0.94,band), scree took
+  // smoothstep(0.35,0.78,band) and grass took smoothstep(0.55,0.95,band) — three
+  // thresholds of one ridged field at one world scale, which is precisely "the
+  // same shape keeps happening, at three sizes" as seen from the outside. And a
+  // ridged multifractal thresholded near its own midpoint is the most blob-like
+  // mask this file can produce, which is why SCREE is where it was filed.
+  //
+  // mA.b was fetched every fragment and never read by anything — a free, fully
+  // independent 197 m patch field. The scree band now comes from mA.b and mC.b
+  // in a combination chosen to be variance-preserving and uncorrelated with the
+  // rock band:
+  //     screeBand - m = 0.86*(mA.b - m) + 0.51*(mC.b - m)
+  //     0.86^2 + 0.51^2 = 1.000  -> same sigma
+  //     weights . (0,1,0)  = 0    -> zero linear correlation with the rock band
+  //
+  // RECENTRED ON THE FIELD MEAN, NOT ON 0.5. Every octave's B channel is
+  // clamp01( ridged * 1.25 ), which is strongly skewed: MEASURED on the built
+  // 256^3 array, mean 0.7287 / 0.7295 / 0.7300 and sd 0.1814 / 0.1798 / 0.1838
+  // for mA.b / mB.b / mC.b — interchangeable in distribution, but nowhere near
+  // 0.5. Mixing about 0.5 would have shifted the mean to 0.81 and quietly put
+  // ~9% more scree on the mountain. About 0.729 the match is near exact:
+  //     mean  0.7250 vs 0.7287        sd  0.1770 vs 0.1814
+  //     E[ 0.55 + smoothstep(0.35,0.78,x)*1.15 ]  1.4378 vs 1.4359  (+0.13%)
+  //     corr( rockBand, screeBand )   -0.025      (was 1.000, same field)
+  // so the window below, which was tuned against mB.b, transfers unchanged and
+  // the total area of scree in the world does not move — only its SHAPE does.
+  //
+  // Rock and grass are deliberately LEFT on mB.b. Those two are complementary
+  // reads of one field (bedrock where it is high, grass suppressed where it is
+  // high), which is a coherent geological story rather than a repeat; the
+  // artefact was scree carrying the same motif as the outcrops above it.
+  // Cost: zero. Both fetches already happened four lines up.
+  float screeBand = clamp( 0.729 + ( mA.b - 0.729 ) * 0.86
+                                 + ( mC.b - 0.729 ) * 0.51, 0.0, 1.0 );
+
   // Slope is expressed as 1 - cos(theta):
   //   20 deg = 0.060   30 deg = 0.134   40 deg = 0.234
   //   50 deg = 0.357   60 deg = 0.500   70 deg = 0.658
@@ -2042,7 +2599,7 @@ float wArr[8];
   // Deliberately wide and strong — a bare alpine face is mostly loose rock,
   // not solid bedrock, and it is what stops the mountain reading as one slab.
   float scree = smoothstep( 0.055, 0.20, terrSlope01 ) * ( 1.0 - smoothstep( 0.33, 0.58, terrSlope01 ) );
-  wArr[3] = scree * ( 0.55 + smoothstep( 0.35, 0.78, band ) * 1.15 ) * ( 0.65 + dryness * 0.75 ) * 1.15;
+  wArr[3] = scree * ( 0.55 + smoothstep( 0.35, 0.78, screeBand ) * 1.15 ) * ( 0.65 + dryness * 0.75 ) * 1.15;
 
   // GRASS: gentle, moist, away from the bedrock patches.
   float gentle = 1.0 - smoothstep( 0.07, 0.30, terrSlope01 );
@@ -2196,6 +2753,9 @@ float terrRough = 0.0;
 // statement about the SHADED pixel, not about one intermediate fetch, so the
 // floor has to survive to the shaded pixel.
 float terrRoughMinB = 0.0;
+// r6-1: how much of this fragment is actually snow, after the height splat. The
+// blue-subsurface term below is keyed off it so it cannot leak onto rock.
+float terrSnowMix = 0.0;
 {
   float bsum = 0.0;
   float bw[4];
@@ -2211,6 +2771,7 @@ float terrRoughMinB = 0.0;
     terrAOTex += terrLM[ k ].x * b;
     terrRough += terrLM[ k ].y * b;
     terrRoughMinB += uLayerRoughMin[ terrSel[ k ] ] * b;
+    if ( terrSel[ k ] == 7 ) terrSnowMix += b;
   }
   terrNrmW = normalize( terrNrmW );
 }
@@ -2350,6 +2911,28 @@ terrAO = clamp( mix( 1.0, terrAO, uAOStrength ), 0.0, 1.0 );
 // darker in direct light as well, not only in ambient.
 terrAlbedo *= mix( 1.0, terrAO, 0.30 );
 
+// --- snow: blue subsurface scattering in shade -----------------------------
+// r6-1, the fourth part of the snow item. Snow is a volume scatterer with a
+// scattering length of a centimetre or two, so light that enters a shaded
+// hollow bounces a dozen times before it leaves and comes out with the red gone.
+// It is the single most recognisable thing about snow after its brightness, and
+// it is why a photograph of a snowfield is never grey in the hollows — it is
+// cyan.
+//
+// This is deliberately keyed to the BAKED occlusion and the curvature term, not
+// to N.L. Two reasons. It is the geometry-scale hollows — sun cups, sastrugi
+// troughs, the fracture lines — that have the long internal path lengths, and
+// that is precisely what terrAO measures per pixel and mip-filters correctly at
+// range. And this material owns no sun-direction uniform (sky.js owns the
+// light), so an N.L form would have to reach into three's directionalLights[]
+// array from inside <map_fragment>, which compiles today and would silently
+// take the whole mountain black the first time that chunk is renamed upstream.
+if ( terrSnowMix > 0.004 ) {
+  float terrSnowShade = clamp( ( 1.0 - terrAO ) * 1.4 + terrCavity * 0.5, 0.0, 1.0 );
+  terrAlbedo *= mix( vec3( 1.0 ), vec3( 0.80, 0.90, 1.14 ),
+                     terrSnowMix * terrSnowShade * uSnowSSS );
+}
+
 // --- specular anti-aliasing (Toksvig / LEAN equivalent) --------------------
 // The normal maps here store xy only and reconstruct z, so they are unit length
 // by construction and a texture-space Toksvig factor has nothing to read. The
@@ -2379,7 +2962,17 @@ terrAlbedo *= mix( 1.0, terrAO, 0.30 );
 // little downward range so the surface is not perfectly uniform.
 // Only an explicit water FILM (not ambient dampness — see terrWetFilm) is
 // allowed below that.
-float terrDryFloor = max( uRoughFloor, terrRoughMinB * 0.94 );
+//
+// r6-1 — THE GLOBAL FLOOR NO LONGER OVERRIDES A LOWER PER-LAYER ONE.
+// ROUGH_MIN's own comment says "mud and snow are allowed lower because a puddle
+// and an ice crust genuinely are smoother", and then max( uRoughFloor, ... )
+// clamped both of them straight back up to 0.25, which is why nothing in the
+// entire 16-shot set produces a specular hit. The min() lets a layer whose own
+// authored floor is BELOW the global one keep it, and changes nothing anywhere
+// else: for every mineral layer ROUGH_MIN (0.55-0.85) exceeds uRoughFloor
+// (0.25), so min() returns uRoughFloor and the expression is identical to the
+// old one, term for term. Only snow (0.11) and mud (0.18) move.
+float terrDryFloor = max( min( uRoughFloor, terrRoughMinB ), terrRoughMinB * 0.94 );
 float terrRoughFloor = mix( terrDryFloor, 0.045,
   smoothstep( 0.25, 0.70, terrWet ) * terrWetFilm );
 
@@ -2399,6 +2992,7 @@ function buildUniforms(ctx, textures, opts) {
   const normalK = new Float32Array(LAYER_COUNT);
   const roughK = new Float32Array(LAYER_COUNT);
   const roughMin = new Float32Array(ROUGH_MIN);
+  const tileRot = new Float32Array(LAYER_TILE_ROT);
   const lift = new Float32Array(LAYER_COUNT);
   // P3: the only layer with an albedo lift. See LOAM_ALBEDO_LIFT.
   lift[SurfaceIds.LOAM] = opts.loamLift !== undefined ? opts.loamLift : LOAM_ALBEDO_LIFT;
@@ -2436,6 +3030,7 @@ function buildUniforms(ctx, textures, opts) {
     uLayerRoughMin: { value: roughMin },
     uLayerLift: { value: lift },
     uLayerTint: { value: tints },
+    uLayerTileRot: { value: tileRot },
 
     uTime: { value: 0 },
     // Default 0. Wetness is a weather/creek state, not a look: it used to
@@ -2453,7 +3048,15 @@ function buildUniforms(ctx, textures, opts) {
     uDetailFadeStart: { value: pick(opts.detailFadeStart, 22) },
     uDetailFadeEnd: { value: pick(opts.detailFadeEnd, 78) },
 
-    uVarScales: { value: new THREE.Vector3(1 / 210, 1 / 62, 1 / 13) },
+    // r6-2: was (1/210, 1/62, 1/13). The fine octave's 13 m repeat was inside
+    // the 8-15 m band the round filed as legible ground tiling, and 210/62/13
+    // are close enough to 3.4x apart to beat. 197/71/19 m are off-harmonic
+    // (2.77x, 3.74x) and the fine octave is out of the reported band.
+    uVarScales: { value: new THREE.Vector3(1 / 197, 1 / 71, 1 / 19) },
+    // Metres of domain warp applied to the mid/fine octaves from the coarse
+    // octave's own fields. Big enough (relative to a 19 m period) that the
+    // lattice never registers, small enough that a feature does not smear.
+    uMacroWarp: { value: pick(opts.macroWarp, 13.0) },
     uMacroContrast: { value: pick(opts.macroContrast, 0.30) },
 
     // 1 - cos(theta):  26 deg -> 0.101,  47 deg -> 0.318
@@ -2470,7 +3073,16 @@ function buildUniforms(ctx, textures, opts) {
     // R0: 0.55 -> 0.35. See the occlusion block.
     uCavityStrength: { value: pick(opts.cavityStrength, 0.35) },
     uAOStrength: { value: pick(opts.aoStrength, 1.0) },
-    uTileRotate: { value: pick(opts.tileRotate, 0.38) },
+    // r6-2: this is now a GLOBAL SCALE on LAYER_TILE_ROT, which carries the
+    // actual per-layer amounts. 1.0 so the table means what it says.
+    uTileRotate: { value: pick(opts.tileRotate, 1.0) },
+    // Extra tile-break blend width at grazing incidence. 0.30 (head-on, the old
+    // constant) -> 0.62 at fully edge-on. See the note above terrProj.
+    uTileBlendGraze: { value: pick(opts.tileBlendGraze, 0.32) },
+    // N.V window the grazing fade runs over: fully grazing below ~7 deg of
+    // elevation off the surface, fully off above ~27 deg.
+    uGrazeBand: { value: new THREE.Vector2(
+      pick(opts.grazeStart, 0.12), pick(opts.grazeEnd, 0.45)) },
     uRoughnessScale: { value: 1.0 },
     uRainRipple: { value: pick(opts.rainRipple, 0.0) },
     uRoughFloor: { value: pick(opts.roughFloor, 0.25) },
@@ -2513,6 +3125,10 @@ function buildUniforms(ctx, textures, opts) {
       ? new THREE.Vector2(opts.windDir.x, opts.windDir.y).normalize()
       : new THREE.Vector2(0.82, 0.57).normalize()) },
     uSnowEdgeScale: { value: 1 / pick(opts.snowEdgeMetres, 3.5) },
+    // r6-1: strength of the blue subsurface shift in shaded snow. 1.0 would put
+    // the deepest sun cup at the full (0.80, 0.90, 1.14); 0.85 keeps it just
+    // short of that so the term reads as scattering rather than as a paint job.
+    uSnowSSS: { value: pick(opts.snowSSS, 0.85) },
 
     uSurfaceAttrWeight: { value: pick(opts.surfaceAttrWeight, 1.5) },
     uIdMap: { value: null },

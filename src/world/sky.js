@@ -44,6 +44,15 @@
 // under the camera. `ctx.sun.intensity` is NOT dimmed by cloud any more — it was,
 // globally, which is an exposure wobble rather than a shadow.
 //
+// R7-1 — the field is NEAR-FIELD ONLY, and that is not a taste call, it is the
+// fix for the pale-pink curtain the r7 set shipped. See the long note on
+// hfog_cloudShade() below for the derivation; the short version is that the
+// field must never be the *only* shading signal on a surface, and beyond about
+// 2 km the only surface in this world is terrain.js's terrain-far-ring
+// backdrop, which is `receiveShadow: false`, carries no texture, and has a
+// vertex every 200–310 m. There, four analytic plane waves stop reading as
+// weather and start reading as a printed sheet.
+//
 // CONTRACT-NOTE (sky range, R5-E2): §6 asks for a physically-plausible
 // Rayleigh/Mie sky, and this is one — but Preetham is a *radiance* model with no
 // notion of the key light it has to share a photograph with, and its dynamic
@@ -88,30 +97,87 @@
 // 36 m disc centred ~20 m ahead of the eye. It trades 2.6x of reach for 5.1x of
 // sharpness, and the reach it gives up was carrying nothing.
 //
-// CONTRACT-NOTE (second cascade): the r2 work order asks for a coarse second
-// cascade at 400–1500 m so a 720 m mountain can self-shadow in an aerial wide;
-// the r3 work order asks for a *tight* second slice fitted to the bike+rider box.
-// Neither is implemented, for one reason. The only way to add a second shadow map
-// in stock three is a second DirectionalLight, and a second light must *split*
-// the key or the scene is lit twice. `ctx.sun.intensity` is read as "the key" by
-// water.js:2449, vegetation.js:4152 and particles.js for their own hand-rolled
-// sun terms, so splitting it would silently under-light the water glint, the
-// entire forest and every particle by the far light's share — and the trees would
-// then no longer match the ground they stand on.
-// The one arrangement that adds a shadow without adding light is a subtractive
-// triple: +K tight-shadowed, +K wide-shadowed and -K unshadowed, summing to
-// K*(shadowWide + shadowTight - 1). That was costed and rejected: inside *both*
-// shadows the expression is -1, so it subtracts the whole key from the ambient
-// term and crushes to black, and "the rider crosses tree shade" makes that the
-// common case — it would re-open the crushed-shadow-floor P0 that round 2 fixed.
-// Implemented instead: (a) the texel-budget fit above, which is where hero-scale
-// contact shadows actually come from, and (b) the single cascade's *radius*
-// adapts to the camera's height above the terrain. In gameplay (eye 2–6 m off the
-// deck) it stays at the tight fit; lift the camera into an aerial framing and it
-// grows toward a 620 m radius / ~0.6 m texel, arriving only when nothing in frame
-// is close enough to want a contact shadow. Costs one extra `terrain.sampleHeight`
-// per frame and no extra draw. A genuine CSM belongs with a renderer-wide
-// material patch, which is a cross-module change.
+// CONTRACT-NOTE (cascades, R6-1/R6-2): there are now THREE sun shadow maps and
+// still exactly ONE light's worth of energy in the scene.
+//
+// The r3 note here used to say a second map was impossible without splitting the
+// key, because in stock three a second shadow map needs a second
+// DirectionalLight and a second DirectionalLight also *lights*. That reasoning
+// was half right and the conclusion was wrong. A DirectionalLight at
+// `intensity = 0` still has its shadow map rendered by WebGLShadowMap (the pass
+// never looks at intensity) but contributes `color * intensity == vec3(0)` to
+// every BRDF — so it is a shadow caster that emits nothing. What was actually
+// missing was somewhere to *use* the extra maps, and that is a patched shadow
+// chunk: `installShadowChunks()` below rewrites the directional block of
+// `lights_fragment_begin` so that every directional shadow map in the scene is
+// folded into one occlusion term by `min()` and that single term is applied to
+// the key. One light, three maps, no extra energy — which is the standard answer
+// and is what the r6 verdict asked for.
+//
+//   index 0  MAIN  the texel-budget fit below. 36 m radius, 0.035 m texel at
+//                  high. Unchanged: it is what carries the world at play range.
+//   index 1  NEAR  fitted per frame to the bike+rider bounds, 2.2 m radius at
+//                  1024 => a 4.3 mm texel. A 30 mm frame tube is 7 texels and a
+//                  60 mm forearm is 14, so the hero finally casts a contact
+//                  shadow with structure in it instead of floating. Its sampler
+//                  window closes 14 m past the hero (it cannot affect anything
+//                  further), and it is muted outright — pass and all — once the
+//                  hero is past SHADOW_NEAR_MAX_VIEW, where a 4 mm texel cannot
+//                  resolve on screen anyway.
+//   index 2  FAR   a coarse world slice, 950 m radius at 2048 => 0.93 m texel at
+//                  high, refitted and re-rendered at 20 Hz rather than 60 (the
+//                  frustum is texel-snapped, so a 50 ms lag is well under one
+//                  texel of drift at trail speed). Faded in by view distance
+//                  from ~0.85x to ~1.35x the main cascade's reach, so it takes
+//                  over where the main map stops instead of laying its 0.9 m
+//                  blocks over the sharp map — a real cascade handoff, not a
+//                  blind min() everywhere.
+//
+// The subtractive triple the r3 note costed and rejected (+K/+K/-K) is still the
+// wrong answer and is still not used: min() over the maps needs no negative
+// light and cannot crush the ambient floor.
+//
+// The extra maps travel to every material the same way the fog does — see the
+// fog CONTRACT-NOTE above. The per-cascade fade/mute parameters ride a shared
+// `Float32Array` (`dShadowParams`) for the same reason. If the installed three
+// version ever stops matching the source string the patch keys off,
+// `installShadowChunks()` logs and disables itself, and the renderer falls back
+// to exactly the stock single-map behaviour.
+//
+// The single cascade's adaptive-radius growth (camera height above terrain) is
+// KEPT: it is what gives a cinematic/aerial framing a mid-range shadow at a
+// 0.6 m texel, and it now composites with the far slice rather than standing in
+// for it.
+//
+// DEVIATION, stated plainly: the work order says the far cascade should carry
+// "terrain and far vegetation". It carries terrain. vegetation.js decides which
+// instances to submit to the shadow pass from `sky.shadowDistance`, and that one
+// number is read *once* and clamps the instance count for ALL THREE passes — so
+// raising it to the far cascade's reach would multiply the forest's shadow cost
+// by both the reach and the map count at the same time, on a build whose only
+// performance number is known to be wrong (verdict §6). `sky.shadowRange`, which
+// terrain.js reads and which gates terrain casters alone, IS raised to the far
+// reach. Raising vegetation's is a one-line change here once somebody can
+// measure a real frame.
+//
+// R7 UPDATE — the real frame now exists, and it says DO NOT RAISE IT. Measured
+// at 1920x1080 with all 17 module update()/lateUpdate() calls ticking and the
+// bike actually descending (i.e. the measurement the verdict §6 said the old
+// harness was not making):
+//
+//   open alpine    10.35 ms
+//   jump line      13.13 ms
+//   dense forest   15.29 ms   <- already OVER the governor's shed threshold
+//   final sprint   13.04 ms
+//                             GOV_SHED_MS = 15.0
+//
+// Dense forest is the case that raising `sky.shadowDistance` would hit, and it
+// is the case that is already shedding resolution. The reach multiplies the
+// submitted instance count and the map count multiplies it again, so this is not
+// a few percent — it is the one change that would push the worst frame past the
+// governor permanently. The deviation therefore stands, and it is now a measured
+// decision rather than a deferred one. Revisit only behind a forest-shadow
+// instance budget that is independent of `shadowDistance`.
 //
 // CONTRACT-NOTE (background): engine.js installs a fallback `scene.background`
 // texture and a fallback `scene.environment`. This module deliberately leaves
@@ -136,6 +202,8 @@ const _center = new THREE.Vector3();
 const _lightRight = new THREE.Vector3();
 const _lightUp = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);
+const _nearCenter = new THREE.Vector3();   // hero cascade fit centre
+const _farCenter = new THREE.Vector3();    // world cascade fit centre
 const _colA = new THREE.Color();
 const _colB = new THREE.Color();
 const _colC = new THREE.Color();
@@ -238,19 +306,97 @@ function installFogChunks() {
 	// almost never one you can see, so agreement is unobservable, while sampling a
 	// texture is not possible here — this chunk reaches every fogged material in
 	// the project through a shared Float32Array, and a texture cannot travel that
-	// way (see the CONTRACT-NOTE at the head of sky.js). Measured over a 600x600
-	// grid: 60% of the ground fully sunlit, 8% fully shaded, mean occlusion 0.22,
-	// features 590–1200 m across. Cost is one divide and four sines.
-	float hfog_cloudShade( vec3 wpos ) {
-		float depth = ${HFOG}[ 7 ].x;
+	// way (see the CONTRACT-NOTE at the head of sky.js). Features are 590–1200 m
+	// across. Cost is one divide and four sines.
+	//
+	// R6-3 — the r3 build of this was real (an assessor filed it as absent and was
+	// overruled) but too low-contrast to read. Three changes, none of which touches
+	// the field's shape or its feature size:
+	//
+	//   * the threshold band tightens from smoothstep(0.02, 0.62) to (0.06, 0.40).
+	//     Measured over a 3.6 km grid at the shipping scale: the old band put 5.3%
+	//     of the ground at full depth and spent 41% of it on the ramp, so a cloud
+	//     edge was a ~500 m gradient — which reads as a stain on the terrain, not
+	//     as a cloud overhead. The new band gives 14.9% at full depth (2.8x) over
+	//     28% of ramp, and mean occlusion goes 0.216 -> 0.281.
+	//   * depth rises: CLOUD_SHADOW_DEPTH 0.40 -> 0.52 on the CPU side.
+	//   * and it is now CHROMATIC. What a cloud removes is the warm *direct* sun;
+	//     what is left standing is the blue sky fill. A neutral multiply reads as
+	//     "someone pulled the exposure down"; taking red down 1.08x and blue only
+	//     0.86x reads as "the sun went behind something", and it does so at a much
+	//     smaller luminance step. At full shade the factor is 0.528 / 0.563 / 0.624
+	//     — 44.0% off the luminance where the r3 build took 33.6%, but with a B/R
+	//     of 1.18 where the r3 build held 1.00 exactly.
+	//
+	// It stays a multiply on outgoing radiance rather than on the sun term alone,
+	// because this chunk runs after lighting and cannot separate them. 0.53 is well
+	// clear of the crushed-black floor round 2 fixed: an already-shadowed pixel at
+	// sRGB 40 lands at sRGB ~30, not at 0.
+	//
+	// R7-1 — THE CURTAIN. The r7 set shipped a pale-pink vertical ribbed sheet with
+	// a hard top edge across five of sixteen shots (worst: r7_00, r7_14). It is
+	// this function, and the three changes above are what made it visible. The
+	// chain, each link measured rather than assumed:
+	//
+	//   * The field is a function of wpos.XZ ALONE — it has no vertical term at
+	//     all, by design, because it is a shadow cast onto a landscape. On ground
+	//     that is fine. On a distant mountain FLANK, world XZ barely moves as you
+	//     walk up a screen column, so the field's contours project as exactly
+	//     vertical, exactly elevation-invariant bands. That is the "ribbing", and
+	//     it is why the sheet is uniform to +/-1 sRGB over 350 scanlines.
+	//   * The surface it lands on out there is terrain.js's terrain-far-ring
+	//     (FAR_RING_R = 5400 m, 448 radial strips, receiveShadow:false, vertex
+	//     colours only, no texture, no cascade). The field is therefore not
+	//     MODULATING a shaded surface, it is the ENTIRE shading of it.
+	//   * The ring's own skyline is the sheet's top edge — hard, and shaped like a
+	//     ridge, because above it is the sky dome and the dome is fog:false, so
+	//     the field stops dead at the silhouette with no falloff whatsoever.
+	//   * At 3–5 km on a slightly-upward ray the haze integral only reaches
+	//     fogFactor ~0.44, so ~56% of that flat surface survives to be multiplied,
+	//     and the r6 hardening (0.437 depth, 28% ramp) writes a 44% step into it.
+	//   * The chromatic split then tints the step: measured on r7_14, slit/plateau
+	//     is 0.578 / 0.679 / 0.832 in sRGB — red knocked down hardest, blue least,
+	//     which is this function's own 1.08/1.00/0.86 signature and is the proof
+	//     that the sheet is this term and not the cloud raymarch. (The raymarch
+	//     was also ruled out directly: reimplemented offline against the shipping
+	//     uniforms over the whole hemisphere at 8 camera/layer configurations, it
+	//     produces broken cumulus and ZERO flat azimuth columns. And the dome
+	//     cannot receive this function at all: skyMaterial.fog === false.)
+	//
+	// So the field needs the one thing a real cloud shadow has and this one did
+	// not: it has to lose its contrast with distance. Airlight in front of a
+	// shadow does not carry the shadow, so shadow contrast decays with the path
+	// through the haze; by 2–3 km of alpine air a cumulus shadow on a far flank is
+	// a hue shift, not a 44% step. CLOUD_SHADE_NEAR/FAR below are that decay,
+	// keyed on vFogDepth (view-space depth, already a varying here, so this costs
+	// one smoothstep and no extra interpolant).
+	//
+	// The band is deliberately placed OUTSIDE the playable world rather than
+	// inside it: WORLD is 3072 m across, gameplay sightlines are 30–800 m, and the
+	// widest shot in the set looks about 2 km across the massif. So:
+	//   0–1400 m   full depth, bit-identical to r7. The measured ground result the
+	//              panel asked to keep (5.3% -> 14.9% of the ground at full depth,
+	//              mean occlusion 0.216 -> 0.281, B/R 1.18) is untouched, because
+	//              every one of those numbers is sampled on ground under and
+	//              around the rider.
+	//   1400–3000  smooth decay. Covers the far half of the massif in the wides.
+	//   3000 m +   zero. The far ring can no longer be painted, at any depth, at
+	//              any coverage, from any camera. The curtain cannot come back.
+	const float CLOUD_SHADE_NEAR = 1400.0;
+	const float CLOUD_SHADE_FAR  = 3000.0;
+
+	vec3 hfog_cloudShade( vec3 wpos, float viewDepth ) {
+		float depth = ${HFOG}[ 7 ].x
+			* ( 1.0 - smoothstep( CLOUD_SHADE_NEAR, CLOUD_SHADE_FAR, viewDepth ) );
 		vec3 sd = ${HFOG}[ 3 ].xyz;
-		if ( depth <= 0.0 || sd.y < 0.06 ) return 1.0;
+		if ( depth <= 0.0 || sd.y < 0.06 ) return vec3( 1.0 );
 		vec2 p = ( wpos.xz + sd.xz * ( 900.0 / sd.y ) + ${HFOG}[ 7 ].zw ) * ${HFOG}[ 7 ].y;
 		float m = sin( p.x * 1.000 + p.y * 0.317 )
 			+ sin( p.x * -0.593 + p.y * 0.812 ) * 0.86
 			+ sin( p.x * 0.231 + p.y * -1.371 ) * 0.63
 			+ sin( p.x * 1.717 + p.y * 1.093 ) * 0.41;
-		return 1.0 - depth * smoothstep( 0.02, 0.62, m * 0.3448 );
+		float s = smoothstep( 0.06, 0.40, m * 0.3448 );
+		return vec3( 1.0 ) - ( depth * s ) * vec3( 1.08, 1.00, 0.86 );
 	}
 
 	// This chunk runs *after* <tonemapping_fragment> and <colorspace_fragment>,
@@ -337,7 +483,12 @@ function installFogChunks() {
 	// through 4 km of sunlit air. Applied in whatever space the target expects —
 	// on the post-processing path (the shipping path) that is scene-referred
 	// linear, which is where a shadow belongs.
-	gl_FragColor.rgb *= hfog_cloudShade( vFogWorldPosition );
+	//
+	// vFogDepth (R7-1) is view-space depth, written by the fog_vertex override
+	// above. It drives the near-field falloff — see hfog_cloudShade. Passing the
+	// depth rather than recomputing length(wpos - cameraPosition) keeps this to
+	// zero extra maths on a chunk that reaches every lit material in the project.
+	gl_FragColor.rgb *= hfog_cloudShade( vFogWorldPosition, vFogDepth );
 
 	gl_FragColor.rgb = mix( gl_FragColor.rgb, hfogFinal, clamp( fogFactor, 0.0, 1.0 ) );
 
@@ -354,6 +505,208 @@ function installFogChunks() {
 }
 
 installFogChunks();
+
+// ===========================================================================
+// 1b. Global shadow chunk override — composite cascades (R6-1 / R6-2).
+// ===========================================================================
+//
+// Stock three applies directional shadow map i to directional light i. That is
+// why "add a second cascade" reads as "add a second light", and why the r3 note
+// at the head of this file concluded a second map had to split the key.
+//
+// The patch below breaks that pairing. Every directional shadow map in the
+// scene is sampled once, weighted, and folded into a single occlusion term by
+// `min()`; that term is then applied to whichever directional lights are
+// actually emitting. sky.js adds the extra maps as DirectionalLights at
+// `intensity = 0`: WebGLShadowMap renders their maps (it never inspects
+// intensity) and the BRDF receives `color * intensity == vec3(0)` from them, so
+// they are shadow casters that emit nothing at all. Total scene energy is
+// unchanged to the last bit, and `ctx.sun.intensity` — which water.js,
+// vegetation.js and particles.js all read as "the key" — never moves.
+//
+// The weights ride a shared Float32Array for the same reason the fog does: a
+// typed array survives `UniformsUtils.clone()` by reference, so one array
+// reaches every stock material without patching a module this one does not own.
+// A material that never received it reads zeroes, which decodes as "no fade,
+// not muted" — i.e. plain min() over all maps, which is still correct, just
+// without the cascade handoff.
+
+const DSHADOW = 'dShadowParams';
+const DSHADOW_VEC4S = 3;   // MAIN, NEAR, FAR. Must match the light count below.
+
+/**
+ * Per-cascade compositing parameters, shared by reference with every material.
+ * A cascade's weight is a soft window on view distance, so each slice pays its
+ * sampler fetch only over the range it can actually affect.
+ *   [i].x  fade-IN start distance, metres (view space)
+ *   [i].y  1 / fade-in width; <= 0 means "no near edge, full weight from 0"
+ *   [i].z  fade-OUT end distance, metres
+ *   [i].w  1 / fade-out width; <= 0 means "no far edge, full weight to infinity"
+ * All zeroes is therefore "always full weight", i.e. a plain min() over every
+ * map — the correct fallback for a material that never received the uniform.
+ * A cascade is MUTED by pushing its fade-in start out of the world (x = 1e9,
+ * y = 1), which drives the weight to zero and skips the fetch entirely.
+ */
+const shadowParams = new Float32Array(DSHADOW_VEC4S * 4);
+
+/** Fade-in start that no fragment can ever reach — the mute encoding. */
+const SHADOW_MUTE_START = 1e9;
+
+/** False if the installed three version did not match — cascades then stay off. */
+let shadowCompositeInstalled = false;
+
+// The stock text of the directional block of `lights_fragment_begin`, three r185.
+// Compared line by line after `normaliseGlsl()` strips blank lines and trailing
+// space, because the published build of three strips them and the repository
+// source does not — matching either one literally would fail against the other.
+// Content still has to agree exactly: if a three upgrade changes so much as a
+// token the match fails, the warning fires, and the renderer keeps its stock
+// single-map behaviour rather than silently losing every shadow in the game.
+const DIR_BLOCK_STOCK = [
+  '\tDirectionalLight directionalLight;',
+  '\t#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0',
+  '\tDirectionalLightShadow directionalLightShadow;',
+  '\t#endif',
+  '',
+  '\t#pragma unroll_loop_start',
+  '\tfor ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {',
+  '',
+  '\t\tdirectionalLight = directionalLights[ i ];',
+  '',
+  '\t\tgetDirectionalLightInfo( directionalLight, directLight );',
+  '',
+  '\t\t#if defined( USE_SHADOWMAP ) && ( UNROLLED_LOOP_INDEX < NUM_DIR_LIGHT_SHADOWS )',
+  '\t\tdirectionalLightShadow = directionalLightShadows[ i ];',
+  '\t\tdirectLight.color *= ( directLight.visible && receiveShadow ) ? getShadow( directionalShadowMap[ i ], directionalLightShadow.shadowMapSize, directionalLightShadow.shadowIntensity, directionalLightShadow.shadowBias, directionalLightShadow.shadowRadius, vDirectionalShadowCoord[ i ] ) : 1.0;',
+  '\t\t#endif',
+  '',
+  '\t\tRE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  '',
+  '\t}',
+  '\t#pragma unroll_loop_end',
+].join('\n');
+
+// The replacement. Two changes:
+//   1. the per-light `getShadow` becomes one composited `dscDirShadow`,
+//      computed before the light loop as min() over every directional map;
+//   2. RE_Direct is skipped for a light whose colour is black, so the two
+//      zero-intensity shadow-only lights cost a uniform-coherent branch instead
+//      of two full BRDF evaluations per fragment.
+// The extra braces inside the shadow loop give each unrolled copy its own scope
+// (three's unroller pastes the body verbatim, so sibling declarations would
+// collide), and the loop's own closing brace is still the only `}` followed by
+// `#pragma unroll_loop_end`, which is what three's unroll regex keys on.
+const DIR_BLOCK_PATCHED = [
+  '\tDirectionalLight directionalLight;',
+  '',
+  '\t// --- DESCENT composite cascades (src/world/sky.js) ------------------',
+  '\t// One occlusion term, min() over every directional shadow map, applied to',
+  '\t// the key. The extra maps belong to zero-intensity lights, so they add a',
+  '\t// shadow and no light. dShadowParams[ i ] fades / mutes each cascade.',
+  '\tfloat dscDirShadow = 1.0;',
+  '\t#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0',
+  '\tif ( receiveShadow ) {',
+  '\t\tfloat dscViewDist = length( geometryPosition );',
+  '\t\t#pragma unroll_loop_start',
+  '\t\tfor ( int i = 0; i < NUM_DIR_LIGHT_SHADOWS; i ++ ) {',
+  '\t\t\t{',
+  '\t\t\t\tvec4 dscP = dShadowParams[ i ];',
+  '\t\t\t\tfloat dscW = ( dscP.y > 0.0 ) ? clamp( ( dscViewDist - dscP.x ) * dscP.y, 0.0, 1.0 ) : 1.0;',
+  '\t\t\t\tif ( dscP.w > 0.0 ) dscW *= clamp( ( dscP.z - dscViewDist ) * dscP.w, 0.0, 1.0 );',
+  '\t\t\t\tif ( dscW > 0.0 ) {',
+  '\t\t\t\t\tfloat dscS = getShadow( directionalShadowMap[ i ], directionalLightShadows[ i ].shadowMapSize, directionalLightShadows[ i ].shadowIntensity, directionalLightShadows[ i ].shadowBias, directionalLightShadows[ i ].shadowRadius, vDirectionalShadowCoord[ i ] );',
+  '\t\t\t\t\tdscDirShadow = min( dscDirShadow, mix( 1.0, dscS, dscW ) );',
+  '\t\t\t\t}',
+  '\t\t\t}',
+  '\t\t}',
+  '\t\t#pragma unroll_loop_end',
+  '\t}',
+  '\t#endif',
+  '',
+  '\t#pragma unroll_loop_start',
+  '\tfor ( int i = 0; i < NUM_DIR_LIGHTS; i ++ ) {',
+  '',
+  '\t\tdirectionalLight = directionalLights[ i ];',
+  '',
+  '\t\tgetDirectionalLightInfo( directionalLight, directLight );',
+  '',
+  '\t\t#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0',
+  '\t\tdirectLight.color *= ( directLight.visible && receiveShadow ) ? dscDirShadow : 1.0;',
+  '\t\t#endif',
+  '',
+  '\t\tif ( any( greaterThan( directLight.color, vec3( 0.0 ) ) ) ) {',
+  '',
+  '\t\t\tRE_Direct( directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material, reflectedLight );',
+  '',
+  '\t\t}',
+  '',
+  '\t}',
+  '\t#pragma unroll_loop_end',
+].join('\n');
+
+// Declared with NUM_DIR_LIGHT_SHADOWS entries, not a fixed 3, so every element
+// is referenced by the unrolled loop above. A driver that reports a shrunken
+// active array size for trailing unused elements would otherwise make the
+// uniform4fv upload overrun the uniform and raise INVALID_OPERATION.
+const DSHADOW_DECL = /* glsl */`
+#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+
+	// Per-cascade compositing parameters, owned by src/world/sky.js. A soft
+	// window on view distance, so each slice is only fetched where it matters.
+	//   .x  fade-IN start (m)    .y  1 / fade-in width  (<= 0: no near edge)
+	//   .z  fade-OUT end (m)     .w  1 / fade-out width (<= 0: no far edge)
+	// All zeroes = always full weight, which is plain min() over every map.
+	uniform vec4 ${DSHADOW}[ NUM_DIR_LIGHT_SHADOWS ];
+
+#endif
+`;
+
+/** Blank lines and trailing space carry no GLSL meaning and differ between the
+ *  three source tree and its published build, so neither takes part in the match. */
+function normaliseGlsl(s) {
+  return s.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l !== '').join('\n');
+}
+
+const DIR_BLOCK_HEAD = '\tDirectionalLight directionalLight;';
+const DIR_BLOCK_TAIL = '\t#pragma unroll_loop_end';
+
+function installShadowChunks() {
+  if (shadowCompositeInstalled) return;
+
+  const src = THREE.ShaderChunk.lights_fragment_begin;
+  const bail = (why) => {
+    console.warn('[sky] lights_fragment_begin ' + why + '; composite shadow cascades are ' +
+      'disabled and the stock single shadow map is used. (src/world/sky.js, R6-1/R6-2)');
+  };
+  if (typeof src !== 'string') return bail('is not a string');
+
+  const a = src.indexOf(DIR_BLOCK_HEAD);
+  if (a < 0) return bail('has no directional light block');
+  const b = src.indexOf(DIR_BLOCK_TAIL, a);
+  if (b < 0) return bail('has no unrolled directional loop');
+  const found = src.slice(a, b + DIR_BLOCK_TAIL.length);
+
+  if (normaliseGlsl(found) !== normaliseGlsl(DIR_BLOCK_STOCK)) {
+    return bail('does not match the expected three.js r185 source');
+  }
+
+  THREE.ShaderChunk.lights_fragment_begin =
+    src.slice(0, a) + DIR_BLOCK_PATCHED + src.slice(b + DIR_BLOCK_TAIL.length);
+  THREE.ShaderChunk.shadowmap_pars_fragment = THREE.ShaderChunk.shadowmap_pars_fragment + DSHADOW_DECL;
+
+  // Publish the shared array everywhere a stock material could pick it up —
+  // same route the fog parameters take, and for the same reason.
+  const decl = { value: shadowParams };
+  if (THREE.UniformsLib && THREE.UniformsLib.lights) THREE.UniformsLib.lights[DSHADOW] = decl;
+  for (const key in THREE.ShaderLib) {
+    const lib = THREE.ShaderLib[key];
+    if (lib && lib.uniforms && lib.uniforms[DSHADOW] === undefined) lib.uniforms[DSHADOW] = decl;
+  }
+
+  shadowCompositeInstalled = true;
+}
+
+installShadowChunks();
 
 // ===========================================================================
 // 2. Procedural noise for the cloud volumes. Everything below tiles exactly by
@@ -1682,6 +2035,103 @@ export function createSky(ctx) {
   sun.shadow.bias = -0.00008;
   sun.shadow.normalBias = 0.0063;
 
+  // --- the two extra cascades (R6-1 / R6-2) --------------------------------
+  //
+  // Shadow casters that emit nothing: `intensity = 0` means WebGLShadowMap still
+  // renders their maps (the pass never inspects intensity) while every BRDF gets
+  // `color * intensity == vec3(0)` from them. The patched `lights_fragment_begin`
+  // above folds all three maps into one occlusion term with min() and applies it
+  // to the key, so the scene's total light energy is bit-identical to a single
+  // DirectionalLight and `ctx.sun.intensity` — the number water.js, vegetation.js
+  // and particles.js each read as "the key" — is untouched.
+  //
+  // Cascade ORDER MATTERS: WebGLLights fills `directionalShadow[]` in scene
+  // traversal order, and dShadowParams is indexed by that. These are added to the
+  // scene immediately after `sun`, and sky.js owns all scene lighting (CONTRACT
+  // §6), so the indices below are fixed.
+  const SHADOW_IDX_MAIN = 0;
+  const SHADOW_IDX_NEAR = 1;
+  const SHADOW_IDX_FAR = 2;
+
+  /** Cascades are only wired up if the chunk patch actually took. */
+  const compositeCascades = shadowCompositeInstalled;
+
+  // NEAR — the hero slice. Radius is the bike+rider bounding sphere plus margin
+  // for lean, whip and ragdoll; 2.2 m at 1024 is a 4.3 mm texel, so a 30 mm frame
+  // tube is 7 texels across and a 60 mm forearm is 14. That is the whole point of
+  // this cascade: at the main fit's 0.035 m both are sub-texel and the hero
+  // physically cannot cast a contact shadow, which is the single defect every
+  // assessor independently flagged in r6_14.
+  const SHADOW_NEAR_MAP = { low: 512, medium: 1024, high: 1024, ultra: 2048 };
+  const SHADOW_NEAR_RADIUS = 2.2;
+  const SHADOW_NEAR_BACKOFF = 9;     // metres up-sun of the disc that can cast
+  const SHADOW_NEAR_UP = 0.72;       // centre offset from the chassis origin
+  const SHADOW_NEAR_FWD = 0.52;      //   (rear-axle-ish) towards the bounds centre
+  // Acne is a ratio phenomenon (see updateShadowFrustum) so the normal offset
+  // follows the texel down. 0.30 rather than the main fit's 0.18 buys margin
+  // against speckle on the terrain that shares this tiny frustum, and 0.30 of a
+  // 4.3 mm texel is 1.3 mm — 23x smaller than the frame tube it must not erase.
+  const SHADOW_NEAR_NORMAL_K = 0.30;
+  // Past this the hero is a handful of pixels and a 4 mm texel resolves nothing,
+  // so the cascade is muted in the shader AND its render pass is skipped.
+  const SHADOW_NEAR_MAX_VIEW = 260;
+  // How far past the hero the cascade's sampler window stays open, and over how
+  // many metres it closes.
+  const SHADOW_NEAR_TAIL = 14;
+  const SHADOW_NEAR_FEATHER = 8;
+
+  // FAR — the coarse world slice. 950 m radius at 2048 is a 0.93 m texel, which
+  // is the scale terrain self-shadowing actually lives at: a ridge shadow at a
+  // 19-degree sun is hundreds of metres long. One 36 m slice cannot shadow 720 m
+  // of relief, which is why r6_00 has almost no self-shadowing in it.
+  const SHADOW_FAR_MAP = { low: 512, medium: 1024, high: 2048, ultra: 2048 };
+  const SHADOW_FAR_RADIUS = { low: 500, medium: 700, high: 950, ultra: 1200 };
+  const SHADOW_FAR_AHEAD = 0.30;
+  // Caster headroom up-sun of the derived slab (see fitShadowDisc), and a ceiling
+  // on the derived depth so a sun on the horizon cannot ask for a 20 km frustum.
+  // 6 km at 24-bit depth is 0.36 mm of resolution, which is far finer than a
+  // 0.93 m texel can use.
+  const SHADOW_FAR_BACKOFF = 300;
+  const SHADOW_FAR_MAX_SPREAD = 6000;
+  // Refit + re-render at 20 Hz, not 60. The frustum is texel-snapped, so 50 ms of
+  // lag at 25 m/s is 1.25 m — about one texel — and it is not the pass to spend a
+  // third of the shadow budget on every frame.
+  const SHADOW_FAR_INTERVAL = 0.05;
+  // Where the far slice takes over from the main one, as a multiple of the main
+  // cascade's BASE reach (not its adaptive aerial reach, which would push the
+  // handoff out to 800 m in a wide and leave the mid-ground unshadowed). Below
+  // this the sharp map owns the frame; a blind min() would otherwise lay 0.9 m
+  // blocks over 35 mm shadows at play range.
+  const SHADOW_FAR_FADE_IN = 0.85;
+  const SHADOW_FAR_FADE_OUT = 1.35;
+
+  function nearMapSizeFor() { return SHADOW_NEAR_MAP[ctx.quality] || SHADOW_NEAR_MAP.high; }
+  function farMapSizeFor() { return SHADOW_FAR_MAP[ctx.quality] || SHADOW_FAR_MAP.high; }
+  function farRadiusFor() { return SHADOW_FAR_RADIUS[ctx.quality] || SHADOW_FAR_RADIUS.high; }
+
+  const sunNear = new THREE.DirectionalLight(0xffffff, 0);
+  sunNear.name = 'sunShadowNear';
+  sunNear.castShadow = compositeCascades && settings.shadows !== false;
+  sunNear.shadow.mapSize.set(nearMapSizeFor(), nearMapSizeFor());
+  sunNear.shadow.camera.near = 1;
+  // Both cameras are re-derived every fit (fitShadowDisc); these are only what
+  // the first program compile and the first frame see.
+  sunNear.shadow.camera.far = 70;
+  sunNear.shadow.bias = -0.00025;
+  sunNear.shadow.normalBias = 0.0013;
+
+  const sunFar = new THREE.DirectionalLight(0xffffff, 0);
+  sunFar.name = 'sunShadowFar';
+  sunFar.castShadow = compositeCascades && settings.shadows !== false;
+  sunFar.shadow.mapSize.set(farMapSizeFor(), farMapSizeFor());
+  sunFar.shadow.camera.near = 1;
+  sunFar.shadow.camera.far = 8000;
+  sunFar.shadow.bias = -0.00012;
+  sunFar.shadow.normalBias = 0.17;
+  // Driven by hand at SHADOW_FAR_INTERVAL rather than every frame.
+  sunFar.shadow.autoUpdate = false;
+  sunFar.shadow.needsUpdate = true;
+
   // The cool fill. This, not the key, is what stops shadowed rock crushing to
   // black and reading as CG: outdoors, shadow is lit by the *sky*, so it is blue.
   const hemi = new THREE.HemisphereLight(0x9dc0f0, 0x54452f, 0.42);
@@ -1697,6 +2147,11 @@ export function createSky(ctx) {
   if (scene) {
     scene.add(sun);
     scene.add(sun.target);
+    // Immediately after the key, so directionalShadow[] indexes MAIN/NEAR/FAR.
+    if (compositeCascades) {
+      scene.add(sunNear); scene.add(sunNear.target);
+      scene.add(sunFar); scene.add(sunFar.target);
+    }
     scene.add(hemi);
     scene.add(ambient);
     scene.add(skyMesh);
@@ -1722,8 +2177,13 @@ export function createSky(ctx) {
   // frequency of the shadow field at a ~1.2 km wavelength and the highest at
   // ~620 m, which is honest cumulus spacing.
   const DOWN_HAZE_FRACTION = 0.45;
-  const CLOUD_SHADOW_DEPTH = 0.40;
+  // R6-3: 0.40 -> 0.52. Combined with the tighter threshold band and the chromatic
+  // split in hfog_cloudShade, full cloud shade now takes ~44% of the luminance
+  // (r3: 34%) and puts a real blue cast under the patch. See the shader note.
+  const CLOUD_SHADOW_DEPTH = 0.52;
   const CLOUD_SHADOW_SCALE = 0.005;
+  /** Rec.709 luminance of the chromatic split above — keeps the CPU mirror honest. */
+  const CLOUD_SHADOW_LUMA = 0.2126 * 1.08 + 0.7152 * 1.00 + 0.0722 * 0.86;
   if (scene) scene.fog = new THREE.FogExp2(0x9fbcdd, 0.00042);
 
   fogParams[3] = FOG_DENSITY;              // [0].a
@@ -2085,6 +2545,9 @@ export function createSky(ctx) {
 
     // Rebuild the IBL only when the sun has actually moved (~0.36 degrees).
     if (sunDirection.dot(lastEnvSunDir) < 0.99998) envDirty = true;
+    // The far cascade is refitted on a timer, but a sun move invalidates it
+    // immediately — its whole frustum basis is the sun direction.
+    farDirty = true;
   }
 
   function setSunAngles(azimuthRad, elevationRad) {
@@ -2275,6 +2738,232 @@ export function createSky(ctx) {
     sun.shadow.normalBias = clamp(texel * 0.18, 0.002, 0.12);
   }
 
+  // -------------------------------------------------------------------------
+  // The two extra cascades (R6-1 / R6-2).
+  //
+  // Same derivation as updateShadowFrustum — an explicit disc fitted about a
+  // centre, snapped to the texel grid in the light's own basis so nothing swims —
+  // factored out because there are now three of them and three copies of a
+  // texel-snap guarantee drift. `sun` keeps its own copy above deliberately: it
+  // carries the adaptive-radius branch and a comment history worth not churning.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fit `light`'s ortho shadow camera to a texel-snapped disc of `radius` about
+   * `center`. Returns the resulting metres-per-texel. Allocation-free (module
+   * scratch only).
+   *
+   * `backoff` is caster headroom up-sun of the near plane. The depth range in the
+   * other direction is DERIVED, not authored, and that is the part that is easy
+   * to get wrong on a big slice: the disc is perpendicular to the sun, so a flat
+   * ground plane crossing it runs away in depth at tan(90 - elevation). At the
+   * shipping 19.2-degree sun a 950 m disc spans +/-2.9 km of depth, and a far
+   * plane sized as "a couple of radii" would have clipped over half of the world
+   * cascade's own footprint out of the frustum — shadowless, silently, exactly
+   * where the cascade exists to put shadows.
+   */
+  function fitShadowDisc(light, center, radius, backoff, normalK, reliefPad, maxSpread) {
+    // three's LightShadow re-derives the basis with lookAt() and the default
+    // (0,1,0) up, so the snap has to happen in exactly that basis.
+    _lightRight.copy(_worldUp).cross(sunDirection);
+    if (_lightRight.lengthSq() < 1e-6) _lightRight.set(1, 0, 0);
+    _lightRight.normalize();
+    _lightUp.copy(sunDirection).cross(_lightRight).normalize();
+
+    const mapSize = light.shadow.mapSize.x || 1024;
+    const texel = (2 * radius) / mapSize;
+    const cx = Math.round(center.dot(_lightRight) / texel) * texel;
+    const cy = Math.round(center.dot(_lightUp) / texel) * texel;
+    const cz = center.dot(sunDirection);
+
+    _v1.set(0, 0, 0)
+      .addScaledVector(_lightRight, cx)
+      .addScaledVector(_lightUp, cy)
+      .addScaledVector(sunDirection, cz);
+
+    // Half-depth of the slab that has to be inside the frustum, either side of
+    // the disc plane: the ground's own run-away plus the relief standing on it.
+    const spread = Math.min(radius / Math.max(sunDirection.y, 0.10) + reliefPad, maxSpread);
+
+    light.target.position.copy(_v1);
+    light.position.copy(_v1).addScaledVector(sunDirection, spread + backoff);
+    light.updateMatrixWorld();
+    light.target.updateMatrixWorld();
+
+    const cam = light.shadow.camera;
+    cam.left = -radius; cam.right = radius;
+    cam.top = radius; cam.bottom = -radius;
+    cam.near = 1;
+    cam.far = 2 * spread + backoff + 40;
+    cam.updateProjectionMatrix();
+
+    // Acne is a ratio phenomenon (see the note in updateShadowFrustum): both
+    // terms are fractions of a texel and follow it, so one set of numbers is
+    // correct at a 4 mm texel and at a 0.9 m one.
+    const depthRange = cam.far - cam.near;
+    light.shadow.bias = -clamp(texel / depthRange, 1.5e-5, 0.00045);
+    light.shadow.normalBias = clamp(texel * normalK, 0.0004, 0.60);
+    return texel;
+  }
+
+  let nearMuted = true;
+  let nearFadeEnd = 0;
+  let nearTexel = 0;
+  let farTexel = 0;
+  let farTimer = 0;
+  let farDirty = true;
+  let farRadius = farRadiusFor();
+
+  /**
+   * NEAR cascade — fitted to the bike+rider bounds. Called from lateUpdate, not
+   * update: sky is wave 4 and bike is wave 5, so a fit taken in update() would be
+   * a frame stale, and at 25 m/s a frame is 0.42 m — a fifth of this disc. The
+   * hero would slide out of its own shadow map on every fast section.
+   */
+  function updateNearShadow(camera) {
+    if (!compositeCascades || !sunNear.castShadow) { nearMuted = true; return; }
+    const st = ctx.bike && ctx.bike.state;
+    const p = st && st.position;
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) {
+      // No hero yet (menu, cinematic fly-through): mute it and skip the pass.
+      nearMuted = true;
+      sunNear.shadow.autoUpdate = false;
+      return;
+    }
+
+    // `position` is the rear-axle-ish chassis origin, so the combined bike+rider
+    // bounds sit up and forward of it. Using the bike's own basis keeps the fit
+    // centred through lean and pitch instead of drifting to one side of the disc.
+    _nearCenter.copy(p);
+    if (st.up && Number.isFinite(st.up.y)) _nearCenter.addScaledVector(st.up, SHADOW_NEAR_UP);
+    else _nearCenter.y += SHADOW_NEAR_UP;
+    if (st.forward && Number.isFinite(st.forward.x)) _nearCenter.addScaledVector(st.forward, SHADOW_NEAR_FWD);
+
+    const dist = camera ? camera.position.distanceTo(p) : 0;
+    nearMuted = dist > SHADOW_NEAR_MAX_VIEW;
+    sunNear.shadow.autoUpdate = !nearMuted;
+    if (nearMuted) return;
+    // Everything this cascade can darken is the hero plus the shadow it throws:
+    // a 1.85 m rider at a 19-degree sun reaches 5.3 m down-slope, and the disc is
+    // 2.2 m. SHADOW_NEAR_TAIL past the hero covers both with room to spare, and
+    // the window costs the rest of the frame nothing.
+    nearFadeEnd = dist + SHADOW_NEAR_TAIL;
+
+    // reliefPad 1.5 m covers a berm lip or a rock the hero is standing on;
+    // maxSpread 60 m keeps the depth range sane if the sun drops to the horizon.
+    nearTexel = fitShadowDisc(sunNear, _nearCenter, SHADOW_NEAR_RADIUS,
+      SHADOW_NEAR_BACKOFF, SHADOW_NEAR_NORMAL_K, 1.5, 60);
+  }
+
+  /**
+   * FAR cascade — a coarse world slice, refitted and re-rendered on a timer.
+   * Camera-following rather than world-anchored so it always covers what is in
+   * frame; texel-snapped so following costs nothing in stability.
+   */
+  function updateFarShadow(camera, dt) {
+    if (!compositeCascades || !sunFar.castShadow || !camera) return;
+    farTimer -= dt;
+    if (farTimer > 0 && !farDirty) return;
+    farTimer = SHADOW_FAR_INTERVAL;
+    farDirty = false;
+
+    farRadius = farRadiusFor();
+    camera.getWorldDirection(_camFwd);
+    _farCenter.copy(camera.position).addScaledVector(_camFwd, farRadius * SHADOW_FAR_AHEAD);
+    // Drop the centre onto the deck. A disc centred on a camera 400 m up would
+    // spend half its depth range on empty air and clip the valley out of the far
+    // plane — which is exactly how an aerial ends up with no shadows in it.
+    const terrain = ctx.terrain;
+    if (terrain && typeof terrain.sampleHeight === 'function') {
+      const gy = terrain.sampleHeight(_farCenter.x, _farCenter.z);
+      if (Number.isFinite(gy)) _farCenter.y = gy;
+    }
+
+    // reliefPad is the whole mountain: a summit up-sun of the slice must be
+    // inside the frustum or it cannot shadow the valley it stands over.
+    farTexel = fitShadowDisc(sunFar, _farCenter, farRadius, SHADOW_FAR_BACKOFF,
+      0.18, WORLD_RELIEF, SHADOW_FAR_MAX_SPREAD);
+    sunFar.shadow.needsUpdate = true;
+  }
+
+  /** Write one cascade's view-distance window. See the shadowParams doc comment. */
+  function setCascade(idx, inStart, inRate, outEnd, outRate) {
+    const o = idx * 4;
+    shadowParams[o] = inStart;
+    shadowParams[o + 1] = inRate;
+    shadowParams[o + 2] = outEnd;
+    shadowParams[o + 3] = outRate;
+  }
+
+  function muteCascade(idx) { setCascade(idx, SHADOW_MUTE_START, 1, 0, 0); }
+
+  /**
+   * Publish the per-cascade weights.
+   *
+   * MAIN is unwindowed: it is the world's shadow and it already returns 1.0
+   * outside its own frustum.
+   *
+   * NEAR is windowed to end just past the hero, because its sampler fetch is a
+   * full PCF kernel and it can only affect a 2.2 m disc plus the shadow that disc
+   * throws. Leaving it open would spend nine texture compares per pixel on the
+   * whole frame for a map that is relevant to a fraction of one percent of it.
+   *
+   * FAR fades in across the range where MAIN runs out, so the handoff is a real
+   * cascade selection; a blind min() would lay its 0.9 m blocks over 35 mm
+   * shadows at play range and fringe every shadow edge in the frame.
+   */
+  function updateShadowParams() {
+    if (!compositeCascades) return;
+
+    if (sun.castShadow) setCascade(SHADOW_IDX_MAIN, 0, 0, 0, 0);
+    else muteCascade(SHADOW_IDX_MAIN);
+
+    if (sunNear.castShadow && !nearMuted) {
+      setCascade(SHADOW_IDX_NEAR, 0, 0, nearFadeEnd, 1 / SHADOW_NEAR_FEATHER);
+    } else {
+      muteCascade(SHADOW_IDX_NEAR);
+    }
+
+    if (sunFar.castShadow) {
+      const baseReach = shadowRadius * (1 + SHADOW_FIT_AHEAD);
+      const fadeStart = baseReach * SHADOW_FAR_FADE_IN;
+      const fadeEnd = Math.max(baseReach * SHADOW_FAR_FADE_OUT, fadeStart + 1);
+      setCascade(SHADOW_IDX_FAR, fadeStart, 1 / (fadeEnd - fadeStart), 0, 0);
+    } else {
+      muteCascade(SHADOW_IDX_FAR);
+    }
+  }
+
+  /**
+   * engine.js's own applyShadowSettings() traverses the scene and forces EVERY
+   * light's shadow map to `settings.shadowMapSize`, which would silently blow the
+   * hero cascade up to 2048 and the world cascade down. Re-assert ours; the
+   * comparison is two integer tests per frame and only fires when something else
+   * has actually changed them.
+   */
+  function assertCascadeMapSizes() {
+    if (!compositeCascades) return;
+    const wantNear = nearMapSizeFor();
+    const wantFar = farMapSizeFor();
+    if (sunNear.shadow.mapSize.x !== wantNear) {
+      sunNear.shadow.mapSize.set(wantNear, wantNear);
+      disposeShadowMap(sunNear);
+    }
+    if (sunFar.shadow.mapSize.x !== wantFar) {
+      sunFar.shadow.mapSize.set(wantFar, wantFar);
+      disposeShadowMap(sunFar);
+      farDirty = true;
+    }
+  }
+
+  function disposeShadowMap(light) {
+    const map = light.shadow.map;
+    if (!map) return;
+    if (map.depthTexture) { map.depthTexture.dispose(); map.depthTexture = null; }
+    map.dispose();
+    light.shadow.map = null;
+  }
+
   function applyShadowSettings() {
     const size = Math.max(256, Math.min(8192, (settings.shadowMapSize | 0) || 2048));
     if (sun.shadow.mapSize.x !== size) {
@@ -2282,6 +2971,17 @@ export function createSky(ctx) {
       if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
     }
     sun.castShadow = settings.shadows !== false;
+    if (compositeCascades) {
+      // The extra cascades are authored per tier, NOT from settings.shadowMapSize:
+      // their radii are fixed by what they have to contain (a bike, a mountain),
+      // so their map size is what sets their sharpness and it is not the player's
+      // to scale. They follow settings.shadows on/off only.
+      sunNear.castShadow = sun.castShadow;
+      sunFar.castShadow = sun.castShadow;
+      assertCascadeMapSizes();
+      farRadius = farRadiusFor();
+      farDirty = true;
+    }
     // The fit follows the map size, so a resolution change re-derives the radius
     // at constant sharpness rather than changing how crisp the shadows are.
     shadowRadius = baseShadowRadius();
@@ -2306,6 +3006,11 @@ export function createSky(ctx) {
   // This is the CPU mirror of exactly that function, so `sky.cloudShadow` reports
   // what the world is actually doing under the camera rather than a second,
   // independently-drifting number.
+  //
+  // R7-1 note: the shader now fades the field out between CLOUD_SHADE_NEAR and
+  // CLOUD_SHADE_FAR of view depth. This mirror has no fade term and must not grow
+  // one — its only caller samples it AT the camera position, i.e. at view depth
+  // 0, where the shader's fade factor is exactly 1.0. The two still agree.
   let cloudShadow = 1;
 
   function cloudShadeAt(worldX, worldZ) {
@@ -2318,7 +3023,9 @@ export function createSky(ctx) {
       + Math.sin(px * -0.593 + pz * 0.812) * 0.86
       + Math.sin(px * 0.231 + pz * -1.371) * 0.63
       + Math.sin(px * 1.717 + pz * 1.093) * 0.41) * 0.3448;
-    return 1 - depth * smoothstep(0.02, 0.62, m);
+    // Same band as the shader (R6-3), reported as the *luminance* of its
+    // chromatic result so `sky.cloudShadow` still means "how much key is left".
+    return 1 - depth * smoothstep(0.06, 0.40, m) * CLOUD_SHADOW_LUMA;
   }
 
   // -------------------------------------------------------------------------
@@ -2365,6 +3072,10 @@ export function createSky(ctx) {
   }) : null;
 
   setTimeOfDay(timeOfDay);
+  // Publish the cascade weights before the first frame. `nearMuted` starts true,
+  // so the hero slice is muted until lateUpdate has actually fitted it — a map
+  // that has never been rendered must not be sampled.
+  updateShadowParams();
 
   const api = {
     // --- required surface (CONTRACT §6) ----------------------------------
@@ -2386,6 +3097,11 @@ export function createSky(ctx) {
 
       // --- shadow frustum -----------------------------------------------
       if (camera) updateShadowFrustum(camera);
+      // The world cascade is camera-fitted like the main one, so it belongs here
+      // (a frame of lag on a 950 m disc is invisible); the hero cascade is fitted
+      // to the bike and has to wait for lateUpdate — see updateNearShadow.
+      assertCascadeMapSizes();
+      updateFarShadow(camera, dt);
 
       // --- drifting cloud shadows ----------------------------------------
       // The field itself is per-pixel, in the fog chunk. All that happens here is
@@ -2413,10 +3129,28 @@ export function createSky(ctx) {
       }
     },
 
+    /**
+     * The hero shadow slice is fitted here rather than in update() because sky is
+     * wave 4 and bike is wave 5: a fit taken in update() would be a frame stale,
+     * and at 25 m/s a frame is 0.42 m against a 2.2 m disc. Every update() in the
+     * project runs before every lateUpdate(), so this sees the current frame's
+     * bike state; the camera it measures distance against is one frame old
+     * (chaseCamera is wave 7), which only matters to a 260 m mute threshold.
+     */
+    lateUpdate(dt, c) {
+      const camera = (c && c.camera) || ctx.camera;
+      updateNearShadow(camera);
+      updateShadowParams();
+    },
+
     dispose() {
       if (offQuality) offQuality();
       if (scene) {
         scene.remove(sun); scene.remove(sun.target);
+        if (compositeCascades) {
+          scene.remove(sunNear); scene.remove(sunNear.target);
+          scene.remove(sunFar); scene.remove(sunFar.target);
+        }
         scene.remove(hemi); scene.remove(ambient);
         scene.remove(skyMesh);
         if (envRT && scene.environment === envRT.texture) scene.environment = null;
@@ -2431,6 +3165,14 @@ export function createSky(ctx) {
       skyGeometry.dispose();
       shapeTex.dispose(); detailTex.dispose(); weather.texture.dispose();
       if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+      if (compositeCascades) {
+        disposeShadowMap(sunNear);
+        disposeShadowMap(sunFar);
+        // Mute both cascades in the shared array, so a material that outlives the
+        // module cannot go on sampling a disposed map.
+        shadowParams[SHADOW_IDX_NEAR * 4 + 2] = 1;
+        shadowParams[SHADOW_IDX_FAR * 4 + 2] = 1;
+      }
       if (envRT) { envRT.dispose(); envRT = null; }
       if (pmrem) { pmrem.dispose(); pmrem = null; }
       fogParams[20] = 0;   // disable the height-fog chunk cleanly
@@ -2457,10 +3199,28 @@ export function createSky(ctx) {
       shadowRadius = clamp(v, 20, 800) / (1 + SHADOW_FIT_AHEAD);
       adaptiveRadius = Math.max(adaptiveRadius, shadowRadius);
     },
-    /** The reach the cascade is actually fitted to this frame (see CONTRACT-NOTE). */
-    get shadowRange() { return adaptiveRadius * (1 + SHADOW_FIT_AHEAD); },
+    /**
+     * The reach a caster must be inside to appear in ANY cascade this frame.
+     * R6-2: this now reports the far slice's reach when the far slice is live, so
+     * terrain.js (its only consumer — it gates `mesh.castShadow` on this) submits
+     * the relief the world cascade exists to shadow. `shadowDistance` above is
+     * deliberately NOT raised: vegetation.js reads that one, reads it once, and
+     * uses it to clamp the instance count submitted to EVERY shadow pass — see
+     * the DEVIATION paragraph in the cascade CONTRACT-NOTE at the head of the file.
+     */
+    get shadowRange() {
+      const main = adaptiveRadius * (1 + SHADOW_FIT_AHEAD);
+      if (!compositeCascades || !sunFar.castShadow) return main;
+      return Math.max(main, farRadius * (1 + SHADOW_FAR_AHEAD));
+    },
     /** Metres of world per shadow-map texel this frame — the sharpness number. */
     get shadowTexel() { return (2 * adaptiveRadius) / (sun.shadow.mapSize.x || 2048); },
+    /** Metres per texel of the hero slice, or 0 when it is muted this frame. */
+    get shadowNearTexel() { return nearMuted ? 0 : nearTexel; },
+    /** Metres per texel of the coarse world slice, 0 when it is off. */
+    get shadowFarTexel() { return (compositeCascades && sunFar.castShadow) ? farTexel : 0; },
+    /** True when the three-map composite cascade patch is live. */
+    get compositeCascades() { return compositeCascades; },
     get timeOfDay() { return timeOfDay; },
     get environment() { return envRT ? envRT.texture : null; },
     /** Measured scale that puts the sky's IBL in step with the sun (see §6). */

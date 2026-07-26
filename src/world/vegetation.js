@@ -36,8 +36,23 @@
 //   which is correct: the forest may stand on thin alpine soils near its upper limit.
 //
 // Everything here is procedural: two canvas-authored texture atlases (foliage albedo +
-// a derived normal map), one render-target atlas baked from the near-tier meshes for the
-// far imposters, and one tiling rock detail normal. No external assets.
+// a derived normal map), a PAIR of render-target atlases baked from the near-tier meshes
+// for the far imposters (albedo + normal, over 16 octahedral view directions each), and
+// one tiling rock detail normal. No external assets.
+//
+// CONTRACT-NOTE (vegetation -> reviewers): the far tier's texture budget went from
+//   8.0 MB (one 2048x1024 albedo) to 12.3 MB (a 1920x1280 albedo + a 960x640 normal),
+//   16.4 MB with the CPU-built mip chains against 10.7 MB before. That buys 16 baked
+//   views per species instead of one, and it is what pays for the far tier responding
+//   to the sun at all. Draw calls and instance counts are unchanged; the far card went
+//   from 3 crossed quads (18 verts / 12 tris) to 1 billboard (6 verts / 4 tris), so the
+//   920 m tier is 3x cheaper in geometry than it was.
+//
+// CONTRACT-NOTE (vegetation -> next round): there is a documented, measured,
+//   NOT-YET-APPLIED one-line correction in this file — see the FINDING block above
+//   VEG_FRAG_NORMAL. It is a world-space/view-space mismatch in the near+mid canopy's
+//   normal blend. It needs one build and one look before it lands, which is why it is
+//   written down rather than done.
 //
 // Performance model
 // -----------------
@@ -169,21 +184,79 @@ const CHUNK_SHRUB = 40;
 const CHUNK_FERN = 24;
 const CHUNK_GRASS = 20;
 
-// Imposter atlas: 4 columns × 2 rows of 512×512 cells. Every tree is LETTERBOXED,
-// never rescaled — the imposter has to be exactly as tall as the mesh it replaces or
-// the LOD transition steps vertically, which is far more visible than a card that is
-// wider than its crown. The cell was 384 px (aspect 0.75) and that was too narrow:
-// subalpine fir and Scots pine both overhang a 0.75 cell, so both were being shrunk
-// to 92-96% height and popping at 214 m. A square cell clears every species with the
-// basal sweep included. The extra width is transparent and is discarded before any
-// shading work, so it costs nothing but 2 MB of atlas.
-const IMP_COLS = 4;
-const IMP_ROWS = 2;
-const IMP_CELL_W = 512;
-const IMP_CELL_H = 512;
-const IMP_W = IMP_CELL_W * IMP_COLS;          // 2048
-const IMP_H = IMP_CELL_H * IMP_ROWS;          // 1024
-const IMP_ASPECT = IMP_CELL_W / IMP_CELL_H;   // 1.0 — width/height of a unit tree card
+// ---------------------------------------------------------------------------
+// FAR-TIER IMPOSTOR ATLAS — OCTAHEDRAL, ALBEDO + NORMAL (R6-V1 / R6-V2)
+// ---------------------------------------------------------------------------
+//
+// What was here before, and why it was the defect all four review lenses saw in the
+// mid-distance of r6_00 / r6_04 / r6_15:
+//
+//   * ONE baked view per species, shown on THREE FIXED CROSS-QUADS at 60°. No view
+//     direction ever selected it, so from a level camera some quads are edge-on and
+//     from an aerial ALL of them are — the one direction a fixed cross-quad cannot
+//     serve. That is the "field of pale vertical smears".
+//   * The cards carried NO baked normal. Their only shading input was a smooth
+//     outward+up vertex bulge (`ao = 0.82 + 0.16 * v`, whose own comment admitted it
+//     corrected "half of the measured luminance inversion"). The interpolated normal
+//     at the middle of a card is very close to straight UP, so every far tree
+//     collected the full hemisphere-light sky term — a pale blue-white — where the
+//     near mesh's needles point in every direction and collect roughly half of it.
+//     Measured on r6_00: near canopy median rgb(68,94,52), hue 97.5°, linear
+//     luminance 0.095; far band rgb(116,146,128), hue 142.2°, luminance 0.258.
+//     2.7x the luminance and 45° of hue toward cyan. The up-facing normal explains
+//     BOTH numbers, which a "fog tint" hypothesis does not.
+//
+// So the atlas is now a pair — baked ALBEDO and baked NORMAL — over a hemi-octahedral
+// grid of view directions, and the card is a single view-aligned billboard that picks
+// the nearest baked view and is relit at runtime from the real sun.
+//
+// The grid is IMP_GRID x IMP_GRID hemi-octahedral. At IMP_GRID = 4 that is 16 views:
+// the 12 BORDER cells are horizontal (azimuth every 30°) and the 4 INTERIOR cells sit
+// at 63° elevation. There is no lower hemisphere — you never see a tree from beneath.
+const IMP_GRID = 4;
+// Species blocks, laid out across the atlas. SPECIES.length must fit in
+// IMP_SP_COLS * IMP_SP_ROWS; there is a build-time assertion in createVegetation.
+const IMP_SP_COLS = 3;
+const IMP_SP_ROWS = 2;
+const IMP_COLS = IMP_GRID * IMP_SP_COLS;      // 12 view cells across
+const IMP_ROWS = IMP_GRID * IMP_SP_ROWS;      // 8 view cells down
+// 160 px per view cell. The tier runs 214-920 m and is only ALONE past 250 m, where a
+// 25 m tree is ~77 px tall at 1080p — so 160 px is 2.1x oversampled at the sharpest
+// distance the cell is ever asked for, and the mip chain does the rest. Going to
+// 16 views therefore costs 9.8 MB rather than the 25 MB a 256 px cell would have.
+const IMP_CELL = 160;
+const IMP_W = IMP_CELL * IMP_COLS;            // 1920
+const IMP_H = IMP_CELL * IMP_ROWS;            // 1280
+// The normal atlas is baked at half linear resolution. Normal detail at half the
+// albedo resolution is indistinguishable on a 4-90 px card (the foliage atlas already
+// makes the same trade in normalFromImage) and it keeps the pair under 17 MB.
+const IMP_NRM_DIV = 2;
+const IMP_NW = IMP_W / IMP_NRM_DIV;           // 960
+const IMP_NH = IMP_H / IMP_NRM_DIV;           // 640
+// Transparent guard band around each cell, as a fraction of the cell. Without it the
+// mip chain bleeds one view into its neighbour — which the old 4x2 atlas got away
+// with only because neighbouring cells were different species and the card was three
+// crossed quads that never resolved anyway. 6% is 9.6 px at mip 0 and survives to
+// mip 3 (20 px cell), by which point the card is under 12 screen px.
+const IMP_MARGIN = 0.06;
+// World span of one cell, in unit-tree heights. The cell is square and centred on the
+// tree's centre, so it covers y in [-0.06, 1.06] and x in [-0.56, 0.56].
+const IMP_SPAN = 1 + IMP_MARGIN * 2;          // 1.12
+
+// Deepest mip the regression check has any business measuring, derived rather than
+// picked. At CAMERA_FOV = 62° vertical over 1080 rows, on-screen scale is
+// 1080 / (2·tan(31°)·d) = 898.7 / d px per metre. The tier runs 214-920 m over tree
+// heights of 4.5-33 m, so the CARD (IMP_SPAN × the tree) spans:
+//     33 m at 214 m -> 155 px   =>  mip log2(160/155) = 0.05
+//     25 m at 250 m -> 101 px   =>  mip 0.67
+//     25 m at 920 m ->  27 px   =>  mip 2.55
+//      6 m at 920 m ->   6.6 px =>  mip 4.6
+// So levels 0..5 is everything the card can sample and anything past that is off the
+// end of the world. The previous cut of this check ran to level 7 (a 1-px cell) and
+// reported a 51% luminance drift that no frame could ever contain — a metric measuring
+// texels that are never fetched is worse than no metric, because it fails loudly and
+// trains you to ignore it.
+const IMP_MIP_MAX = 5;
 
 // One alpha-test threshold for the whole foliage chain. The coverage-preserving mip
 // builder solves against this exact number, so every material that samples the atlas
@@ -206,18 +279,52 @@ const FOLIAGE_ALPHA_TEST = 0.18;
 // above drawSprig is checkable against one number rather than seven literals.
 //   atlas px      = NEEDLE_W * CELL_PX                       = 5.73
 //   screen px     = atlas px * (card_px / CELL_PX) = 5.73 * 0.39 = 2.24
-// The acceptance window is 3-4 atlas px and 2-4 screen px on the near tier.
+//
+// R6-V3, AUDIT CORRECTION. The line that used to sit here said "the acceptance window
+// is 3-4 atlas px and 2-4 screen px on the near tier", and that is not a window — it
+// is two constraints that cannot both be met. They are related by a FIXED ratio, the
+// 0.39 downsample at which a 512 px cell is mapped onto a ~200 px near branch card:
+//
+//   3-4 atlas px  ->  1.17-1.56 screen px      (fails the screen constraint)
+//   2-4 screen px ->  5.1-10.3 atlas px        (exceeds the "3-4 atlas px" figure)
+//
+// Only one of the two can bind, and it must be the SCREEN one, because the defect
+// being fixed was a needle that could not resolve on screen at the closest distance
+// the game presents. The atlas figure is therefore a FLOOR (be at least 3 px in the
+// atlas, or the canvas antialiasing eats the stroke before it is ever sampled), which
+// is exactly how `api.stats.needle.pass` has always tested it. 5.73 atlas px / 2.24
+// screen px clears the floor and lands mid-window on screen. Stated here so the next
+// round measures against the constraint that binds rather than against a number that
+// contradicts it.
 const NEEDLE_W = 0.0112;
 // Sub-branchlet and branchlet AXES have to stay above ~3 atlas px for the same
 // reason the needles do — a 1.6 px twig is the other half of the stipple.
+//
+// R6-V3, MEASURED RESIDUAL. These clear the 3 px ATLAS floor (3.07 px, and 2.30-4.61
+// px for the branchlet, which tapers with height) but they land at 1.20 and 0.90-1.80
+// SCREEN px — below the 2 px the needles themselves now hold. They are largely
+// covered by the needle clusters drawn along them, so this is a residual rather than
+// a live defect, but it is the reason the twig structure still reads as a smudge
+// rather than as twigs at 3-5 m. Raising them is not free: the axes are drawn under
+// the needles, so widening them thickens the whole plate's coverage and would have to
+// be paid for by thinning the clusters again.
 const SUBTWIG_W = 0.0060;
 const BRANCHLET_W = 0.0090;
 // The downsample a near branch card actually renders at: a 512 px cell mapped onto
 // a ~200 px card. Recorded so `api.stats.needle` can report screen px, and so the
 // number is stated once instead of being folded into a comment.
 const NEAR_CARD_DOWNSAMPLE = 0.39;
-// The imposter is a baked crown shown at 4-90 px, so it lives almost entirely in the
-// mip chain. Matched down with the near tier so the LOD seam does not step in coverage.
+// The imposter is a baked crown shown at ~6-155 px (see IMP_MIP_MAX for the
+// arithmetic), so it lives almost entirely in the mip chain.
+//
+// R6-V3 note, since this number looks like it disagrees with FOLIAGE_ALPHA_TEST and
+// does not: the bake material is `transparent:false` / `blending:Normal` /
+// `alphaToCoverage:false`, which is exactly three's `opaque` predicate, so the baked
+// shader compiles with `#define OPAQUE` and `opaque_fragment` forces `diffuseColor.a
+// = 1.0`. The baked alpha is therefore a BINARY coverage mask that has ALREADY had
+// FOLIAGE_ALPHA_TEST applied to it, not a copy of the atlas ramp. 0.30 is then a
+// threshold on a coverage FRACTION produced by the mip chain, not a second bite at
+// the same antialiased edge — and buildCoverageMips re-solves every level against it.
 const IMPOSTER_ALPHA_TEST = 0.30;
 
 // Explicit render order (R3-D10). Alpha-tested foliage MUST draw after solid geometry:
@@ -1276,6 +1383,76 @@ function buildCoverageMips(src, w, h, alphaTest, cols, rows) {
 }
 
 /**
+ * Mip chain for the baked IMPOSTOR NORMAL atlas (R6-V1).
+ *
+ * Deliberately NOT buildCoverageMips: that solve exists to hold an alpha-tested
+ * SILHOUETTE constant, and a normal atlas has no silhouette of its own — it is
+ * masked by the albedo atlas's alpha at exactly the same uv. What it does need is
+ *   * averaging in VECTOR space, not byte space;
+ *   * alpha weighting, so cleared texels outside the crown do not drag the average
+ *     toward the clear colour. The clear is (0.5, 0.5, 1.0) — "facing the camera" —
+ *     so a fully transparent block degrades to a flat card rather than to garbage.
+ *
+ * AND — the part that matters, and the part a renormalise would throw away — it
+ * stores the average WITHOUT renormalising, so the stored vector's LENGTH carries how
+ * coherent the normals were inside that texel's footprint. Level 0 comes straight off
+ * the render target at unit length; a deep level over a crown edge might be 0.3.
+ *
+ * That length is not a curiosity, it is the fix for the second half of the luminance
+ * inversion. Averaging a spread of normals and then renormalising gives a vector that
+ * faces the mean direction at FULL strength, and `max(0, N.L)` on that vector is
+ * strictly greater than the true `E[max(0, N.L)]` over the spread — a mipped normal
+ * map makes a surface brighter than the geometry it stands for. Measured on a
+ * coherent synthetic of 6 px needle strokes, the renormalising version drifted +30%
+ * in luminance by mip 4 while the albedo chain alone drifted only +9%. The shader
+ * uses the length to put that energy back where it belongs; see VEG_FRAG_IMP_ENERGY.
+ */
+function buildNormalMips(src, w, h) {
+  const levels = [{ data: src, width: w, height: h }];
+  let cur = src, cw = w, ch = h;
+  while (cw > 1 || ch > 1) {
+    const nw = Math.max(1, cw >> 1);
+    const nh = Math.max(1, ch >> 1);
+    const dst = new Uint8Array(nw * nh * 4);
+    for (let y = 0; y < nh; y++) {
+      const sy0 = Math.min(y * 2, ch - 1);
+      const sy1 = Math.min(y * 2 + 1, ch - 1);
+      for (let x = 0; x < nw; x++) {
+        const sx0 = Math.min(x * 2, cw - 1);
+        const sx1 = Math.min(x * 2 + 1, cw - 1);
+        let nx = 0, ny = 0, nz = 0, a = 0, ws = 0;
+        for (let j = 0; j < 2; j++) {
+          const yy = j === 0 ? sy0 : sy1;
+          for (let i = 0; i < 2; i++) {
+            const xx = i === 0 ? sx0 : sx1;
+            const k = (yy * cw + xx) * 4;
+            const av = cur[k + 3];
+            const wgt = av * (1 / 255) + 0.02;
+            nx += (cur[k] * (2 / 255) - 1) * wgt;
+            ny += (cur[k + 1] * (2 / 255) - 1) * wgt;
+            nz += (cur[k + 2] * (2 / 255) - 1) * wgt;
+            a += av;
+            ws += wgt;
+          }
+        }
+        // Divide by the WEIGHT SUM, not by the vector length: the result is the mean
+        // of unit vectors, so |result| <= 1 and it encodes coherence. Do not
+        // "helpfully" normalise this — see the header.
+        const inv = 1 / Math.max(ws, 1e-6);
+        const k2 = (y * nw + x) * 4;
+        dst[k2] = Math.max(0, Math.min(255, Math.round((nx * inv * 0.5 + 0.5) * 255)));
+        dst[k2 + 1] = Math.max(0, Math.min(255, Math.round((ny * inv * 0.5 + 0.5) * 255)));
+        dst[k2 + 2] = Math.max(0, Math.min(255, Math.round((nz * inv * 0.5 + 0.5) * 255)));
+        dst[k2 + 3] = (a * 0.25) | 0;
+      }
+    }
+    levels.push({ data: dst, width: nw, height: nh });
+    cur = dst; cw = nw; ch = nh;
+  }
+  return levels;
+}
+
+/**
  * Derives a tangent-space normal map from an RGBA image, treating
  * luminance × alpha as height. Downsampled: normal detail at half the albedo
  * resolution is indistinguishable and halves the memory.
@@ -1375,7 +1552,12 @@ function buildRockNormal(seed, size) {
       out[k] = (nx * inv * 0.5 + 0.5) * 255;
       out[k + 1] = (ny * inv * 0.5 + 0.5) * 255;
       out[k + 2] = (nz * inv * 0.5 + 0.5) * 255;
-      out[k + 3] = 255;
+      // R6-V4. Alpha was a hard 255 and carried nothing. It now carries the HEIGHT
+      // field the normals were derived from, which the boulder shader thresholds into
+      // a sparse quartz/mica fleck mask — see VEG_FRAG_ROCK. Free: the value is
+      // already computed, it rides in the three triplanar fetches the shader already
+      // makes, and it costs no extra texture and no extra sample.
+      out[k + 3] = Math.max(0, Math.min(255, Math.round(h[j * size + i] * 255)));
     }
   }
   const tex = new THREE.DataTexture(out, size, size, THREE.RGBAFormat);
@@ -1879,46 +2061,87 @@ function buildConifer(cfg, seed, tier) {
 }
 
 // ---------------------------------------------------------------------------
-// Far-tier imposter: three cross-quads at 60°, UV-mapped to one imposter atlas
-// cell. Normals bulge outward and up so the card still shades like a volume and
-// picks up sun direction, rather than reading as a flat sticker.
+// Far-tier imposter card (R6-V2).
+//
+// ONE quad, not three crossed ones. It is oriented in the vertex shader to face the
+// camera (see VEG_VERT_IMP_SETUP), and it samples whichever of the 16 baked
+// hemi-octahedral views is nearest to the current view direction in the tree's own
+// yawed frame. A cross-quad exists only to fake view-independence out of a single
+// baked view; once the view is selected per frame there is nothing left for the
+// second and third quads to do except double the overdraw and put a visible
+// intersection line down the middle of every distant tree.
+//
+// Geometry is in CARD space: x = across, y = along the card's own up axis, both
+// centred on the tree's CENTRE (not its base), because that is where the bake camera
+// orbits. The quad is IMP_SPAN wide and tall in unit-tree heights, so it carries the
+// cell's transparent guard band with it and the tree inside it is exactly 1.0 tall —
+// the imposter must be exactly as tall as the mesh it replaces or the LOD swap steps
+// vertically, which is far more visible than anything else in the transition.
+//
+// The vertex colour is now flat WHITE. The old fixed `ao = 0.82 + 0.16 * v` tint is
+// gone: it was a scalar standing in for the crown's shading, and the card now has the
+// near mesh's actual per-texel normals to shade with. Leaving both in would apply the
+// occlusion twice, since the authored vertex AO is already inside the baked albedo.
 // ---------------------------------------------------------------------------
 
 function buildImposterCard() {
   const B = newBuilder();
-  const hw = IMP_ASPECT * 0.5;
-  for (let c = 0; c < 3; c++) {
-    const a = (c / 3) * Math.PI;
-    const dx = Math.cos(a), dz = Math.sin(a);
-    const start = B.count;
-    for (let j = 0; j <= 2; j++) {
-      const v = j / 2;
-      for (let i = 0; i <= 1; i++) {
-        const s = i === 0 ? -1 : 1;
-        const px = dx * hw * s, pz = dz * hw * s;
-        // Outward + up, weighted so the middle of the card faces the viewer.
-        let nx = dx * s * 0.72, ny = 0.62 - v * 0.18, nz = dz * s * 0.72;
-        const nl = Math.hypot(nx, ny, nz) || 1;
-        // Crown-ensemble occlusion. The baked texel is albedo, so the card and the
-        // mesh agree on colour — but a flat card collects N·L across its whole area
-        // where a real crown is a volume with roughly half its needle area turned
-        // away from the sun and an interior that shadows itself. Without this the
-        // far tier renders systematically brighter than the mesh it replaces, which
-        // is half of the measured luminance inversion. 0.82 at the crown base rising
-        // to 0.98 at the leader (mean 0.90) matches the near mesh's own vertex AO
-        // envelope, which runs innerShade 0.52-0.60 at the axis to 1.0 at the tips.
-        const ao = 0.82 + 0.16 * v;
-        bVert(B, px, v, pz, nx / nl, ny / nl, nz / nl,
-          i, v, 0.32, 0.55 + v * 0.30, ao, ao, ao);
-      }
-    }
-    for (let j = 0; j < 2; j++) {
-      const k = start + j * 2;
-      bQuad(B, k, k + 1, k + 3, k + 2);
+  const h = IMP_SPAN * 0.5;
+  const ROWS = 2;
+  const start = B.count;
+  for (let j = 0; j <= ROWS; j++) {
+    const v = j / ROWS;
+    const y = -h + IMP_SPAN * v;
+    // Height fraction of the TREE (0 at the base, 1 at the leader) at this row. The
+    // card overhangs the tree by IMP_MARGIN at both ends, hence the clamp.
+    const hf = clamp01(0.5 + y);
+    for (let i = 0; i <= 1; i++) {
+      const x = i === 0 ? -h : h;
+      // aWind.x is the trunk-sway weight (height², matching every other tier's
+      // convention) and aWind.y the flutter/translucency thickness.
+      bVert(B, x, y, 0, 0, 0, 1, i, v, hf * hf, 0.25 + 0.35 * hf, 1, 1, 1);
     }
   }
-  const g = bGeometry(B);
-  return g;
+  for (let j = 0; j < ROWS; j++) {
+    const k = start + j * 2;
+    bQuad(B, k, k + 1, k + 3, k + 2);
+  }
+  return bGeometry(B);
+}
+
+/**
+ * Hemi-octahedral DECODE: view-grid cell (gi, gj) -> unit direction from the tree
+ * toward the camera, in the tree's own frame. The exact inverse of `vegOctaGrid()`
+ * in VEG_IMP_COMMON — if these two ever disagree the card samples the wrong view,
+ * so they are written next to each other on purpose.
+ *
+ *   u = px + pz,  v = pz - px,  py = 1 - |px| - |pz|
+ *
+ * |px| + |pz| = max(|u|, |v|), so py >= 0 everywhere on the square and is exactly 0
+ * on the border: every border cell is a horizontal view.
+ */
+function impViewDir(gi, gj, out) {
+  const n = IMP_GRID - 1;
+  const u = (gi / n) * 2 - 1;
+  const v = (gj / n) * 2 - 1;
+  const px = (u - v) * 0.5;
+  const pz = (u + v) * 0.5;
+  const py = 1 - Math.abs(px) - Math.abs(pz);
+  return out.set(px, py, pz).normalize();
+}
+
+/**
+ * The card's own basis for a given view direction, matching the runtime billboard
+ * exactly (VEG_VERT_IMP_SETUP). `right` is horizontal so the card never rolls with
+ * the camera; `up` leans back as the view elevates, which is what lets an elevated
+ * baked view read correctly instead of being painted onto a vertical plane.
+ */
+function impCardBasis(d, right, up) {
+  right.set(0, 1, 0).cross(d);
+  if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
+  else right.normalize();
+  up.copy(d).cross(right).normalize();
+  return up;
 }
 
 // ---------------------------------------------------------------------------
@@ -2585,6 +2808,35 @@ const VEG_FRAG_FADE = /* glsl */`
 	}
 `;
 
+// FINDING, R6-V3 — DELIBERATELY NOT FIXED THIS ROUND. READ BEFORE TOUCHING.
+//
+// `normal` here is in VIEW space: it comes from <normal_fragment_begin>, which is
+// `normalize( vNormal )`, and vNormal is `normalMatrix * objectNormal` — normalMatrix
+// is derived from the modelVIEW matrix. `vCanopyNormal` is in WORLD space
+// (`mat3( modelMatrix ) * vegNrmObj`, set in VEG_VERT_NORMAL). So this line mixes two
+// different spaces at a weight of 0.55-0.80, and the near/mid canopy's lighting
+// therefore rotates with the camera's yaw instead of staying put on the hillside.
+//
+// It is a genuine defect and it is a ONE-LINE fix — but not the line it looks like.
+// The stated intent (see the block comment above VEG_COMMON, item 3) is "the authored
+// vertex normal blended back over the MAPPED normal", i.e. reduce the normal map's
+// influence and keep the crown's volume shading. three already publishes exactly that
+// vector, in the right space, at exactly this point in the shader:
+//
+//     normal = normalize( mix( normal, nonPerturbedNormal, uCanopyMix ) );
+//
+// I have not applied it, for two reasons, and both should be weighed rather than
+// inherited. First, it is outside this round's brief, which is the FAR tier. Second
+// and more importantly it is not a no-op on the near tier: at uCanopyMix 0.72 the
+// corrected line reduces the foliage normal map to 28% of its authored strength,
+// where the current line effectively replaces the normal outright. That is a visible
+// change to a near canopy three rounds have tuned by eye, it cannot be verified from
+// this seat (shared dev server), and the round order lists "crushed 0.0% / clipped
+// 0.0% across all 16 shots" as a property that must survive. It wants one build and
+// one look, not a blind edit.
+//
+// The FAR tier does not wait for that: VEG_FRAG_IMP_NORMAL builds its TBN in view
+// space from the start, so the imposter path is already correct.
 const VEG_FRAG_NORMAL = /* glsl */`
 	normal = normalize( mix( normal, faceDirection * normalize( vCanopyNormal ), uCanopyMix ) );
 `;
@@ -2627,11 +2879,45 @@ const VEG_FRAG_ROCK = /* glsl */`
 		// and object-space projection would swim under per-instance scaling.
 		vec3 tw = abs( normalize( vCanopyNormal ) );
 		tw = tw / max( tw.x + tw.y + tw.z, 1e-4 );
-		vec3 tnx = texture2D( uRockNormal, vWorldPos.zy * uRockScale ).xyz * 2.0 - 1.0;
-		vec3 tny = texture2D( uRockNormal, vWorldPos.xz * uRockScale ).xyz * 2.0 - 1.0;
-		vec3 tnz = texture2D( uRockNormal, vWorldPos.xy * uRockScale ).xyz * 2.0 - 1.0;
-		vec3 dn = tnx.zyx * tw.x + tny.xzy * tw.y + tnz.xyz * tw.z;
+		vec4 tnx = texture2D( uRockNormal, vWorldPos.zy * uRockScale );
+		vec4 tny = texture2D( uRockNormal, vWorldPos.xz * uRockScale );
+		vec4 tnz = texture2D( uRockNormal, vWorldPos.xy * uRockScale );
+		vec3 dn = ( tnx.xyz * 2.0 - 1.0 ).zyx * tw.x
+			+ ( tny.xyz * 2.0 - 1.0 ).xzy * tw.y
+			+ ( tnz.xyz * 2.0 - 1.0 ).xyz * tw.z;
 		normal = normalize( normal + dn * uRockStrength );
+
+		// R6-V4. QUARTZ FLECKS — the one place this module can legitimately put a
+		// specular hit on screen, and it did not have one.
+		//
+		// Every material in this file sat at roughness 0.88-0.97, which is very close
+		// to Lambertian: there is no orientation of camera, sun and surface anywhere
+		// in the world at which vegetation could return a highlight. The whole shot
+		// set measures with no channel above 249 and no pixel above L=242, and this
+		// is part of why. Real granite and schist are not uniformly matte — they are a
+		// matte matrix with quartz and mica grains in it, and at a 19 deg sun those
+		// grains are the brightest thing on a talus slope by an order of magnitude.
+		//
+		// The mask is the top of the SAME height field the detail normals came from,
+		// carried in the map's alpha, so it costs nothing beyond the fetches above.
+		// It is deliberately sparse and deliberately mip-fading: a box-filtered height
+		// field regresses to its mean, so the smoothstep window empties out with
+		// distance and the flecks stop existing before they can become a crawling
+		// sparkle field. That is the whole specular-aliasing defence, and it is why
+		// the threshold is on a MIPPED texture rather than on a procedural hash.
+		//
+		// The window is fitted to the measured height distribution, not guessed: over a
+		// 256 px tile the packed alpha runs 19-241 with a mean of 135 (0.53), and
+		// smoothstep(0.76, 0.90) puts 2.67% of the surface somewhere on the ramp with
+		// 0.35% at full strength. Only the fraction of THAT which happens to align with
+		// the mirror direction actually lights up, so at a boulder coverage of 3-8% of
+		// frame this is well under 0.01% of pixels. It is meant to reach white; it is
+		// not meant to be measurable as a clipped-pixel percentage, and it is not.
+		// (0.80-0.95 was the first cut and reached full strength on 0.01% of texels —
+		// invisible. The distribution, not the intuition, chose these numbers.)
+		float rockH = tnx.w * tw.x + tny.w * tw.y + tnz.w * tw.z;
+		float fleck = smoothstep( 0.76, 0.90, rockH ) * uRockGlint;
+		roughnessFactor = mix( roughnessFactor, 0.20, fleck );
 	}
 `;
 
@@ -2639,6 +2925,194 @@ const VEG_FRAG_ATLAS_PARS = /* glsl */`
 uniform sampler2D uRockNormal;
 uniform float uRockScale;
 uniform float uRockStrength;
+uniform float uRockGlint;
+`;
+
+// ---------------------------------------------------------------------------
+// R6-V2. Octahedral imposter: view selection, billboard construction, and the
+// runtime relight from the baked normal atlas.
+// ---------------------------------------------------------------------------
+
+const VEG_IMP_COMMON = /* glsl */`
+const float IMP_GRID_F = ${IMP_GRID}.0;
+
+// Hemi-octahedral ENCODE: a unit direction in the tree's own frame -> [0,1]².
+// The inverse of impViewDir() on the CPU; keep the two in lockstep.
+vec2 vegOctaGrid( vec3 d ) {
+	d.y = max( d.y, 0.0 );
+	d /= max( abs( d.x ) + abs( d.y ) + abs( d.z ), 1e-5 );
+	return vec2( d.x + d.z, d.z - d.x ) * 0.5 + 0.5;
+}
+
+// Stable per-instance hash, used to STOCHASTICALLY ROUND the view-grid coordinate.
+//
+// Why not just round to the nearest view: 16 views means a 30° azimuth step, and a
+// whole hillside of trees crossing that boundary on the same frame is a synchronised
+// flash. Why not blend two views: that is two albedo + two normal fetches on a tier
+// that covers 30-50% of the pixels in the wide shots, and per-pixel cell selection
+// breaks the uv derivatives so the mip level goes wrong at every cell boundary.
+//
+// Rounding STOCHASTICALLY per instance costs nothing and is better than either: at a
+// fractional grid coordinate of 0.3, three trees in ten already show the next view,
+// so a stand crosses a view boundary as a dissolve spread over hundreds of trees.
+// The hash is a function of the instance anchor only, so it is constant in time and
+// cannot flicker, and it is evaluated per VERTEX — all four corners of a card get the
+// same answer, so the uv stays continuous across the quad and the mips stay correct.
+vec2 vegHash2( vec2 p ) {
+	return fract( sin( vec2( dot( p, vec2( 12.9898, 78.2330 ) ),
+	                         dot( p, vec2( 39.3468, 11.1357 ) ) ) )
+		* vec2( 43758.5453, 24634.6345 ) );
+}
+`;
+
+const VEG_VERT_IMP_PARS = /* glsl */`
+attribute vec2 aAtlas;
+uniform vec2 uCellUV;
+varying vec3 vImpT;
+varying vec3 vImpB;
+varying vec3 vImpN;
+${VEG_IMP_COMMON}
+`;
+
+// Runs where <uv_vertex> used to, i.e. before anything else in main(), because the
+// atlas uv it computes has to overwrite the one <uv_vertex> just wrote and the card
+// frame it computes is needed again at <project_vertex>.
+const VEG_VERT_IMP_SETUP = /* glsl */`
+	// The tree's own frame. compose() builds every tree as (translate, near-vertical
+	// rotate with a RANDOM YAW, non-uniform scale), so the instance columns are
+	// orthogonal up to scale and normalising each gives an orthonormal basis. Using
+	// the tree's own frame rather than world axes is what makes the baked azimuth
+	// relative to the instance's yaw — otherwise every tree in a stand would show the
+	// same face at the same time, which is the flattening this is meant to fix.
+	vec3 vegLX = vec3( 1.0, 0.0, 0.0 );
+	vec3 vegLY = vec3( 0.0, 1.0, 0.0 );
+	vec3 vegLZ = vec3( 0.0, 0.0, 1.0 );
+	vec3 vegBase = modelMatrix[ 3 ].xyz;
+	float vegH = 1.0;
+	#ifdef USE_INSTANCING
+		vegLX = normalize( mat3( modelMatrix ) * instanceMatrix[ 0 ].xyz );
+		vegLY = normalize( mat3( modelMatrix ) * instanceMatrix[ 1 ].xyz );
+		vegLZ = normalize( mat3( modelMatrix ) * instanceMatrix[ 2 ].xyz );
+		vegBase = ( modelMatrix * vec4( instanceMatrix[ 3 ].xyz, 1.0 ) ).xyz;
+		vegH = length( mat3( modelMatrix ) * instanceMatrix[ 1 ].xyz );
+	#endif
+	// The bake camera orbits the tree's CENTRE, so the card is centred there too.
+	vec3 vegCentre = vegBase + vegLY * ( 0.5 * vegH );
+
+	vec3 vegVD = cameraPosition - vegCentre;
+	float vegVDL = length( vegVD );
+	vegVD = vegVDL > 1e-4 ? vegVD / vegVDL : vec3( 0.0, 0.0, 1.0 );
+
+	// View-aligned billboard with a horizontal RIGHT axis: the card never rolls with
+	// the camera, but its up axis DOES lean back as the view elevates. That lean is
+	// the whole reason an elevated baked view reads correctly instead of being
+	// painted onto a vertical plane — and the aerial establishing shot is exactly
+	// the case the old fixed cross-quad could not serve.
+	vec3 vegRight = cross( vec3( 0.0, 1.0, 0.0 ), vegVD );
+	float vegRL = length( vegRight );
+	vegRight = vegRL > 1e-3 ? vegRight / vegRL : vec3( 1.0, 0.0, 0.0 );
+	vec3 vegCardUp = cross( vegVD, vegRight );
+
+	vec2 vegG = clamp( vegOctaGrid( vec3(
+		dot( vegVD, vegLX ), dot( vegVD, vegLY ), dot( vegVD, vegLZ ) ) ), 0.0, 1.0 )
+		* ( IMP_GRID_F - 1.0 );
+	vec2 vegCell = floor( vegG ) + step( vegHash2( vegBase.xz ), fract( vegG ) );
+	vegCell = clamp( vegCell, vec2( 0.0 ), vec2( IMP_GRID_F - 1.0 ) );
+	#ifdef USE_MAP
+		// aAtlas is the SPECIES block origin; uCellUV is one view cell.
+		vMapUv = aAtlas + ( vegCell + uv ) * uCellUV;
+	#endif
+`;
+
+const VEG_VERT_IMP_PROJECT = /* glsl */`
+	vec3 vegWP = vegCentre
+		+ vegRight * ( transformed.x * vegH )
+		+ vegCardUp * ( transformed.y * vegH );
+	vegWP += vegWindOffset( vegWP, vegBase.xz, aWind.x, aWind.y, vegH );
+	vWorldPos = vegWP;
+	vTrans = aWind.y;
+	// World-space, for the translucency term — which is written entirely in world
+	// space (uSunDir, cameraPosition, vWorldPos) and must stay that way.
+	vCanopyNormal = vegVD;
+
+	// VIEW-space card basis, for the baked normal map. three's lighting runs in view
+	// space, so the TBN has to be handed over in view space; building it here costs
+	// three matrix-vector products per vertex instead of per fragment.
+	mat3 vegVM = mat3( viewMatrix );
+	vImpT = normalize( vegVM * vegRight );
+	vImpB = normalize( vegVM * vegCardUp );
+	vImpN = normalize( vegVM * vegVD );
+
+	vec4 mvPosition = viewMatrix * vec4( vegWP, 1.0 );
+	gl_Position = projectionMatrix * mvPosition;
+
+	{
+		float vegD = distance( cameraPosition, vegWP );
+		float fi = ( uFadeIn.y > uFadeIn.x ) ? smoothstep( uFadeIn.x, uFadeIn.y, vegD ) : 1.0;
+		float fo = ( uFadeOut.y > uFadeOut.x ) ? ( 1.0 - smoothstep( uFadeOut.x, uFadeOut.y, vegD ) ) : 1.0;
+		vFade = clamp( fi * fo, 0.0, 1.0 );
+	}
+`;
+
+const VEG_FRAG_IMP_PARS = /* glsl */`
+uniform sampler2D uImpNormal;
+varying vec3 vImpT;
+varying vec3 vImpB;
+varying vec3 vImpN;
+`;
+
+// NOT wrapped in braces: `impCoh` is read again by VEG_FRAG_IMP_ENERGY further down
+// main(), so it has to stay in scope.
+const VEG_FRAG_IMP_NORMAL = /* glsl */`
+	// THE relight. The baked texel is the NEAR MESH's own surface normal at that
+	// point, expressed in the bake camera's frame — which is precisely the card's
+	// (right, up, toward-camera) frame at runtime. So this is a tangent-space normal
+	// map whose tangent frame is the billboard itself, and the far tier now shades
+	// from the same normals as the mesh it stands in for, instead of from a smooth
+	// outward-and-up bulge that collected the whole sky.
+	//
+	// impCoh is the LENGTH of the stored vector, which buildNormalMips leaves
+	// un-normalised on purpose: 1.0 at mip 0, falling toward 0 wherever a mip has
+	// averaged a spread of needle normals into one texel. It is consumed below.
+	vec3 impRaw = texture2D( uImpNormal, vMapUv ).xyz * 2.0 - 1.0;
+	float impCoh = clamp( length( impRaw ), 0.0, 1.0 );
+	// Below 0.05 the mean direction is noise, so fall back to +Z — facing the camera,
+	// which is what the bake cleared to. Continuous degradation, not a black rim.
+	vec3 impN = impCoh > 0.05 ? impRaw / impCoh : vec3( 0.0, 0.0, 1.0 );
+	normal = normalize( vImpT * impN.x + vImpB * impN.y + vImpN * impN.z );
+`;
+
+const VEG_FRAG_IMP_ENERGY = /* glsl */`
+	{
+		// ENERGY CONSERVATION FOR A MIPPED NORMAL FIELD.
+		//
+		// Renormalising an averaged normal and lighting it is not the same as lighting
+		// the spread it came from: max(0, N.L) is convex-ish in N over the lit
+		// hemisphere, so the mean direction at full strength is always BRIGHTER than
+		// the true E[max(0, N.L)]. That is a luminance inversion that grows with
+		// distance — exactly the family of defect this whole round is fixing, just
+		// one order smaller than the one the fixed AO tint produced.
+		//
+		// Both limits are known exactly:
+		//   * a delta distribution (impCoh = 1) gives max(0, N.L);
+		//   * an isotropic distribution (impCoh = 0) gives the average of max(0, cos)
+		//     over the sphere, which is 1/4.
+		// So mix( 0.25, N.L, impCoh ) is the correct expected response, and the ratio
+		// to what three has already accumulated is the correction. It can only darken:
+		// the clamp's upper bound is 1.0, so a normal spread can never ADD energy.
+		//
+		// Applied to directDiffuse ONLY. The ambient and hemisphere terms integrate
+		// over the whole hemisphere already and do not have this error, and scaling
+		// them would re-introduce the cool sky cast this round removed. There is
+		// exactly one DirectionalLight in this scene, so one dot product covers it.
+		if ( impCoh < 0.995 ) {
+			vec3 impSunV = normalize( ( viewMatrix * vec4( uSunDir, 0.0 ) ).xyz );
+			float impNdl = max( dot( normal, impSunV ), 0.0 );
+			float impWant = mix( 0.25, impNdl, impCoh );
+			reflectedLight.directDiffuse *= ( impNdl > 1e-3 )
+				? clamp( impWant / impNdl, 0.30, 1.0 ) : 1.0;
+		}
+	}
 `;
 
 /**
@@ -2661,7 +3135,7 @@ function createSharedUniforms() {
  * Builds a patched MeshStandardMaterial.
  * opts: { map, normalMap, alphaTest, fadeIn, fadeOut, windAmp, canopyMix,
  *         trans: [scale, power, distortion, wrap], transTint, roughness,
- *         vertexColors, side, rock, atlasScale }
+ *         vertexColors, side, rock, imposter, imposterNormal, cellUV }
  */
 function makeVegMaterial(shared, opts) {
   const mat = new THREE.MeshStandardMaterial({
@@ -2708,9 +3182,11 @@ function makeVegMaterial(shared, opts) {
     own.uRockNormal = { value: opts.rockNormal };
     own.uRockScale = { value: opts.rockScale || 0.9 };
     own.uRockStrength = { value: opts.rockStrength || 0.9 };
+    own.uRockGlint = { value: opts.rockGlint !== undefined ? opts.rockGlint : 0 };
   }
-  if (opts.atlasScale) {
-    own.uAtlasScale = { value: new THREE.Vector2(opts.atlasScale[0], opts.atlasScale[1]) };
+  if (opts.imposter) {
+    own.uCellUV = { value: new THREE.Vector2(opts.cellUV[0], opts.cellUV[1]) };
+    own.uImpNormal = { value: opts.imposterNormal || null };
   }
   mat.userData.uniforms = own;
 
@@ -2719,33 +3195,47 @@ function makeVegMaterial(shared, opts) {
 
     let v = shader.vertexShader;
     v = VEG_VERT_PARS + '\n' + v;
-    if (opts.atlasScale) {
-      v = 'attribute vec2 aAtlas;\nuniform vec2 uAtlasScale;\n' + v;
+    if (opts.imposter) {
+      v = VEG_VERT_IMP_PARS + '\n' + v;
       v = v.replace('#include <uv_vertex>',
-        '#include <uv_vertex>\n\t#ifdef USE_MAP\n\t\tvMapUv = uv * uAtlasScale + aAtlas;\n\t#endif');
+        '#include <uv_vertex>\n' + VEG_VERT_IMP_SETUP);
+      // No VEG_VERT_NORMAL: the card's own vertex normal is meaningless once the
+      // quad is oriented in the shader, and vCanopyNormal is written in the project
+      // block instead. Injecting both would just assign the varying twice.
+      v = v.replace('#include <project_vertex>', VEG_VERT_IMP_PROJECT);
+    } else {
+      v = v.replace('#include <defaultnormal_vertex>',
+        '#include <defaultnormal_vertex>\n' + VEG_VERT_NORMAL);
+      v = v.replace('#include <project_vertex>', VEG_VERT_PROJECT);
     }
-    v = v.replace('#include <defaultnormal_vertex>',
-      '#include <defaultnormal_vertex>\n' + VEG_VERT_NORMAL);
-    v = v.replace('#include <project_vertex>', VEG_VERT_PROJECT);
     v = v.replace('#include <worldpos_vertex>', VEG_VERT_WORLDPOS);
     shader.vertexShader = v;
 
     let f = shader.fragmentShader;
-    f = VEG_FRAG_PARS + (opts.rock ? VEG_FRAG_ATLAS_PARS : '') + '\n' + f;
+    f = VEG_FRAG_PARS + (opts.rock ? VEG_FRAG_ATLAS_PARS : '')
+      + (opts.imposter ? VEG_FRAG_IMP_PARS : '') + '\n' + f;
     f = f.replace('#include <clipping_planes_fragment>',
       '#include <clipping_planes_fragment>\n' + VEG_FRAG_FADE);
     f = f.replace('#include <normal_fragment_maps>',
-      '#include <normal_fragment_maps>\n' + (opts.rock ? VEG_FRAG_ROCK : VEG_FRAG_NORMAL));
-    if (!opts.noTranslucency) {
+      '#include <normal_fragment_maps>\n' + (opts.rock ? VEG_FRAG_ROCK
+        : opts.imposter ? VEG_FRAG_IMP_NORMAL : VEG_FRAG_NORMAL));
+    // ONE replace, not two. The energy correction must run BEFORE the translucency is
+    // added — it corrects the DIRECT DIFFUSE term three just accumulated, whereas
+    // transmission is a separate transport path that was never over-counted — and two
+    // successive replaces against the same marker would emit them in the reverse
+    // order, silently scaling the backlight as well.
+    const tail = (opts.imposter ? VEG_FRAG_IMP_ENERGY : '')
+      + (opts.noTranslucency ? '' : VEG_FRAG_TRANSLUCENCY);
+    if (tail) {
       f = f.replace('#include <lights_fragment_end>',
-        '#include <lights_fragment_end>\n' + VEG_FRAG_TRANSLUCENCY);
+        '#include <lights_fragment_end>\n' + tail);
     }
     shader.fragmentShader = f;
   };
   // Distinct cache key per configuration so three does not share programs between
   // materials whose injected code differs.
   mat.customProgramCacheKey = () => 'veg|' + (opts.name || '') + '|' + (opts.rock ? 'r' : '') +
-    (opts.atlasScale ? 'a' : '') + (opts.noTranslucency ? 'n' : '');
+    (opts.imposter ? 'i' : '') + (opts.noTranslucency ? 'n' : '');
   return mat;
 }
 
@@ -3294,24 +3784,66 @@ const SPECIES = [
   },
 ];
 
+// Normal-bake shader. Deliberately a raw ShaderMaterial rather than
+// MeshNormalMaterial: MeshNormalMaterial has no `map`, so it cannot alpha-test the
+// foliage atlas, and baking a conifer's normals without discarding the empty 85% of
+// every needle card would fill the crown with the card's own flat plane normal.
+//
+// The output is the VIEW-space normal of whichever surface won the depth test,
+// packed 0..1, with alpha = 1 for kept fragments. Back faces are flipped, because a
+// DoubleSide needle card seen from behind is still lit from the side you can see.
+// A ShaderMaterial gets no <colorspace_fragment>, so this writes raw bytes — which
+// is what a normal map wants, and why the target is tagged NoColorSpace.
+const IMP_NRM_VERT = /* glsl */`
+varying vec2 vImpUvN;
+varying vec3 vImpNrmV;
+void main() {
+	vImpUvN = uv;
+	vImpNrmV = normalize( normalMatrix * normal );
+	gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+}
+`;
+
+const IMP_NRM_FRAG = /* glsl */`
+uniform sampler2D map;
+uniform float alphaCut;
+varying vec2 vImpUvN;
+varying vec3 vImpNrmV;
+void main() {
+	vec4 t = texture2D( map, vImpUvN );
+	if ( t.a < alphaCut ) discard;
+	vec3 n = normalize( vImpNrmV );
+	if ( !gl_FrontFacing ) n = -n;
+	gl_FragColor = vec4( n * 0.5 + 0.5, 1.0 );
+}
+`;
+
 /**
- * Bakes each species' near-tier mesh into one atlas using the live renderer.
+ * Bakes every species' near-tier mesh into an ALBEDO atlas and a matching NORMAL
+ * atlas, over IMP_GRID² hemi-octahedral view directions each. (R6-V1 + R6-V2.)
  *
- * The bake must produce ALBEDO, not shaded colour. Under three's Lambert BRDF the
- * outgoing radiance is `irradiance · albedo / π`, so an AmbientLight of exactly π
- * and nothing else writes `albedo` into the texel, bit for bit. The previous bake
- * used `π · 0.80` plus a HemisphereLight at 0.85 — which is neither albedo (it is
- * ~5% hot and carries a blue/olive vertical gradient the scene will then apply a
- * *second* time) nor shaded colour. The authored per-vertex crown occlusion
- * (`innerShade`, the tube curvature AO) is already in the geometry's `color`
- * attribute, so it survives the bake and the far card keeps the near mesh's own
- * self-shading without any lighting being double-counted.
+ * ALBEDO. The bake must produce albedo, not shaded colour. Under three's Lambert
+ * BRDF the outgoing radiance is `irradiance · albedo / π`, so an AmbientLight of
+ * exactly π and nothing else writes `albedo` into the texel, bit for bit. The
+ * authored per-vertex crown occlusion (`innerShade`, the tube curvature AO) is in
+ * the geometry's `color` attribute, so it survives the bake and the card keeps the
+ * near mesh's own self-shading without any lighting being double-counted.
  *
- * Returns a WebGLRenderTarget, or null if anything about the render path refuses —
- * in which case the caller falls back to a canvas-drawn silhouette atlas.
+ * NORMAL. This is the half that did not exist, and its absence is the root cause of
+ * the far-tier defect: with no baked normal the card could only shade from its own
+ * vertex bulge, which points essentially straight up in the middle of the card and
+ * therefore collected the entire hemisphere-light sky term. Baking the near mesh's
+ * own view-space normals and relighting through them makes the far tier respond to
+ * the sun the same way the mesh it replaces does — which is the whole ask.
+ *
+ * The two targets are baked in one pass over the same camera set so a view can never
+ * disagree between them.
+ *
+ * Returns { albedo, normal } WebGLRenderTargets, or null if the render path refuses,
+ * in which case the caller falls back to canvas-drawn atlases.
  */
 function bakeImposterAtlas(renderer, geometries, atlasMap) {
-  let rt = null;
+  let rtA = null, rtN = null;
   const prevTarget = renderer.getRenderTarget();
   const prevAutoClear = renderer.autoClear;
   const prevClear = new THREE.Color();
@@ -3324,27 +3856,30 @@ function bakeImposterAtlas(renderer, geometries, atlasMap) {
   renderer.getViewport(prevViewport);
   renderer.getScissor(prevScissor);
 
+  let bakeMat = null, nrmMat = null, scene = null;
   try {
-    rt = new THREE.WebGLRenderTarget(IMP_W, IMP_H, {
+    const rtOpts = {
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
-      generateMipmaps: false,     // the chain is rebuilt on the CPU, coverage-preserved
+      generateMipmaps: false,     // the chains are rebuilt on the CPU
       depthBuffer: true,
       stencilBuffer: false,
-    });
-    rt.texture.colorSpace = THREE.SRGBColorSpace;
-    rt.texture.wrapS = THREE.ClampToEdgeWrapping;
-    rt.texture.wrapT = THREE.ClampToEdgeWrapping;
-    rt.texture.anisotropy = THREE.Texture.DEFAULT_ANISOTROPY || 4;
+    };
+    rtA = new THREE.WebGLRenderTarget(IMP_W, IMP_H, rtOpts);
+    rtA.texture.colorSpace = THREE.SRGBColorSpace;
+    rtA.texture.wrapS = rtA.texture.wrapT = THREE.ClampToEdgeWrapping;
+    rtN = new THREE.WebGLRenderTarget(IMP_NW, IMP_NH, rtOpts);
+    rtN.texture.colorSpace = THREE.NoColorSpace;
+    rtN.texture.wrapS = rtN.texture.wrapT = THREE.ClampToEdgeWrapping;
 
-    const scene = new THREE.Scene();
+    scene = new THREE.Scene();
     scene.background = null;
     // Exactly π, and nothing else: irradiance π · (albedo/π) = albedo.
     scene.add(new THREE.AmbientLight(0xffffff, Math.PI));
 
-    const bakeMat = new THREE.MeshStandardMaterial({
+    bakeMat = new THREE.MeshStandardMaterial({
       map: atlasMap,
       color: 0xffffff,
       roughness: 1.0,          // kill the specular lobe; this is an albedo bake
@@ -3355,60 +3890,92 @@ function bakeImposterAtlas(renderer, geometries, atlasMap) {
       vertexColors: true,
       fog: false,
     });
+    nrmMat = new THREE.ShaderMaterial({
+      uniforms: { map: { value: atlasMap }, alphaCut: { value: FOLIAGE_ALPHA_TEST } },
+      vertexShader: IMP_NRM_VERT,
+      fragmentShader: IMP_NRM_FRAG,
+      side: THREE.DoubleSide,
+      fog: false,
+    });
 
+    // Ortho box = one cell exactly, centred on the tree's centre. IMP_SPAN carries
+    // the guard band, so the tree itself is 1.0 tall inside a 1.12 cell.
     const cam = new THREE.OrthographicCamera(
-      -IMP_ASPECT * 0.5, IMP_ASPECT * 0.5, 1.02, -0.02, -4, 4);
-    cam.position.set(0, 0, 0);
-    cam.lookAt(0, 0, -1);
-    cam.updateMatrixWorld(true);
-
-    renderer.toneMapping = THREE.NoToneMapping;
-    renderer.setRenderTarget(rt);
-    renderer.autoClear = false;
-    renderer.setScissorTest(false);
-    // Clear to a dark foliage green with zero alpha: mip generation averages RGB
-    // across the alpha edge, and clearing to black would rim every imposter.
-    renderer.setClearColor(0x14200e, 0);
-    renderer.clear(true, true, false);
-    renderer.setScissorTest(true);
+      -IMP_SPAN * 0.5, IMP_SPAN * 0.5, IMP_SPAN * 0.5, -IMP_SPAN * 0.5, 0.05, 4);
+    const target = new THREE.Vector3(0, 0.5, 0);
+    const dir = new THREE.Vector3();
+    const right = new THREE.Vector3();
+    const cardUp = new THREE.Vector3();
 
     const mesh = new THREE.Mesh(geometries[0], bakeMat);
     scene.add(mesh);
 
-    const slots = Math.min(geometries.length, IMP_COLS * IMP_ROWS);
-    for (let i = 0; i < slots; i++) {
-      mesh.geometry = geometries[i];
-      // The unit tree spans y 0..1, x/z within ±halfWidth. The imposter MUST be
-      // exactly as tall as the mesh it replaces or the LOD swap steps vertically —
-      // a far more visible error than clipping a few branch tips at the cell edge.
-      // So allow the crown to overhang the cell by up to 12% before shrinking at
-      // all: the widest species (subalpine fir) overhangs by ~8%, which used to
-      // shrink its imposter to 92% height and pop every tree at 214 m.
-      // ...and never shrink by more than 3% whatever happens: at 214 m a 25 m tree is
-      // ~90 px tall, so 3% is under 3 px of step while a crown clipped at the cell
-      // edge is invisible at that range.
-      const hw = Math.max(0.02, geometries[i].userData.halfWidth || 0);
-      const scaleToFit = Math.max(0.97,
-        Math.min(1, ((IMP_ASPECT * 0.5 * 0.985) / hw) * 1.12));
-      mesh.scale.setScalar(scaleToFit);
-      mesh.position.set(0, 0, 0);
-      mesh.rotation.set(0, 0, 0);
-      mesh.updateMatrixWorld(true);
-      // GL viewport origin is bottom-left and render-target textures are sampled
-      // with v=0 at the bottom, so row index maps straight through to the uv
-      // offset used by aAtlas.
-      const x = (i % IMP_COLS) * IMP_CELL_W;
-      const y = ((i / IMP_COLS) | 0) * IMP_CELL_H;
-      renderer.setViewport(x, y, IMP_CELL_W, IMP_CELL_H);
-      renderer.setScissor(x, y, IMP_CELL_W, IMP_CELL_H);
-      renderer.render(scene, cam);
+    const slots = Math.min(geometries.length, IMP_SP_COLS * IMP_SP_ROWS);
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.autoClear = false;
+
+    for (let pass = 0; pass < 2; pass++) {
+      const albedo = pass === 0;
+      const cellPx = albedo ? IMP_CELL : IMP_CELL / IMP_NRM_DIV;
+      mesh.material = albedo ? bakeMat : nrmMat;
+      renderer.setRenderTarget(albedo ? rtA : rtN);
+      renderer.setScissorTest(false);
+      // Albedo clears to a dark foliage green at zero alpha (mip generation averages
+      // RGB across the alpha edge, and black would rim every card); the normal atlas
+      // clears to +Z, "facing the camera", for the same reason.
+      if (albedo) renderer.setClearColor(0x14200e, 0);
+      else renderer.setClearColor(0x8080ff, 0);
+      renderer.clear(true, true, false);
+      renderer.setScissorTest(true);
+
+      for (let s = 0; s < slots; s++) {
+        mesh.geometry = geometries[s];
+        // The unit tree spans y 0..1, x/z within ±halfWidth. The imposter MUST be
+        // exactly as tall as the mesh it replaces or the LOD swap steps vertically —
+        // a far more visible error than clipping a few branch tips at the cell edge.
+        // So only shrink once the crown would eat into the guard band, and never by
+        // more than 3%: at 250 m a 25 m tree is ~77 px tall, so 3% is 2 px of step.
+        const hw = Math.max(0.02, geometries[s].userData.halfWidth || 0);
+        const scaleToFit = Math.max(0.97, Math.min(1, 0.5 / hw));
+        mesh.scale.setScalar(scaleToFit);
+        mesh.position.set(0, 0, 0);
+        mesh.rotation.set(0, 0, 0);
+        mesh.updateMatrixWorld(true);
+        const spCol = s % IMP_SP_COLS;
+        const spRow = (s / IMP_SP_COLS) | 0;
+        for (let gj = 0; gj < IMP_GRID; gj++) {
+          for (let gi = 0; gi < IMP_GRID; gi++) {
+            impViewDir(gi, gj, dir);
+            impCardBasis(dir, right, cardUp);
+            // Matrix4.lookAt derives x from cross(up, z); with up = cardUp and
+            // z = dir that returns exactly `right`, so the bake camera's basis IS
+            // the runtime card's basis. The two constructions must not drift.
+            cam.up.copy(cardUp);
+            cam.position.copy(target).addScaledVector(dir, 2);
+            cam.lookAt(target);
+            cam.updateMatrixWorld(true);
+            // GL viewport origin is bottom-left and render-target textures sample
+            // with v=0 at the bottom, so cell row maps straight through to the uv
+            // offset used by aAtlas + the shader's view-cell index.
+            const cx = (spCol * IMP_GRID + gi) * cellPx;
+            const cy = (spRow * IMP_GRID + gj) * cellPx;
+            renderer.setViewport(cx, cy, cellPx, cellPx);
+            renderer.setScissor(cx, cy, cellPx, cellPx);
+            renderer.render(scene, cam);
+          }
+        }
+      }
     }
 
-    bakeMat.dispose();
     scene.clear();
-    return rt;
+    bakeMat.dispose(); nrmMat.dispose();
+    return { albedo: rtA, normal: rtN };
   } catch (err) {
-    if (rt) rt.dispose();
+    if (rtA) rtA.dispose();
+    if (rtN) rtN.dispose();
+    if (bakeMat) bakeMat.dispose();
+    if (nrmMat) nrmMat.dispose();
+    if (scene) scene.clear();
     console.warn('[vegetation] imposter bake failed, using canvas fallback', err);
     return null;
   } finally {
@@ -3466,51 +4033,163 @@ function hueDelta(a, b) {
 }
 
 /**
- * Read the baked imposter atlas back to the CPU, rebuild its mip chain with per-cell
- * alpha coverage preserved, and run the LOD-match regression check.
+ * Median of the LIT colour over the texels that survive `alphaTest`, given an albedo
+ * level and the matching normal level, both at w×h.
  *
- * THE REGRESSION CHECK. The review measured the far imposter tier at RGB(156,138,113)
- * — a warm tan — against a near canopy of RGB(51,73,42): a 60° hue rotation and an
- * inverted luminance ramp. The mechanism is mip coverage loss, and it is measurable
- * without a screenshot: the atlas at mip 0 IS the near tier's albedo (it is baked from
- * the same geometry under a π ambient), so any drift between mip 0 and the mip levels
- * actually sampled at 250-920 m is exactly the near/far mismatch. The check asserts
- * every sampled level stays within 12% luminance and 8° hue of mip 0 — the tolerance
- * the work order names — and reports the worst level either way.
+ * The shading is deliberately the crudest defensible model — one directional term
+ * plus a flat ambient — because the quantity being compared is a RATIO between two
+ * mip levels of the same pair, and every term that is common to both cancels. What
+ * must NOT cancel, and does not, is the normal: that is the whole variable under
+ * test.
+ *
+ * It applies the SAME energy correction the shader does (VEG_FRAG_IMP_ENERGY),
+ * including the 0.30 clamp floor, because a regression check that measures a
+ * different shading model from the one that ships measures nothing.
  */
-function finaliseImposterAtlas(renderer, rt) {
-  const buf = new Uint8Array(IMP_W * IMP_H * 4);
-  renderer.readRenderTargetPixels(rt, 0, 0, IMP_W, IMP_H, buf);
-
-  const levels = buildCoverageMips(buf, IMP_W, IMP_H, IMPOSTER_ALPHA_TEST, IMP_COLS, IMP_ROWS);
-
-  const base = medianRGBOver(levels[0].data, IMPOSTER_ALPHA_TEST);
-  const report = {
-    base: base ? [base.r, base.g, base.b] : null,
-    worstLevel: 0, worstLum: 0, worstHue: 0, pass: true, levels: [],
+function medianLitRGB(alb, nrm, w, h, alphaTest, Lx, Ly, Lz, amb) {
+  const thr = alphaTest * 255;
+  const hr = new Uint32Array(256), hg = new Uint32Array(256), hb = new Uint32Array(256);
+  let n = 0;
+  for (let k = 0; k < w * h * 4; k += 4) {
+    if (alb[k + 3] < thr) continue;
+    let nx = nrm[k] * (2 / 255) - 1;
+    let ny = nrm[k + 1] * (2 / 255) - 1;
+    let nz = nrm[k + 2] * (2 / 255) - 1;
+    let coh = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (coh > 1) coh = 1;
+    if (coh > 0.05) { nx /= coh; ny /= coh; nz /= coh; } else { nx = 0; ny = 0; nz = 1; }
+    let ndl = nx * Lx + ny * Ly + nz * Lz;
+    if (ndl < 0) ndl = 0;
+    let direct = ndl;
+    if (coh < 0.995 && ndl > 1e-3) {
+      let corr = (0.25 + (ndl - 0.25) * coh) / ndl;
+      if (corr > 1) corr = 1; else if (corr < 0.30) corr = 0.30;
+      direct = ndl * corr;
+    }
+    const s = direct + amb;
+    const r = SRGB_TO_LIN[alb[k]] * s;
+    const g = SRGB_TO_LIN[alb[k + 1]] * s;
+    const b = SRGB_TO_LIN[alb[k + 2]] * s;
+    hr[LIN_TO_SRGB[Math.min(4095, (r * 4095) | 0)]]++;
+    hg[LIN_TO_SRGB[Math.min(4095, (g * 4095) | 0)]]++;
+    hb[LIN_TO_SRGB[Math.min(4095, (b * 4095) | 0)]]++;
+    n++;
+  }
+  if (n === 0) return null;
+  const pick = (hist) => {
+    let c = 0;
+    for (let i = 0; i < 256; i++) { c += hist[i]; if (c * 2 >= n) return i; }
+    return 255;
   };
-  if (base) {
-    const L0 = Math.max(1e-5, lumOfSRGB(base));
-    const H0 = hueOfSRGB(base);
-    // Levels 1..6 are what a 4-250 px card actually samples (IMP_CELL_H = 512, so
-    // level L is a 512>>L px cell). Below that the card is under 8 px and the tier
-    // has already faded out at 920 m.
-    const last = Math.min(6, levels.length - 1);
-    for (let i = 1; i <= last; i++) {
-      const m = medianRGBOver(levels[i].data, IMPOSTER_ALPHA_TEST);
+  return { r: pick(hr), g: pick(hg), b: pick(hb), n };
+}
+
+/**
+ * Read both baked atlases back to the CPU, rebuild their mip chains, and run the
+ * near/far LOD-match regression check the round-3 order asked for.
+ *
+ * WHAT THE CHECK IS, PRECISELY, because the wording matters. The order asks for
+ * "far-tier median RGB within 12% luminance and 8° hue of near-tier canopy under the
+ * same sun". After R6-V1 the far tier renders the NEAR MESH's own albedo through the
+ * NEAR MESH's own normals — that is what the pair is — so the near tier and the far
+ * tier are no longer two different assets that can drift apart in authoring. They are
+ * the same asset at two mip levels. The whole of the remaining near/far difference is
+ * therefore mip drift, and measuring it IS measuring the near/far match:
+ *
+ *   * reference  = albedo level 1 with normal level 0 (a 80 px cell, still full
+ *     detail — this is the near mesh as rendered);
+ *   * far tier   = albedo levels 2..IMP_MIP_MAX with normal levels 1.., which is the
+ *     band the card actually samples (see IMP_MIP_MAX for the arithmetic);
+ *   * both are LIT with the same sun, at 19° elevation and 35° off the view axis,
+ *     matching the scene's golden-hour sun, before the medians are taken.
+ *
+ * The pairing is offset by one because the normal atlas is baked at half the linear
+ * resolution: albedo level i and normal level i-1 have identical dimensions.
+ *
+ * The honest limit of this check: it cannot catch an error that is COMMON to both
+ * levels (a wrong bake camera, say). For that, the number to watch on a screenshot is
+ * `litMedian` below against the measured near canopy — r6_00 measured near canopy
+ * rgb(68,94,52) at hue 97.5° and far band rgb(116,146,128) at hue 142.2°.
+ */
+function finaliseImposterAtlas(renderer, rts) {
+  const bufA = new Uint8Array(IMP_W * IMP_H * 4);
+  renderer.readRenderTargetPixels(rts.albedo, 0, 0, IMP_W, IMP_H, bufA);
+  const bufN = new Uint8Array(IMP_NW * IMP_NH * 4);
+  renderer.readRenderTargetPixels(rts.normal, 0, 0, IMP_NW, IMP_NH, bufN);
+
+  const levels = buildCoverageMips(bufA, IMP_W, IMP_H, IMPOSTER_ALPHA_TEST,
+    IMP_COLS, IMP_ROWS);
+  const nrmLevels = buildNormalMips(bufN, IMP_NW, IMP_NH);
+
+  // Sun at 19° elevation, 35° in azimuth off the card's view axis — the scene's own
+  // golden-hour geometry, expressed in the card frame the baked normals live in.
+  const el = 19 * Math.PI / 180, az = 35 * Math.PI / 180;
+  const Lx = Math.sin(az) * Math.cos(el);
+  const Ly = Math.sin(el);
+  const Lz = Math.cos(az) * Math.cos(el);
+  const AMB = 0.22;
+
+  // Offset of the normal chain against the albedo chain: half-res normals.
+  const NOFF = Math.round(Math.log2(IMP_NRM_DIV));   // 1
+
+  const report = {
+    grid: IMP_GRID, views: IMP_GRID * IMP_GRID, cellPx: IMP_CELL,
+    ref: null, litMedian: null, refHue: 0,
+    worstLevel: 0, worstLum: 0, worstHue: 0, pass: true, levels: [],
+    albedoBase: null, albedoWorstLum: 0, albedoWorstHue: 0,
+  };
+
+  const litAt = (i) => {
+    const j = i - NOFF;
+    if (j < 0 || j >= nrmLevels.length || i >= levels.length) return null;
+    const a = levels[i], nn = nrmLevels[j];
+    if (a.width !== nn.width || a.height !== nn.height) return null;
+    return medianLitRGB(a.data, nn.data, a.width, a.height,
+      IMPOSTER_ALPHA_TEST, Lx, Ly, Lz, AMB);
+  };
+
+  const ref = litAt(1);
+  if (ref) {
+    const L0 = Math.max(1e-5, lumOfSRGB(ref));
+    const H0 = hueOfSRGB(ref);
+    report.ref = [ref.r, ref.g, ref.b];
+    report.litMedian = [ref.r, ref.g, ref.b];
+    report.refHue = H0;
+    const last = Math.min(IMP_MIP_MAX, levels.length - 1);
+    for (let i = 2; i <= last; i++) {
+      const m = litAt(i);
       if (!m) continue;
       const dL = Math.abs(lumOfSRGB(m) - L0) / L0;
       const dH = hueDelta(hueOfSRGB(m), H0);
-      report.levels.push({ level: i, rgb: [m.r, m.g, m.b], dLum: dL, dHue: dH });
+      report.levels.push({ level: i, cellPx: IMP_CELL >> i, rgb: [m.r, m.g, m.b], dLum: dL, dHue: dH });
       if (dL > report.worstLum) { report.worstLum = dL; report.worstLevel = i; }
       if (dH > report.worstHue) report.worstHue = dH;
     }
     report.pass = report.worstLum <= 0.12 && report.worstHue <= 8;
     if (!report.pass) {
-      console.warn('[vegetation] imposter LOD match FAILED: worst mip drift ' +
+      console.warn('[vegetation] imposter near/far match FAILED: worst drift ' +
         (report.worstLum * 100).toFixed(1) + '% luminance / ' +
-        report.worstHue.toFixed(1) + '° hue (budget 12% / 8°), mip0 median rgb(' +
-        base.r + ',' + base.g + ',' + base.b + ')');
+        report.worstHue.toFixed(1) + '° hue (budget 12% / 8°) at mip ' +
+        report.worstLevel + '; lit reference rgb(' + ref.r + ',' + ref.g + ',' + ref.b + ')');
+    }
+  }
+
+  // Second, cheaper cut on the albedo alone. Kept because it isolates the coverage
+  // mip solve from the normal chain: if the lit check fails and this one passes, the
+  // normals are at fault, and vice versa.
+  const ab = medianRGBOver(levels[0].data, IMPOSTER_ALPHA_TEST);
+  if (ab) {
+    report.albedoBase = [ab.r, ab.g, ab.b];
+    const L0 = Math.max(1e-5, lumOfSRGB(ab));
+    const H0 = hueOfSRGB(ab);
+    const last = Math.min(IMP_MIP_MAX, levels.length - 1);
+    for (let i = 1; i <= last; i++) {
+      const m = medianRGBOver(levels[i].data, IMPOSTER_ALPHA_TEST);
+      if (!m) continue;
+      const dL = Math.abs(lumOfSRGB(m) - L0) / L0;
+      const dH = hueDelta(hueOfSRGB(m), H0);
+      if (dL > report.albedoWorstLum) report.albedoWorstLum = dL;
+      if (dH > report.albedoWorstHue) report.albedoWorstHue = dH;
     }
   }
 
@@ -3529,46 +4208,87 @@ function finaliseImposterAtlas(renderer, rt) {
   tex.generateMipmaps = false;
   tex.mipmaps = levels;
   tex.needsUpdate = true;
-  return { texture: tex, report };
+
+  const ntex = new THREE.DataTexture(nrmLevels[0].data, IMP_NW, IMP_NH,
+    THREE.RGBAFormat, THREE.UnsignedByteType);
+  // A normal map is data, never colour. Tagging this sRGB would put the whole far
+  // tier's shading through a 2.4 gamma and is the classic way to lose this fix.
+  ntex.colorSpace = THREE.NoColorSpace;
+  ntex.wrapS = THREE.ClampToEdgeWrapping;
+  ntex.wrapT = THREE.ClampToEdgeWrapping;
+  ntex.minFilter = THREE.LinearMipmapLinearFilter;
+  ntex.magFilter = THREE.LinearFilter;
+  ntex.flipY = false;
+  ntex.generateMipmaps = false;
+  ntex.mipmaps = nrmLevels;
+  ntex.needsUpdate = true;
+
+  return { texture: tex, normal: ntex, report };
 }
 
-/** Canvas-drawn conifer silhouettes — only used if the RT bake is unavailable. */
+/**
+ * Canvas-drawn conifer silhouettes plus a dome normal atlas — only used if the RT
+ * bake is unavailable (no renderer, a lost context at boot, a readback refusal).
+ *
+ * It fills every one of the IMP_GRID² view cells of a species with the SAME
+ * silhouette, so the octahedral selection still runs and still produces valid uvs;
+ * it just has nothing view-dependent to select between. The normal atlas is a dome
+ * per cell — which is what the old cross-quad's vertex bulge was, except that it is
+ * now applied in the card's own view-space frame rather than being a world-space
+ * normal fed into a view-space lighting path. So the fallback degrades to roughly
+ * what shipped before this round, deliberately, rather than to a flat sticker.
+ */
 function fallbackImposterAtlas(seed) {
-  const rng = makeRng(subSeed(seed, 'veg-imp-fallback'));
   const canvas = newCanvas(IMP_W, IMP_H);
   const g = canvas.getContext('2d');
   g.clearRect(0, 0, IMP_W, IMP_H);
-  for (let s = 0; s < SPECIES.length && s < IMP_COLS * IMP_ROWS; s++) {
+  const cell = newCanvas(IMP_CELL, IMP_CELL);
+  const cg = cell.getContext('2d');
+  const nSp = Math.min(SPECIES.length, IMP_SP_COLS * IMP_SP_ROWS);
+  for (let s = 0; s < nSp; s++) {
     const sp = SPECIES[s];
-    const col = s % IMP_COLS;
-    // The CanvasTexture keeps flipY, so uv row 0 must be drawn in the BOTTOM
-    // canvas band — hence the row inversion here but not in the RT bake.
-    const row = (s / IMP_COLS) | 0;
-    const x0 = col * IMP_CELL_W;
-    const y0 = (IMP_ROWS - 1 - row) * IMP_CELL_H;
-    g.save();
-    g.beginPath(); g.rect(x0, y0, IMP_CELL_W, IMP_CELL_H); g.clip();
-    const cx = x0 + IMP_CELL_W * 0.5;
-    const crownTop = y0 + IMP_CELL_H * 0.02;
-    const crownBot = y0 + IMP_CELL_H * (1 - sp.crownStart);
-    const maxW = IMP_CELL_H * 0.30;
+    // Redraw the silhouette once per species into a scratch cell, then blit it into
+    // all IMP_GRID² view cells — 16 drawImage calls instead of 16 x 240 ellipses.
+    const rng = makeRng(subSeed(seed, 'veg-imp-fallback-' + sp.key));
+    cg.clearRect(0, 0, IMP_CELL, IMP_CELL);
+    const cx = IMP_CELL * 0.5;
+    // The tree occupies 1/IMP_SPAN of the cell, centred: the guard band is real in
+    // the fallback too or the mip chain bleeds one view cell into the next.
+    const top = IMP_CELL * (IMP_MARGIN / IMP_SPAN);
+    const bot = IMP_CELL * ((1 + IMP_MARGIN) / IMP_SPAN);
+    // Canvas y for height fraction f above the base is lerp(bot, top, f), so the
+    // crown's lower limit is at f = crownStart. (Canvas y runs down; `bot` is the
+    // larger number.)
+    const crownBot = lerp(bot, top, sp.crownStart);
+    const maxW = (bot - top) * 0.30;
     if (!sp.snag) {
       for (let i = 0; i < 240; i++) {
         const t = Math.pow(rng(), 0.7);
-        const y = lerp(crownTop, crownBot, t);
+        const y = lerp(top, crownBot, t);
         const w = maxW * Math.pow(t, 0.72) * (0.7 + rng() * 0.5);
         const cpx = cx + (rng() - 0.5) * 2 * w;
-        const r = IMP_CELL_W * (0.030 + rng() * 0.045);
-        g.fillStyle = hsl(sp.hue + (rng() - 0.5) * 0.04, 0.36,
+        const r = IMP_CELL * (0.030 + rng() * 0.045);
+        cg.fillStyle = hsl(sp.hue + (rng() - 0.5) * 0.04, 0.36,
           0.10 + rng() * 0.16 + (1 - Math.abs(cpx - cx) / (w + 1)) * 0.04);
-        g.beginPath(); g.ellipse(cpx, y, r * 1.3, r * 0.75, 0, 0, TAU); g.fill();
+        cg.beginPath(); cg.ellipse(cpx, y, r * 1.3, r * 0.75, 0, 0, TAU); cg.fill();
       }
     }
-    g.fillStyle = hsl(0.08, 0.22, 0.16);
-    const tw = IMP_CELL_W * 0.035;
-    const trunkTop = y0 + IMP_CELL_H * (1 - (sp.snag ? sp.snagBreak : 1));
-    g.fillRect(cx - tw * 0.5, trunkTop, tw, y0 + IMP_CELL_H - trunkTop);
-    g.restore();
+    cg.fillStyle = hsl(0.08, 0.22, 0.16);
+    const tw = IMP_CELL * 0.035;
+    const trunkTop = lerp(bot, top, sp.snag ? sp.snagBreak : 1);
+    cg.fillRect(cx - tw * 0.5, trunkTop, tw, bot - trunkTop);
+
+    const spCol = s % IMP_SP_COLS;
+    const spRow = (s / IMP_SP_COLS) | 0;
+    for (let gj = 0; gj < IMP_GRID; gj++) {
+      for (let gi = 0; gi < IMP_GRID; gi++) {
+        const x0 = (spCol * IMP_GRID + gi) * IMP_CELL;
+        // The CanvasTexture keeps flipY, so uv row 0 must be drawn in the BOTTOM
+        // canvas band — hence the row inversion here but not in the RT bake.
+        const y0 = (IMP_ROWS - 1 - (spRow * IMP_GRID + gj)) * IMP_CELL;
+        g.drawImage(cell, x0, y0);
+      }
+    }
   }
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -3576,6 +4296,37 @@ function fallbackImposterAtlas(seed) {
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = true;
+  return tex;
+}
+
+/** Dome-normal atlas matching fallbackImposterAtlas's layout. See its header. */
+function fallbackImposterNormal() {
+  const data = new Uint8Array(IMP_NW * IMP_NH * 4);
+  const cw = IMP_NW / IMP_COLS, chh = IMP_NH / IMP_ROWS;
+  for (let y = 0; y < IMP_NH; y++) {
+    // v measured within the cell, 0 at the bottom. flipY is false on this texture,
+    // matching the baked path, so row 0 of the buffer is v = 0.
+    const fy = (y % chh) / chh * 2 - 1;
+    for (let x = 0; x < IMP_NW; x++) {
+      const fx = (x % cw) / cw * 2 - 1;
+      let nx = fx * 0.72, ny = fy * 0.55, nz = 0.80;
+      const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      const k = (y * IMP_NW + x) * 4;
+      data[k] = Math.round((nx / l * 0.5 + 0.5) * 255);
+      data[k + 1] = Math.round((ny / l * 0.5 + 0.5) * 255);
+      data[k + 2] = Math.round((nz / l * 0.5 + 0.5) * 255);
+      data[k + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, IMP_NW, IMP_NH,
+    THREE.RGBAFormat, THREE.UnsignedByteType);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.flipY = false;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
   return tex;
 }
 
@@ -3632,11 +4383,25 @@ export function createVegetation(ctx) {
       treeline: 0, imposter: null,
       // R3-D1. The one number this whole lane hangs off, exported so it can be
       // asserted rather than re-derived by reading the source. See NEEDLE_W.
+      //
+      // R6-V3 added the EFFECTIVE range, because the nominal number is not what any
+      // stroke is actually drawn at: every call site carries a multiplier (1.00 on
+      // the sub-branchlet needles, 0.94 on the branchlet needles and the pine
+      // fascicles, 1.06 on the new growth) and every stroke a per-stroke jitter of
+      // 0.84-1.24 (0.85-1.20 on the pine path). Reporting only the nominal 5.73 lets
+      // a reader assume the narrowest stroke on the plate is 5.73 px when it is 4.53.
       needle: {
         atlasPx: NEEDLE_W * CELL_PX,
+        atlasPxMin: NEEDLE_W * CELL_PX * 0.94 * 0.84,
+        atlasPxMax: NEEDLE_W * CELL_PX * 1.06 * 1.24,
         screenPxNear: NEEDLE_W * CELL_PX * NEAR_CARD_DOWNSAMPLE,
+        subtwigAtlasPx: SUBTWIG_W * CELL_PX,
+        branchletAtlasPx: BRANCHLET_W * CELL_PX,
+        cardDownsample: NEAR_CARD_DOWNSAMPLE,
         alphaTest: FOLIAGE_ALPHA_TEST,
-        pass: (NEEDLE_W * CELL_PX) >= 3 &&
+        // The atlas figure is a FLOOR and the screen figure is a WINDOW — see the
+        // audit note above NEEDLE_W for why they cannot both be windows.
+        pass: (NEEDLE_W * CELL_PX * 0.94 * 0.84) >= 3 &&
           (NEEDLE_W * CELL_PX * NEAR_CARD_DOWNSAMPLE) >= 2 &&
           (NEEDLE_W * CELL_PX * NEAR_CARD_DOWNSAMPLE) <= 4,
       },
@@ -3705,28 +4470,43 @@ export function createVegetation(ctx) {
   const boulderFarGeo = buildBoulder(subSeed(seed, 'veg-boulder'), 1);
 
   // -------------------------------------------------------------------------
-  // Imposter atlas — baked from the near meshes if the renderer allows it.
+  // Imposter atlases — albedo + normal, baked over IMP_GRID² views per species.
   // -------------------------------------------------------------------------
-  let imposterRT = null;
+  if (SPECIES.length > IMP_SP_COLS * IMP_SP_ROWS) {
+    console.warn('[vegetation] ' + SPECIES.length + ' species will not fit the ' +
+      IMP_SP_COLS + 'x' + IMP_SP_ROWS + ' imposter block layout; the surplus will ' +
+      'render as the last species that did fit. Widen IMP_SP_COLS/IMP_SP_ROWS.');
+  }
+  let imposterRTs = null;
   let imposterTex = null;
+  let imposterNrmTex = null;
   if (ctx.renderer) {
-    imposterRT = bakeImposterAtlas(ctx.renderer, nearGeos, atlas.map);
-    if (imposterRT) {
+    imposterRTs = bakeImposterAtlas(ctx.renderer, nearGeos, atlas.map);
+    if (imposterRTs) {
       try {
-        const fin = finaliseImposterAtlas(ctx.renderer, imposterRT);
+        const fin = finaliseImposterAtlas(ctx.renderer, imposterRTs);
         imposterTex = fin.texture;
+        imposterNrmTex = fin.normal;
         api.stats.imposter = fin.report;
-        // The CPU copy replaces the render target completely — hand back 6 MB of VRAM.
-        imposterRT.dispose();
-        imposterRT = null;
+        // The CPU copies replace the render targets completely — hand the VRAM back.
+        imposterRTs.albedo.dispose();
+        imposterRTs.normal.dispose();
+        imposterRTs = null;
       } catch (err) {
+        // GPU mips on the albedo are wrong for an alpha-tested silhouette (that is
+        // what buildCoverageMips exists for) but they are better than no far tier,
+        // and the NORMAL atlas is unaffected by the coverage problem, so this path
+        // still gets a correctly relit card.
         console.warn('[vegetation] imposter readback failed, using GPU mips', err);
-        imposterTex = imposterRT.texture;
+        imposterTex = imposterRTs.albedo.texture;
         imposterTex.minFilter = THREE.LinearFilter;
+        imposterNrmTex = imposterRTs.normal.texture;
+        imposterNrmTex.minFilter = THREE.LinearFilter;
       }
     }
   }
   if (!imposterTex) imposterTex = fallbackImposterAtlas(seed);
+  if (!imposterNrmTex) imposterNrmTex = fallbackImposterNormal();
 
   // -------------------------------------------------------------------------
   // Materials
@@ -3776,13 +4556,19 @@ export function createVegetation(ctx) {
     fadeIn: TREE_TIERS[1].fadeIn, fadeOut: TREE_TIERS[1].fadeOut,
     windAmp: 0.95, canopyMix: 0.80, trans: FOLIAGE_TRANS, transTint: FOLIAGE_TRANS_COLOR,
   });
+  // R6-V1/V2. `canopyMix` is gone from this material on purpose: there is no longer
+  // a vertex bulge to mix back over, because the card is relit from the near mesh's
+  // own baked normals. `side` stays DoubleSide only because a view-aligned quad can
+  // still be caught a hair past 90° during the frame the view flips; the alpha test
+  // and the depth pass both behave the same either way.
   const treeFarMat = makeVegMaterial(shared, {
     name: 'treeFar', map: imposterTex, normalMap: null,
     alphaTest: IMPOSTER_ALPHA_TEST, roughness: 0.95,
     fadeIn: TREE_TIERS[2].fadeIn, fadeOut: TREE_TIERS[2].fadeOut,
-    windAmp: 0.60, canopyMix: 0.94,
+    windAmp: 0.60,
     trans: [0.50, 2.6, 0.28, 0.25], transTint: FOLIAGE_TRANS_COLOR,
-    atlasScale: [1 / IMP_COLS, 1 / IMP_ROWS],
+    imposter: true, imposterNormal: imposterNrmTex,
+    cellUV: [1 / IMP_COLS, 1 / IMP_ROWS],
   });
   const treeNearDepth = makeVegDepthMaterial(shared, {
     name: 'treeNear', map: atlas.map, alphaTest: FOLIAGE_ALPHA_TEST, windAmp: 1.0,
@@ -3840,17 +4626,22 @@ export function createVegetation(ctx) {
     trans: [0.50, 2.6, 0.30, 0.22], transTint: BROADLEAF_TRANS_COLOR,
   });
 
+  // R6-V4. The glint is on the NEAR boulders only (0-130 m). The far tier samples the
+  // detail normal at 0.55 world scale, i.e. deep in the mip chain, where the height
+  // field has already regressed toward its mean and the fleck threshold would be
+  // firing on filtered mush rather than on grains — which is exactly how a specular
+  // term turns into a crawling sparkle field. Off is the correct value out there.
   const rockNearMat = makeVegMaterial(shared, {
     name: 'rockNear', roughness: 0.93, canopyMix: 0,
     fadeIn: ROCK_TIERS[0].fadeIn, fadeOut: ROCK_TIERS[0].fadeOut,
     windAmp: 0, noTranslucency: true, side: THREE.FrontSide,
-    rock: true, rockNormal, rockScale: 1.4, rockStrength: 1.0,
+    rock: true, rockNormal, rockScale: 1.4, rockStrength: 1.0, rockGlint: 1.0,
   });
   const rockFarMat = makeVegMaterial(shared, {
     name: 'rockFar', roughness: 0.95, canopyMix: 0,
     fadeIn: ROCK_TIERS[1].fadeIn, fadeOut: ROCK_TIERS[1].fadeOut,
     windAmp: 0, noTranslucency: true, side: THREE.FrontSide,
-    rock: true, rockNormal, rockScale: 0.55, rockStrength: 0.55,
+    rock: true, rockNormal, rockScale: 0.55, rockStrength: 0.55, rockGlint: 0.0,
   });
   const rockDepth = makeVegDepthMaterial(shared, { name: 'rock', windAmp: 0, side: THREE.FrontSide });
 
@@ -4170,9 +4961,13 @@ export function createVegetation(ctx) {
   const treeLayer = createLayer('trees', CHUNK_TREE, treeTiers);
   const treeKinds = [];
   for (let i = 0; i < SPECIES.length; i++) {
+    // `atlas` is the SPECIES BLOCK origin in uv, not a cell origin — the view cell
+    // inside the block is chosen per instance in the vertex shader. Clamped so a
+    // seventh species could not read off the end of the atlas.
+    const b = Math.min(i, IMP_SP_COLS * IMP_SP_ROWS - 1);
     treeKinds.push(treeLayer.addKind({
       geometries: [nearGeos[i], midGeos[i], null],
-      atlas: [(i % IMP_COLS) / IMP_COLS, ((i / IMP_COLS) | 0) / IMP_ROWS],
+      atlas: [(b % IMP_SP_COLS) / IMP_SP_COLS, ((b / IMP_SP_COLS) | 0) / IMP_SP_ROWS],
     }));
   }
 
@@ -4754,19 +5549,31 @@ export function createVegetation(ctx) {
       chunkCount, 'chunks,', api.stats.buildMs + 'ms');
     const nd = api.stats.needle;
     ctx.debug.log('vegetation needle', nd.pass ? 'PASS' : 'FAIL',
-      '— ' + nd.atlasPx.toFixed(2) + ' atlas px (floor 3.0), ' +
-      nd.screenPxNear.toFixed(2) + ' screen px on the near tier (window 2-4), ' +
-      'alphaTest ' + nd.alphaTest);
+      '— ' + nd.atlasPx.toFixed(2) + ' atlas px nominal, ' +
+      nd.atlasPxMin.toFixed(2) + '-' + nd.atlasPxMax.toFixed(2) + ' effective ' +
+      '(floor 3.0), ' + nd.screenPxNear.toFixed(2) +
+      ' screen px on the near tier (window 2-4), alphaTest ' + nd.alphaTest +
+      '; twig axes ' + nd.subtwigAtlasPx.toFixed(2) + '/' +
+      nd.branchletAtlasPx.toFixed(2) + ' atlas px = ' +
+      (nd.subtwigAtlasPx * nd.cardDownsample).toFixed(2) + '/' +
+      (nd.branchletAtlasPx * nd.cardDownsample).toFixed(2) + ' screen px');
     ctx.debug.log('vegetation treeline', api.stats.treeline + 'm',
       '(run ' + Math.round(runTop) + ' -> ' + Math.round(runBot) + 'm,',
       'terrain mean ' + Math.round(treelineMean) + 'm)');
     const rep = api.stats.imposter;
     if (rep) {
-      ctx.debug.log('vegetation imposter LOD match',
+      ctx.debug.log('vegetation imposter near/far match',
         rep.pass ? 'PASS' : 'FAIL',
-        '— worst mip drift ' + (rep.worstLum * 100).toFixed(1) + '% lum / ' +
-        rep.worstHue.toFixed(1) + '° hue (budget 12% / 8°); mip0 median rgb(' +
-        (rep.base ? rep.base.join(',') : '?') + ')');
+        '— worst drift ' + (rep.worstLum * 100).toFixed(1) + '% lum / ' +
+        rep.worstHue.toFixed(1) + '° hue (budget 12% / 8°) at mip ' + rep.worstLevel +
+        '; lit reference rgb(' + (rep.ref ? rep.ref.join(',') : '?') +
+        ') hue ' + rep.refHue.toFixed(1) + '°');
+      ctx.debug.log('vegetation imposter atlas', rep.views + ' octahedral views (' +
+        rep.grid + 'x' + rep.grid + ') x ' +
+        Math.min(SPECIES.length, IMP_SP_COLS * IMP_SP_ROWS) + ' species at ' +
+        rep.cellPx + 'px; albedo-only drift ' +
+        (rep.albedoWorstLum * 100).toFixed(1) + '% lum / ' +
+        rep.albedoWorstHue.toFixed(1) + '° hue');
     }
   }
 
@@ -4934,8 +5741,11 @@ export function createVegetation(ctx) {
     atlas.map.dispose();
     atlas.normalMap.dispose();
     rockNormal.dispose();
-    if (imposterRT) imposterRT.dispose();
-    else if (imposterTex) imposterTex.dispose();
+    if (imposterRTs) { imposterRTs.albedo.dispose(); imposterRTs.normal.dispose(); }
+    else {
+      if (imposterTex) imposterTex.dispose();
+      if (imposterNrmTex) imposterNrmTex.dispose();
+    }
     if (ctx.scene) ctx.scene.remove(group);
   };
 

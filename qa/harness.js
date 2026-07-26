@@ -167,7 +167,10 @@ export async function shoot(name, { w = 1920, h = 1080, settle = 6 } = {}) {
   // Measure BEFORE restoring, or the telemetry describes the restored backbuffer rather than
   // the frame that was just captured.
   const capturedW = el.width, capturedH = el.height;
-  const metrics = analyse(el);
+  // Build a sky mask: re-render the same frame with the sky dome and background hidden, so the
+  // variance checks below can tell "flat shading on a surface" from "a cloudless sky".
+  const skyMask = buildSkyMask(draw, el);
+  const metrics = analyse(el, 320, 180, skyMask);
   if (capturedW !== w || capturedH !== h) {
     metrics.warnings.push(`WRONG_SIZE captured ${capturedW}x${capturedH}, expected ${w}x${h}`);
   }
@@ -192,13 +195,50 @@ export async function shoot(name, { w = 1920, h = 1080, settle = 6 } = {}) {
   return { ...j, name, metrics };
 }
 
-let _probe = null;
+let _probe = null, _maskCanvas = null;
+
+/**
+ * Render the frame once with the sky hidden against magenta, and return a boolean array marking
+ * which downsampled pixels are sky. Without this, any "flat bright region" test is really just a
+ * clear-sky detector — measured: 12.0% and 11.1% of two frames flagged, zero terrain pixels.
+ */
+export function buildSkyMask(draw, el, w = 320, h = 180) {
+  const d = ctx();
+  const scene = d.scene;
+  let skyObj = null;
+  scene.traverse((o) => { if (!skyObj && o.name === 'sky') skyObj = o; });
+  const prevVis = skyObj ? skyObj.visible : null;
+  const prevBg = scene.background;
+  const prevFog = scene.fog;
+  // Key colour: anything the scene cannot produce. Magenta with no green.
+  const Color = (prevBg && prevBg.isColor) ? prevBg.constructor
+              : (d.sun && d.sun.color && d.sun.color.constructor) || null;
+  if (skyObj) skyObj.visible = false;
+  scene.fog = null;                       // fog would tint the key toward the fog colour
+  scene.background = Color ? new Color(1, 0, 1) : null;
+  draw();
+  if (!_maskCanvas) { _maskCanvas = document.createElement('canvas'); _maskCanvas.width = w; _maskCanvas.height = h; }
+  const g = _maskCanvas.getContext('2d', { willReadFrequently: true });
+  g.drawImage(el, 0, 0, w, h);
+  const px = g.getImageData(0, 0, w, h).data;
+  const mask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const r = px[i * 4], gg = px[i * 4 + 1], b = px[i * 4 + 2];
+    // magenta-dominant => nothing was drawn there => sky
+    mask[i] = (r > 90 && b > 90 && gg < Math.min(r, b) * 0.65) ? 1 : 0;
+  }
+  if (skyObj) skyObj.visible = prevVis;
+  scene.background = prevBg;
+  scene.fog = prevFog;
+  draw();                       // restore the real frame before the caller reads pixels
+  return mask;
+}
 /**
  * Objective per-shot telemetry, so the review loop has measurements and not only opinions.
  * Catches the failure modes the round-2 review had to find by eye: crushed shadows, clipped
  * highlights, and large flat fills (camera underground, or a colourless below-horizon band).
  */
-export function analyse(canvas, w = 320, h = 180) {
+export function analyse(canvas, w = 320, h = 180, skyMask = null) {
   if (!_probe) {
     _probe = document.createElement('canvas');
     _probe.width = w; _probe.height = h;
@@ -243,12 +283,18 @@ export function analyse(canvas, w = 320, h = 180) {
   if (p99 < 200) warnings.push(`NO_HIGHLIGHTS p99 luminance only ${p99.toFixed(0)} — no specular hit or sun glint anywhere`);
   // "clipped 0.0%" is arithmetically true of a structureless white plane. Catch flat bright
   // regions by their lack of within-surface variance, not by their level.
+  //
+  // CORRECTION: the first version of this check flagged CLEAR SKY — measured at 12.0% and 11.1%
+  // of two frames with zero terrain pixels in either. A cloudless sky is legitimately smooth, so
+  // a variance test that includes it is just a sky detector. `mask` (below) is a render of the
+  // same frame with the sky hidden; only pixels that contain geometry are eligible.
   {
     let brightFlat = 0, bright = 0;
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1; x < w - 1; x++) {
         const c = y * w + x;
         if (lum[c] < 150) continue;
+        if (skyMask && skyMask[c]) continue;   // sky pixel — not a surface, cannot be "flat shading"
         bright++;
         let lo = 255, hi = 0;
         for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {

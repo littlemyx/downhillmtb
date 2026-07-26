@@ -35,6 +35,25 @@
 //   `{ position: Vector3, velocity: Vector3|number }` — velocity may be a scalar
 //   speed; both forms are handled.
 //
+// CONTRACT-NOTE (water → reflections, r6 review): the work order asks for
+//   "half-resolution screen-space reflections for the valley water". What is
+//   built here is a *heightfield* reflection march rather than SSR, and the
+//   substitution is deliberate:
+//     • SSR needs the scene colour and depth for the frame it is shading.
+//       postfx owns the composer and there is no shared scene-colour target, so
+//       SSR here would mean either an extra scene pass or a one-frame-late
+//       reprojection of a buffer this module does not own. The former costs more
+//       than the whole water budget; the latter is a cross-module coupling the
+//       hard rules forbid.
+//     • The valley body is a *plane* at a known Y. For a plane, marching the
+//       reflected ray against a baked top-down height map is exact where SSR is
+//       an approximation, and it reflects geometry that is behind the camera or
+//       off the side of the frame — which is most of the far shore in
+//       r6_00-establishing, and which SSR structurally cannot do at all.
+//     • It costs one 256² texture and ~10 fetches on water pixels whose Fresnel
+//       term is actually visible; nothing else in the frame pays anything.
+//   The creek keeps the environment map exactly as before, as the order asks.
+//
 // CONTRACT-NOTE (water → depth buffer): CONTRACT §6 asks for "refraction offset
 //   sampled from the depth texture". postfx owns the composer and there is no
 //   shared scene-depth texture to read, and adding a depth pre-pass for water
@@ -80,6 +99,47 @@ const MAX_PUDDLES = 54;
 // which is the whole reason deep water reads green-blue and a 15 cm riffle
 // reads as clear glass over gravel.
 const ABSORB = new THREE.Vector3(0.95, 0.30, 0.17);
+
+// --- solar-disc glint (r6 review) ------------------------------------------
+// The ceiling on a specular reflection is the radiance of the thing being
+// reflected. sky.js clamps its own solar disc so it cannot write Inf into the
+// HDR buffer, and postfx.js measured what arrives: ~2530 units of post-exposure
+// linear radiance for the disc itself, with its specular-escape curve putting
+// paper white at 595 (postfx.js, HL_SPEC_GAIN block). Those two numbers are the
+// whole calibration for the glint below:
+//   • a mirror reflection cannot exceed 2530, so a glint is hard-clamped to
+//     F * 2530 — brighter than the sun is not a look, it is a bug;
+//   • at normal incidence water's F is ~0.02, giving 50 units → display L243.
+//     Bright, and correctly NOT white: postfx says in terms a 4% dielectric
+//     reflection of the sun must not reach 255, and this is that reflection;
+//   • only a genuinely grazing mirror angle (F > ~0.24) passes 595 and clips.
+// So the glint reaches true white exactly where a real one would, on the small
+// set of pixels where a wavelet happens to face the mirror direction, and
+// nowhere else.
+const SUN_DISC_RADIANCE = 2530.0;
+// GGX alpha floor. The sun is 0.0093 rad across; reflecting it in a mirror
+// halves that in half-vector space, so ~0.0047 is the width of a *reflected*
+// solar disc. 0.0055 is a hair wider — everything real carries some blur, and a
+// lobe narrower than a pixel is a lobe that flickers.
+const GLINT_ALPHA = 0.0055;
+// World metres of surface per screen pixel at which the wavelets are considered
+// fully unresolved, i.e. at which the aggregate slope distribution becomes the
+// specular lobe. This is the term that stops the distant open sea from becoming
+// a field of crawling white dots, and it is also what confines clipping to near
+// water — see the shader comment.
+const GLINT_FOOTPRINT = 0.25;
+
+// --- shore reflection proxy (r6 review) ------------------------------------
+const SHORE_TEX = 256;             // top-down samples per axis over the world
+const SHORE_MAX_DIST = 2600;       // metres of reflected ray ever marched
+const SHORE_CANOPY_H = 16.0;       // metres of forest added to the proxy height
+const SHORE_STEPS = { low: 0, medium: 6, high: 10, ultra: 14 };
+
+// How far the local streambed gradient is allowed to bend the flow map away from
+// the centreline tangent. 0.45 is enough that a midstream boulder visibly parts
+// the surface motion and a bar visibly fans it, and low enough that the creek
+// never advects sideways out of its own channel.
+const FLOW_BED_BEND = 0.45;
 
 // ===========================================================================
 // Module-scope scratch. Nothing in update() is allowed to allocate.
@@ -361,6 +421,29 @@ function makePuffTexture(seed) {
 
 // --- shared helpers, pasted into every water shader ------------------------
 const GLSL_COMMON = /* glsl */`
+#define PI_W 3.141592653589793
+
+// Solar-disc specular, shared by the water surface and the wet-rock decal.
+//
+// For a source small enough that the BRDF is constant across it,
+//     L_out = D * Vis * F * NdL * L_sun * Omega,
+// and L_sun * Omega is the irradiance on a surface facing it, which is exactly
+// PI * sunColor as this file uploads it. So the glint needs no light constant of
+// its own — it is the same sun the diffuse terms use, evaluated as a disc rather
+// than as a delta.
+//
+// a2 is the GGX alpha squared and is the caller's business: the surface picks it
+// so that the lobe is never narrower than the reflected solar disc and never
+// narrower than the screen footprint the surface is being filtered at.
+vec3 discSpecular( float NdH, float NdV, float NdL, float a2, float F, vec3 sunColor ) {
+	float d = NdH * NdH * ( a2 - 1.0 ) + 1.0;
+	float D = a2 / ( PI_W * d * d );
+	float k = 0.5 * sqrt( a2 );
+	float vis = ( NdV / ( NdV * ( 1.0 - k ) + k ) ) * ( NdL / ( NdL * ( 1.0 - k ) + k ) )
+	          / ( 4.0 * NdV * NdL + 1e-4 );
+	return sunColor * ( PI_W * D * vis * F * NdL );
+}
+
 // Two-phase flow mapping. Sampling a scrolling texture along a flow direction
 // smears without bound; sampling it twice at half-cycle-offset phases and
 // cross-fading with a triangle weight keeps the advection but resets the smear
@@ -468,7 +551,16 @@ uniform float uBedScale;
 uniform float uOpacity;
 uniform float uSpecGain;
 uniform float uFresnelMax;
+uniform float uShorePixels;    // screen-space width of the waterline feather
+uniform vec2  uWetMargin;      // x = metres of bank counted as wetted, y = its alpha
 uniform vec4  uRipples[ RIPPLE_COUNT ];   // xz = centre, z = radius, w = strength
+
+#ifdef WATER_SHORE_REFLECT
+uniform sampler2D uShoreTex;   // RGB = shore albedo x geometric shade, A = height/HMAX
+uniform vec4  uShoreRect;      // minX, minZ, 1/width, 1/depth
+uniform vec3  uShoreCfg;       // x = HMAX metres, y = tallest rise, z = blend strength
+uniform vec3  uShoreLight;     // relights the baked albedo from the live sun/sky
+#endif
 
 // Offshore-apron edge dissolve. uDissolveRect is the apron's outer rectangle
 // (minX, minZ, maxX, maxZ) and uDissolveBand is (band width in metres,
@@ -505,6 +597,76 @@ vec3 sampleEnv( vec3 dir, float rough ) {
 	#endif
 }
 
+#ifdef WATER_SHORE_REFLECT
+/**
+ * March the reflected ray across a baked top-down height map of the shore.
+ *
+ * The water body is a plane at a known Y, so a ray leaving it at ( orig, dir )
+ * is at height t * dir.y/|dir.xz| above the water after t horizontal metres.
+ * Comparing that against the terrain height stored in the proxy's alpha channel
+ * is a complete intersection test — no depth buffer, no screen-space
+ * disocclusion, and it works for shore that is off the side of the frame or
+ * behind the camera, which is where most of the far shore in the establishing
+ * shot actually is.
+ *
+ * Returns 1.0 on a hit and writes the reflected colour into hitCol.
+ */
+float marchShore( vec3 orig, vec3 dir, out vec3 hitCol ) {
+
+	hitCol = vec3( 0.0 );
+	vec2 rd = dir.xz;
+	float rl = length( rd );
+	if ( rl < 1e-4 ) return 0.0;
+	rd /= rl;
+	float sy = dir.y / rl;                       // metres of rise per metre travelled
+	if ( sy <= 1e-3 ) return 0.0;
+
+	// The ray can only ever meet ground while it is still lower than the tallest
+	// thing in the map, so that bounds the march exactly rather than by taste:
+	// a steeply reflected ray gets a short march and a grazing one gets a long
+	// one, which is the correct distribution of effort. (The cheap cull is the
+	// Fresnel test at the call site, not this one — this only fires on a
+	// near-vertical reflection.)
+	float dMax = min( uShoreCfg.y / sy, SHORE_MAX_DIST );
+	if ( dMax < 24.0 ) return 0.0;
+
+	const float T0 = 12.0;
+	float ratio = pow( dMax / T0, 1.0 / float( SHORE_STEPS ) );
+	float t = T0;
+	float prevT = T0;
+	float prevGap = 1e6;
+	float hit = 0.0;
+	float tHit = 0.0;
+
+	for ( int k = 0; k < SHORE_STEPS; k ++ ) {
+		t *= ratio;
+		vec2 uv = ( orig.xz + rd * t - uShoreRect.xy ) * uShoreRect.zw;
+		// Outside the map is open water, not a wall: sample clamped and zero the
+		// height so the ray passes through and can still hit on re-entry. Done
+		// with step() rather than a branch so the fetch stays in uniform flow.
+		float inside = step( 0.0, uv.x ) * step( uv.x, 1.0 )
+		             * step( 0.0, uv.y ) * step( uv.y, 1.0 );
+		float terr = texture2D( uShoreTex, clamp( uv, 0.0, 1.0 ) ).a * uShoreCfg.x * inside;
+		float gap = t * sy - terr;               // positive = ray still above ground
+		if ( gap < 0.0 ) {
+			hit = 1.0;
+			// One linear refinement between the last two samples. The proxy is
+			// 12 m per texel, so a second bisection buys nothing a linear
+			// interpolation of the gap does not already give.
+			tHit = mix( prevT, t, prevGap / max( prevGap - gap, 1e-4 ) );
+			break;
+		}
+		prevT = t;
+		prevGap = gap;
+	}
+	if ( hit < 0.5 ) return 0.0;
+
+	vec2 uvH = clamp( ( orig.xz + rd * tHit - uShoreRect.xy ) * uShoreRect.zw, 0.0, 1.0 );
+	hitCol = texture2D( uShoreTex, uvH ).rgb * uShoreLight;
+	return 1.0;
+}
+#endif
+
 void main() {
 
 	vec2 p = vWorld.xz;
@@ -517,7 +679,14 @@ void main() {
 	vec3 B = cross( Ng, T );
 
 	float speed = max( vFlow, 0.42 );
+	// The flow map is authored per vertex from the streambed (see createWater), so
+	// neighbouring vertices genuinely disagree about direction — which is the whole
+	// point, and which also means the interpolated vector is short wherever they
+	// disagree most. Renormalise, or the advection rate quietly drops exactly at
+	// the confluences and rock deflections the flow map exists to show.
 	vec2  fd    = vFlowDir;
+	float fdLen = length( fd );
+	fd = fdLen > 1e-3 ? fd / fdLen : vec2( 1.0, 0.0 );
 
 	// --- three scrolling normal layers ------------------------------------
 	// Cycle rate is tied to scale * speed so the two flow-map phases are always
@@ -614,13 +783,37 @@ void main() {
 	// Wind streaks: very low frequency, so a big flat body has texture even
 	// when every wavelet has mipped away.
 	float wind = texture2D( uFoamTex, p * 0.0032 + vec2( uTime * 0.0018, 0.0 ) ).r;
-	float rough = clamp( 0.030 + vFlow * 0.028 + vFoam * 0.20
-	                     + far * far * 0.26 + wind * 0.06 * far, 0.02, 0.60 );
+	// TWO roughnesses, and keeping them apart is the fix for the ruled line where
+	// the sea meets the sky in r6_00 (measured: sky 179/199/209 at row 131 stepping
+	// to water 161/195/217 at row 132 — an 18-level break in red across one pixel).
+	//   rough        — the lobe width and env-map blur. Grows with distance because
+	//     one pixel comes to cover many wavelets. This is a FILTERING term.
+	//   roughSurface — what the surface actually is: flow chop and aeration. Does
+	//     NOT grow with distance, because a sea two kilometres away is not rougher
+	//     than the same sea nearby, it is merely less resolved.
+	// The Fresnel ceiling has to come off the second one. Driving it from the
+	// filtered value made the far sea's grazing reflectance 0.57 instead of 0.74,
+	// so 43% of the horizon band was dark deep-water colour showing through — which
+	// is exactly the blue step measured above. Physically, water at two kilometres
+	// and 88° of incidence is very nearly a mirror, and now it is.
+	float roughSurface = clamp( 0.030 + vFlow * 0.028 + vFoam * 0.20, 0.02, 0.60 );
+	float rough = clamp( roughSurface + far * far * 0.26 + wind * 0.06 * far, 0.02, 0.60 );
 	vec3 R = reflect( -V, N );
 	// The environment has no ground hemisphere, so fold downward rays back up
 	// rather than sampling a black void at grazing incidence.
 	R.y = R.y < 0.02 ? ( 0.02 - R.y * 0.45 ) : R.y;
 	R = normalize( R );
+
+	// Schlick with a ROUGHNESS CEILING (Lagarde / Karis). F0 = 0.02 for water,
+	// but the grazing limit of a microfacet aggregate is bounded by its own
+	// normal distribution, not by 1.0 — a chopped creek cannot mirror the sky
+	// the way a millpond can. Straight Schlick × 0.93 handed a shallow creek
+	// seen at any oblique angle a 93% sky reflection, which is the other half
+	// of the flat neutral L=226 band across r3_06.
+	float F0 = 0.02;
+	float Fmax = max( 1.0 - roughSurface, F0 );
+	float F = ( F0 + ( Fmax - F0 ) * pow( 1.0 - NdV, 5.0 ) ) * uFresnelMax;
+
 	// The PMREM of a sunlit sky peaks in the tens; left unbounded a grazing
 	// water surface becomes a mirror of the sun's aureole and blows the bloom.
 	// 2.6 -> 1.8: 2.6 linear is where the shipped tonemap lands ~226/255, which
@@ -632,15 +825,24 @@ void main() {
 	// return where the surface is ruffled and brighten it where it is glassy.
 	refl *= 0.86 + 0.28 * wind;
 
-	// Schlick with a ROUGHNESS CEILING (Lagarde / Karis). F0 = 0.02 for water,
-	// but the grazing limit of a microfacet aggregate is bounded by its own
-	// normal distribution, not by 1.0 — a chopped creek cannot mirror the sky
-	// the way a millpond can. Straight Schlick × 0.93 handed a shallow creek
-	// seen at any oblique angle a 93% sky reflection, which is the other half
-	// of the flat neutral L=226 band across r3_06.
-	float F0 = 0.02;
-	float Fmax = max( 1.0 - rough, F0 );
-	float F = ( F0 + ( Fmax - F0 ) * pow( 1.0 - NdV, 5.0 ) ) * uFresnelMax;
+	#ifdef WATER_SHORE_REFLECT
+	// Reflected shore. Gated on F, because below ~5% reflectance nothing that
+	// comes back is visible and the march would be paid for a result that is
+	// then multiplied by nothing; that single test culls the entire down-looking
+	// near field. Confidence keys off roughSurface rather than rough: a rippled
+	// surface genuinely cannot hold a coherent image, but a distant one can, and
+	// this is the band where the reflection matters most.
+	if ( F > 0.05 && uShoreCfg.z > 0.0 ) {
+		vec3 shoreCol;
+		float hitShore = marchShore( vWorld, R, shoreCol );
+		float conf = hitShore * uShoreCfg.z
+		           * ( 1.0 - smoothstep( 0.10, 0.38, roughSurface ) );
+		// The ray was reflected off the PERTURBED normal, so the hit point walks
+		// with the waves — that wobble is the whole reason a reflection in water
+		// reads as water and not as a mirror lying on the ground.
+		refl = mix( refl, shoreCol, conf );
+	}
+	#endif
 
 	vec3 color = mix( below, refl, F );
 
@@ -664,6 +866,7 @@ void main() {
 	// real glitter path can still register.
 	float openSun = smoothstep( 0.0, 0.35, dot( Ng, uSunDir ) );
 	color += min( specTerm, vec3( mix( 0.42, 1.50, openSun ) ) );
+
 
 	// --- foam --------------------------------------------------------------
 	// Turbulence advects with the water and is sampled at two scales so the
@@ -721,6 +924,51 @@ void main() {
 	vec3 foamLit = uFoamColor * ( uSkyHigh * 0.48 + uSunColor * ( 0.24 + 0.52 * sunLit ) );
 	color = mix( color, foamLit, foam );
 
+	// --- solar-disc glint (r6 review) --------------------------------------
+	// Everything above is a stylised sheen with a taste ceiling on it, and the
+	// surface's whole look is tuned around it, so it is untouched. What it
+	// cannot do is produce a *specular hit*: the sixteen-shot set peaks at
+	// L=242 with no true white anywhere in it, and sunlit water is one of the
+	// three or four things in a landscape entitled to clip. This term is the
+	// missing one, it is purely additive, and it is bounded by physics at both
+	// ends rather than by taste.
+	//
+	// Treat the sun as a disc. For a small source L_out = D * Vis * F * NdL *
+	// L_sun * Omega, and L_sun * Omega is by definition the irradiance, which is
+	// PI * uSunColor — so no new light constant is invented here, the glint is
+	// derived from the same sun the diffuse terms already use.
+	//
+	// The alpha is where the work is:
+	//   * floored at GLINT_ALPHA, the GGX width of a *reflected* solar disc.
+	//     Narrower than that and the model is resolving structure finer than its
+	//     own light source, which is how you get single-pixel strobing.
+	//   * widened by the unresolved wavelet slope variance, keyed to the world
+	//     footprint of one pixel. This is the term that matters. Once a pixel
+	//     covers many wavelets the aggregate normal distribution IS the lobe, so
+	//     the open sea at a kilometre flattens into a broad sheen (~L235 at its
+	//     brightest) instead of a field of crawling white dots — and it is also
+	//     why only near water can reach white, which is both correct and what
+	//     bounds the clipped-pixel count to a few hundred in a 2 MPix frame.
+	//   * hard-clamped at F * the sun's own rendered radiance. A reflection is
+	//     never brighter than what it reflects. At normal incidence F ~= 0.02
+	//     gives ~50 units, which postfx's curve puts at display L243: bright,
+	//     and correctly not white, because a 4% dielectric bounce of the sun is
+	//     not a mirror. Past ~24° from grazing F clears the 595 units that
+	//     postfx's specular escape makes paper white, and it clips.
+	float pw = length( fwidth( p ) );                    // metres of surface per pixel
+	float unres = clamp( pw / GLINT_FOOTPRINT, 0.0, 1.0 );
+	// Squared: a footprint at a tenth of the wavelet scale leaves a hundredth of
+	// the variance unresolved, not a tenth of it.
+	float slopeVar = amp * amp * 0.09;                   // RMS slope ~0.3 at amp = 1
+	float aG2 = GLINT_ALPHA * GLINT_ALPHA + unres * unres * slopeVar;
+	float NdL = max( dot( N, uSunDir ), 0.0 );
+	// Aerated water is a diffuser, and water the sun cannot see has nothing to
+	// mirror; both have to gate the term or the foam line becomes a light source.
+	float glintGate = openSun * ( 1.0 - clamp( foam * 1.6, 0.0, 1.0 ) );
+	vec3 sunHue = uSunColor / max( max( uSunColor.r, max( uSunColor.g, uSunColor.b ) ), 1e-4 );
+	vec3 glint = discSpecular( NdH, NdV, NdL, aG2, F, uSunColor ) * glintGate;
+	color += min( glint, sunHue * ( SUN_DISC_RADIANCE * F * glintGate ) );
+
 	// --- flow-aligned streaking -------------------------------------------
 	// Bands of smooth and aerated water that run WITH the current at a ~2 m
 	// scale. It survives the mip chain long after every wavelet has gone, so it
@@ -737,8 +985,66 @@ void main() {
 	// itself blend through as well double-counts it, and the terrain's own
 	// albedo pattern immediately reads as a texture painted on the water.
 	float a = clamp( depthGeom / uEdgeFade, 0.0, 1.0 );
+
+	// --- depth-based shoreline softening (r6 review) -----------------------
+	// uEdgeFade is a band in METRES OF WATER, so how hard the waterline reads
+	// depends entirely on how steep the bed happens to be there and on how far
+	// away it is. On a 1:1 bank at forty metres a 0.22 m band is a single pixel,
+	// and a single-pixel alpha step against opaque terrain is exactly the "hard
+	// intersection" the review is describing — a diagnostic capture of the ford
+	// shows the creek terminating against the berm on a ruled line.
+	//
+	// fwidth( depth ) is how much the water column changes across one pixel, so
+	// depth / fwidth( depth ) is the distance to the waterline measured IN
+	// PIXELS. Feathering on that gives a waterline exactly uShorePixels wide at
+	// every distance and on every bed slope, with no depth buffer, no soft-
+	// particle pass and no extra fetch. Take whichever of the two bands is the
+	// softer, so the authored metric band still governs a shallow beach where it
+	// is already wider than the screen-space floor.
+	//
+	// Both gradients are consulted because they fail in opposite places: the
+	// valley body's depth comes from an 8-bit baked texture whose derivative is
+	// zero across a quantisation plateau, while the creek's per-vertex depth is
+	// smooth but coarse. max() of the two is well behaved on both surfaces.
+	float dW = max( max( fwidth( depthGeom ), fwidth( vDepth ) ), 1e-6 );
+	a = min( a, clamp( depthGeom / ( dW * uShorePixels ), 0.0, 1.0 ) );
+
 	// Foam laps a little way up the wet bank, past the waterline.
 	a = max( a, foam * smoothstep( -0.05, 0.035, depthGeom ) * 0.95 );
+
+	// --- wetted margin -----------------------------------------------------
+	// The band of bank the water has just been over. depthGeom is negative there
+	// (it is the height of the bed ABOVE the surface) and those fragments were
+	// simply discarding, even though the surface mesh already reaches well up the
+	// bank — the far corners of the shoreline quads are emitted for exactly that
+	// reason. So this costs no geometry and no fetch.
+	//
+	// Authored as soaked ground rather than as standing water: bedAlbedo is
+	// already the submerged tint (0.62x dry), so lifting it back to ~0.7x dry and
+	// letting the foam term lap over it reads as wet rock, where blending towards
+	// the water colour would read as a shelf of water perched on the bank.
+	//
+	// Two things keep this from simply relocating the hard edge it exists to
+	// remove. The height-above-water term is continuous through the waterline and
+	// is flat at zero on
+	// the water side, so the band is one ramp with no join in it rather than a
+	// second edge that happens to start where the first one ended. And it carries
+	// the same screen-space feather as the water, so on a near-vertical bank —
+	// where the whole margin would otherwise fall inside a single pixel — it
+	// fades itself out to nothing instead of drawing a line. That is also why the
+	// two compose rather than fight: the feather governs exactly the steep and
+	// distant cases where the margin is suppressed, and the margin governs the
+	// shallow near cases where the waterline was never hard to begin with.
+	float above = max( -depthGeom, 0.0 );
+	float wetA = uWetMargin.y
+	           * ( 1.0 - smoothstep( 0.0, uWetMargin.x, above ) )
+	           * clamp( ( uWetMargin.x - above ) / max( dW * uShorePixels, 1e-6 ), 0.0, 1.0 );
+	// Crossfade the colour over a few centimetres of depth either side of the
+	// line, for the same reason.
+	float wetMix = clamp( ( -depthGeom + uWetMargin.x * 0.10 ) / ( uWetMargin.x * 0.20 ), 0.0, 1.0 );
+	color = mix( color, bedAlbedo * bedLight * 1.05 + foamLit * ( foam * 0.55 ), wetMix );
+	a = max( a, wetA );
+
 	a = clamp( a * uOpacity, 0.0, 1.0 );
 
 	// The offshore apron has to end somewhere, and wherever that is it must not
@@ -997,6 +1303,7 @@ varying vec3  vNrm;
 varying float vWet;
 
 #include <fog_pars_fragment>
+${GLSL_COMMON}
 
 void main() {
 
@@ -1019,13 +1326,26 @@ void main() {
 	// sheen back on top. Premultiplied alpha is what makes both possible in
 	// one pass — rgb is added, dst is only scaled by ( 1 - a ).
 	vec3 col = uWetTint * a;
-	float spec = pow( max( dot( N, H ), 0.0 ), 90.0 ) * 0.55
-	           + pow( max( dot( N, H ), 0.0 ), 12.0 ) * 0.05;
+	float NdH = max( dot( N, H ), 0.0 );
+	float spec = pow( NdH, 90.0 ) * 0.55
+	           + pow( NdH, 12.0 ) * 0.05;
 	// Ceiling: at grazing incidence F -> 1 and the broad lobe alone was worth
 	// ~0.18 linear of unbounded sun, which on a wet bank right at the waterline
 	// is a second white band beside the one the creek was already making.
 	col += min( uSunColor * spec * F * 3.2 * wet, vec3( 0.55 ) );
 	col += uSkyHigh * F * 0.12 * wet;
+
+	// Solar-disc glint (r6 review). The bounded sheen above is what the wet band
+	// is tuned around and it stays; this is the additive term that lets a soaked
+	// rock at the mirror angle actually register as a *hit* rather than topping
+	// out at the 0.55 linear ceiling (display ~L202) it has been held to. See
+	// WET_GLINT_A2 for why the lobe is the rock's roughness and not the film's.
+	// Same F * source-radiance clamp as the water surface: a glint is never
+	// brighter than the thing it is reflecting.
+	float NdL = max( dot( N, uSunDir ), 0.0 );
+	vec3 sunHue = uSunColor / max( max( uSunColor.r, max( uSunColor.g, uSunColor.b ) ), 1e-4 );
+	vec3 glint = discSpecular( NdH, NdV, NdL, WET_GLINT_A2, F, uSunColor ) * wet;
+	col += min( glint, sunHue * ( SUN_DISC_RADIANCE * F * wet ) );
 
 	gl_FragColor = vec4( col, a );
 
@@ -1050,6 +1370,30 @@ function bedTintTable() {
     [0.28, 0.22, 0.15], // ROOT
     [0.24, 0.18, 0.13], // MUD
     [0.78, 0.81, 0.84], // SNOW
+  ];
+  return src.map(([r, g, b]) => new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace));
+}
+
+/**
+ * DRY surface albedo per SurfaceId, for the shore reflection proxy. Deliberately
+ * a separate table from `bedTintTable()`: that one is submerged ground seen
+ * through water and is authored 0.62x here, which would make the reflected shore
+ * two stops darker than the shore itself.
+ *
+ * Values are the terrain's own family (terrainMaterial.js keeps sunlit rock at
+ * 0.35-0.45 after the r3 A3 knockdown), not a guess — a reflection that does not
+ * match the thing it reflects reads worse than no reflection at all.
+ */
+function shoreTintTable() {
+  const src = [
+    [0.30, 0.24, 0.18], // DIRT
+    [0.22, 0.18, 0.13], // LOAM
+    [0.40, 0.39, 0.37], // ROCK
+    [0.46, 0.43, 0.38], // GRAVEL
+    [0.26, 0.31, 0.17], // GRASS
+    [0.26, 0.21, 0.15], // ROOT
+    [0.22, 0.17, 0.12], // MUD
+    [0.80, 0.83, 0.86], // SNOW
   ];
   return src.map(([r, g, b]) => new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace));
 }
@@ -1550,16 +1894,58 @@ export function createWater(ctx) {
       const nx = -sDirX[i] * fy * fl;
       const ny = fl;
       const nz = -sDirZ[i] * fy * fl;
+      // Deepest point of the section, for the lateral velocity profile below.
+      const midDepth = Math.max(0.05, sSurf[i] - sBed[i]);
       for (let j = 0; j < CROSS; j++) {
         const t = (j / (CROSS - 1)) * 2 - 1;
         const px = stX[i] + rx * t * halfGeo;
         const pz = stZ[i] + rz * t * halfGeo;
         const bh = terrain.sampleHeight(px, pz);
         bedTintAt(px, pz, _col);
+
+        // ---- flow map (r6 review) ----------------------------------------
+        // Until now every vertex on the ribbon carried the *centreline tangent*,
+        // so the whole creek advected as one rigid sheet regardless of what the
+        // bed underneath it was doing — a scrolling wallpaper with a two-phase
+        // reset on it. Two per-vertex terms fix that, both free at runtime:
+        //
+        // 1. Direction. A heightfield normal's horizontal part points straight
+        //    down the local gradient (for h = a*x the normal is (-a, 1, 0), and
+        //    -a is downhill when a > 0), so it is the steepest-descent direction
+        //    of the actual streambed at this vertex. Blending it into the
+        //    centreline tangent makes the surface motion curl around midstream
+        //    rocks, tuck into the thalweg and fan out over a shallow bar.
+        terrain.sampleNormal(px, pz, _v2);
+        let fdx = sDirX[i];
+        let fdz = sDirZ[i];
+        const gl2 = Math.hypot(_v2.x, _v2.z);
+        if (gl2 > 1e-4) {
+          const bx = fdx + (_v2.x / gl2) * FLOW_BED_BEND;
+          const bz = fdz + (_v2.z / gl2) * FLOW_BED_BEND;
+          // A rock whose local gradient points back upstream must DEFLECT the
+          // flow, never reverse it — hence the downstream guard rather than a
+          // straight lerp.
+          if (bx * sDirX[i] + bz * sDirZ[i] > 0.2) {
+            const bl = Math.hypot(bx, bz) || 1;
+            fdx = bx / bl; fdz = bz / bl;
+          }
+        }
+
+        // 2. Speed. A channel has a velocity profile: fastest over the deepest
+        //    part of the section, dropping towards nothing at the wetted
+        //    margins. A constant speed across the width is the other half of
+        //    why a scrolling ribbon reads as a conveyor belt, and it is what
+        //    makes the two-phase cycle rate visibly uniform bank to bank.
+        // aDepth stays SIGNED — the outer ribbon vertices are deliberately buried
+        // in the bank and their negative depth is what produces the shoreline
+        // fade and the wetted margin. Only the profile uses the clamped copy.
+        const depthHere = sSurf[i] - bh;
+        const prof = 0.30 + 0.70 * Math.sqrt(clamp01(Math.max(0, depthHere) / midDepth));
+
         pushSurfaceVertex(
           px, sSurf[i], pz, nx, ny, nz,
-          sSurf[i] - bh, sFlow[i], sFoam[i], Math.abs(t), sArc[i],
-          sDirX[i], sDirZ[i], _col);
+          depthHere, sFlow[i] * prof, sFoam[i], Math.abs(t), sArc[i],
+          fdx, fdz, _col);
       }
     }
     for (let i = 0; i < NS - 1; i++) {
@@ -1720,12 +2106,40 @@ export function createWater(ctx) {
           bedTintAt(x, z, _col);
           vPos.push(x, waterLevel, z);
           vNrm.push(0, 1, 0);
-          vDep.push(waterLevel - h);
+          const dep = waterLevel - h;
+          vDep.push(dep);
           vFlw.push(0.10);
           vFoa.push(0);
           vSho.push(0);
           vDis.push(0);
-          vFd.push(drift.x, drift.y);
+          // Flow map (r6 review). Open water does not scroll as a single sheet:
+          // close to a shore the surface motion runs ALONG it, because that is
+          // the only direction with room to go. The depth field's gradient is
+          // the shore normal, so its perpendicular is the alongshore direction —
+          // free, since hCache already holds the bathymetry. Blend from the
+          // prevailing wind drift in deep water to alongshore in the shallows,
+          // which is what gives a bay its own surface direction instead of the
+          // whole lake advecting the same way.
+          const im = Math.max(0, i - 1), ip = Math.min(gx, i + 1);
+          const jm = Math.max(0, j - 1), jp = Math.min(gz, j + 1);
+          const gxh = hCache[j * (gx + 1) + ip] - hCache[j * (gx + 1) + im];
+          const gzh = hCache[jp * (gx + 1) + i] - hCache[jm * (gx + 1) + i];
+          let fdx = drift.x, fdz = drift.y;
+          const gm = Math.hypot(gxh, gzh);
+          if (gm > 1e-4) {
+            // Perpendicular to the bed gradient, oriented to agree with the
+            // drift so neighbouring vertices never point 180° apart (which
+            // would interpolate to a zero-length, and therefore stationary,
+            // flow vector halfway between them).
+            let ax = -gzh / gm, az = gxh / gm;
+            if (ax * drift.x + az * drift.y < 0) { ax = -ax; az = -az; }
+            const shoreW = clamp01(1 - dep / 6.0);
+            fdx = drift.x * (1 - shoreW) + ax * shoreW;
+            fdz = drift.y * (1 - shoreW) + az * shoreW;
+            const fl2 = Math.hypot(fdx, fdz) || 1;
+            fdx /= fl2; fdz /= fl2;
+          }
+          vFd.push(fdx, fdz);
           vBed.push(_col.r, _col.g, _col.b);
         }
       }
@@ -1877,6 +2291,114 @@ export function createWater(ctx) {
     apronRect.set(
       vr.minX - APRON_MARGIN, vr.minZ - APRON_MARGIN,
       vr.maxX + APRON_MARGIN, vr.maxZ + APRON_MARGIN);
+  }
+
+  // =========================================================================
+  // 4.6c Shore reflection proxy
+  // =========================================================================
+  // A top-down bake of the land around the water: RGB = dry albedo times a
+  // geometric shade term, A = height above the water line normalised by HMAX.
+  // The valley body's shader marches its reflected ray against it (see
+  // marchShore in SURFACE_FRAG and the CONTRACT-NOTE at the head of this file
+  // for why this rather than SSR).
+  //
+  // Sized at 256² over the whole world: ~12 m per texel, which at the 300 m to
+  // 2 km range the reflected shore actually sits at subtends well under a degree
+  // — a reflection in moving water is not a place where resolution is the
+  // binding constraint. The bake is 65 k heightfield probes, the same order as
+  // the valley depth bake beside it, and the texture is 256 KB so it stays
+  // resident in cache through the march.
+  let shoreTex = null;
+  const shoreRect = new THREE.Vector4(0, 0, 1, 1);
+  const shoreCfg = new THREE.Vector3(1, 1, 0);      // HMAX, tallest rise, strength
+  const shoreLight = new THREE.Color(1, 1, 1);
+  const shoreSteps = SHORE_STEPS[quality] != null ? SHORE_STEPS[quality] : SHORE_STEPS.high;
+
+  if (valleyMesh && shoreSteps > 0) {
+    const S = SHORE_TEX;
+    const SHORE_TINTS = shoreTintTable();
+    const wW = bounds.maxX - bounds.minX;
+    const dD = bounds.maxZ - bounds.minZ;
+
+    // Sun at bake time, for the geometric shade only — the light COLOUR is
+    // applied live in the shader (uShoreLight), so a time-of-day change still
+    // moves the reflection even though the bake does not re-run.
+    if (ctx.sky && ctx.sky.sunDirection) _v1.copy(ctx.sky.sunDirection);
+    else if (ctx.sun) _v1.copy(ctx.sun.position).normalize();
+    else _v1.set(0.4, 0.55, -0.73).normalize();
+    const sdx = _v1.x, sdy = _v1.y, sdz = _v1.z;
+
+    const rise = new Float32Array(S * S);
+    const shade = new Float32Array(S * S);
+    const tintI = new Uint8Array(S * S);
+    const veg = new Float32Array(S * S);
+    let maxRise = 1;
+
+    for (let j = 0; j < S; j++) {
+      const z = bounds.minZ + (j + 0.5) / S * dD;
+      for (let i = 0; i < S; i++) {
+        const x = bounds.minX + (i + 0.5) / S * wW;
+        const k = j * S + i;
+        const h = terrain.sampleHeight(x, z);
+        terrain.sampleNormal(x, z, _v2);
+        const ndl = Math.max(0, _v2.x * sdx + _v2.y * sdy + _v2.z * sdz);
+        // Forest canopy. From the water you are looking at the tops of trees,
+        // not at the ground under them, and a reflected shoreline with no
+        // canopy on it reads as a bald quarry — this is the single largest
+        // contributor to the reflection looking like the place it reflects.
+        let v = 0;
+        if (typeof terrain.treelineAt === 'function') {
+          const tl = terrain.treelineAt(x, z);
+          // Slope from the normal we already have rather than a fifth terrain
+          // query per texel — sampleSlope() is documented as exactly this angle,
+          // and 65 k texels makes a spare query worth avoiding at boot.
+          const slope = Math.acos(clamp(_v2.y, -1, 1));
+          v = clamp01((tl - h) / 45) * clamp01(1 - slope / 0.95) * 0.8;
+        }
+        veg[k] = v;
+        const r = h - waterLevel + v * SHORE_CANOPY_H;
+        rise[k] = Math.max(0, r);
+        if (rise[k] > maxRise) maxRise = rise[k];
+        // Canopy shading is much flatter than bare ground: a conifer mass is a
+        // volume, and lighting it off the terrain normal makes a reflected
+        // hillside strobe between black and lit as the slope changes.
+        shade[k] = (0.26 + 0.74 * ndl) * (1 - v) + (0.42 + 0.38 * ndl) * v;
+        tintI[k] = terrain.sampleMaterial ? (terrain.sampleMaterial(x, z) & 7) : 2;
+      }
+    }
+
+    const HMAX = Math.max(8, maxRise * 1.02);
+    const data = new Uint8Array(S * S * 4);
+    const canopy = new THREE.Color().setRGB(0.115, 0.165, 0.095, THREE.SRGBColorSpace);
+    for (let k = 0; k < S * S; k++) {
+      const base = SHORE_TINTS[tintI[k]] || SHORE_TINTS[2];
+      const v = veg[k];
+      const sh = shade[k];
+      // Authored back out to sRGB bytes: the texture is tagged sRGB so three
+      // decodes RGB on sample, while A (the height) stays linear, which is
+      // exactly the split this needs.
+      const lr = (base.r * (1 - v) + canopy.r * v) * sh;
+      const lg = (base.g * (1 - v) + canopy.g * v) * sh;
+      const lb = (base.b * (1 - v) + canopy.b * v) * sh;
+      _col.setRGB(clamp01(lr), clamp01(lg), clamp01(lb));   // already linear
+      _col.convertLinearToSRGB();
+      data[k * 4] = Math.round(255 * clamp01(_col.r));
+      data[k * 4 + 1] = Math.round(255 * clamp01(_col.g));
+      data[k * 4 + 2] = Math.round(255 * clamp01(_col.b));
+      data[k * 4 + 3] = Math.round(255 * clamp01(rise[k] / HMAX));
+    }
+
+    shoreTex = new THREE.DataTexture(data, S, S, THREE.RGBAFormat, THREE.UnsignedByteType);
+    shoreTex.wrapS = shoreTex.wrapT = THREE.ClampToEdgeWrapping;
+    shoreTex.minFilter = THREE.LinearFilter;
+    shoreTex.magFilter = THREE.LinearFilter;
+    // No mips on purpose: the march samples inside a loop with a break, where an
+    // implicit derivative is undefined. One level makes that a non-question.
+    shoreTex.generateMipmaps = false;
+    shoreTex.colorSpace = THREE.SRGBColorSpace;
+    shoreTex.needsUpdate = true;
+    shoreRect.set(bounds.minX, bounds.minZ, 1 / wW, 1 / dD);
+    shoreCfg.set(HMAX, maxRise, 1.0);
   }
 
   // =========================================================================
@@ -2102,6 +2624,15 @@ export function createWater(ctx) {
         uOpacity: { value: 1 },
         uSpecGain: { value: 0.42 },
         uFresnelMax: { value: useDepthTex ? 0.84 : 0.93 },
+        // Screen-space floor on the waterline feather. 2.6 px is wide enough
+        // that the intersection never reads as a cut and narrow enough that a
+        // near shoreline still has a definite edge. See the alpha block.
+        uShorePixels: { value: 2.6 },
+        // x = metres of bank counted as wetted, y = its peak alpha. The creek's
+        // banks are steep and its own wet-rock decal already covers them, so it
+        // takes a narrow band; the valley shore is shallow and has no decal, so
+        // it takes a wide one and does most of the work there.
+        uWetMargin: { value: new THREE.Vector2(useDepthTex ? 0.35 : 0.10, 0.55) },
         // Disabled unless the offshore apron switches it on (see below).
         uDissolveRect: { value: new THREE.Vector4(0, 0, 0, 0) },
         uDissolveBand: { value: new THREE.Vector2(0, 0) },
@@ -2123,8 +2654,27 @@ export function createWater(ctx) {
       uniforms.uWaveHeight.value = lowSpec ? 0.04 : 0.085;
     }
 
-    const defines = { RIPPLE_COUNT: RIPPLE_COUNT };
+    const defines = {
+      RIPPLE_COUNT: RIPPLE_COUNT,
+      SUN_DISC_RADIANCE: SUN_DISC_RADIANCE.toFixed(1),
+      GLINT_ALPHA: GLINT_ALPHA.toFixed(6),
+      GLINT_FOOTPRINT: GLINT_FOOTPRINT.toFixed(3),
+    };
     if (lowSpec) defines.WATER_CHEAP = '';
+
+    // The shore march is the valley body's and the apron's; the creek keeps the
+    // environment map, as the work order asks. A creek is a metre wide in a
+    // gully — there is nothing for a reflected ray to find but the bank it is
+    // already touching.
+    if (useDepthTex && shoreTex && shoreSteps > 0) {
+      defines.WATER_SHORE_REFLECT = '';
+      defines.SHORE_STEPS = String(shoreSteps);
+      defines.SHORE_MAX_DIST = SHORE_MAX_DIST.toFixed(1);
+      uniforms.uShoreTex = { value: shoreTex };
+      uniforms.uShoreRect = { value: shoreRect.clone() };
+      uniforms.uShoreCfg = { value: shoreCfg.clone() };
+      uniforms.uShoreLight = { value: new THREE.Vector3(1, 1, 1) };
+    }
 
     const mat = new THREE.ShaderMaterial({
       uniforms,
@@ -2143,6 +2693,14 @@ export function createWater(ctx) {
   const creekMat = makeSurfaceMaterial(false);
   const valleyMat = valleyMesh ? makeSurfaceMaterial(true) : null;
 
+  // The apron deliberately does NOT get the shore march either (it comes in on
+  // the same useDepthTex flag). It begins 2.3 km offshore and runs to the far
+  // plane; everything it can see is open water reflecting sky, its area is
+  // enormous, and terrain.js's far ring lifts the valley floor above the water
+  // line so most of it is occluded by dry land anyway. Paying a ten-tap march
+  // over that many fragments to find nothing is the one place this feature
+  // could actually cost something.
+  //
   // The apron runs on the same shader as everything else, with the baked depth
   // texture switched OFF: that texture only covers the valley rect and its uv
   // clamp would hand every offshore fragment the rect-edge depth, which is
@@ -2160,6 +2718,11 @@ export function createWater(ctx) {
     u.uFoamWidth.value = 0.45;
     u.uRefract.value = 0.20;
     u.uBedScale.value = 0.05;
+    // No wetted margin offshore — there is no shore out here, and the apron's
+    // depth attribute is a constant 24 m so the band would evaluate against a
+    // waterline it never reaches. Gain 0 switches it off; the width stays
+    // non-zero because smoothstep is undefined when its two edges are equal.
+    u.uWetMargin.value.set(0.05, 0.0);
     u.uDissolveRect.value.copy(apronRect);
     u.uDissolveBand.value.set(APRON_DISSOLVE, 1 / APRON_DISSOLVE);
     return m;
@@ -2218,6 +2781,19 @@ export function createWater(ctx) {
       uniforms: u,
       vertexShader: WET_VERT,
       fragmentShader: WET_FRAG,
+      defines: {
+        SUN_DISC_RADIANCE: SUN_DISC_RADIANCE.toFixed(1),
+        // A water film on rock is glossy, not a mirror: alpha 0.10 (a2 = 0.01)
+        // against the water surface's 0.0055. A few millimetres of water follows
+        // the microrelief of what it is sitting on, so the lobe is the rock's,
+        // not the film's. That matters here for a second reason: the wet decal
+        // has no normal map on it, only the terrain normal, which varies slowly
+        // — a mirror-tight lobe on a slowly varying normal would satisfy its
+        // condition over a whole bank at once rather than at a point. Peaks at
+        // display ~L244 at grazing incidence, which is the brightest thing on a
+        // creek bank and still short of paper white.
+        WET_GLINT_A2: '0.01',
+      },
       transparent: true,
       premultipliedAlpha: true,
       depthWrite: false,
@@ -2528,6 +3104,15 @@ export function createWater(ctx) {
     if (skyMod && skyMod.fogGroundColor) skyLow.copy(skyMod.fogGroundColor);
     if (skyMod && skyMod.fogHighColor) skyHigh.copy(skyMod.fogHighColor);
 
+    // Relight for the shore reflection proxy. The bake stores albedo times a
+    // purely geometric shade term, so one multiply here keeps the reflected
+    // shore in step with the live sun and sky instead of freezing at the
+    // time of day the world happened to boot at.
+    shoreLight.setRGB(
+      _sunCol.r * 0.90 + skyHigh.r * 0.60,
+      _sunCol.g * 0.90 + skyHigh.g * 0.60,
+      _sunCol.b * 0.90 + skyHigh.b * 0.60);
+
     for (const m of materials) {
       const u = m.uniforms;
       u.uSunDir.value.copy(_v1);
@@ -2535,6 +3120,7 @@ export function createWater(ctx) {
       u.uSkyLow.value.copy(skyLow);
       u.uSkyHigh.value.copy(skyHigh);
       u.uEnvIntensity.value = envInt;
+      if (u.uShoreLight) u.uShoreLight.value.set(shoreLight.r, shoreLight.g, shoreLight.b);
       if (envTex !== lastEnv) {
         u.envMap.value = envTex;
         // Setting material.envMap is what makes three emit USE_ENVMAP and the
@@ -2734,6 +3320,7 @@ export function createWater(ctx) {
       texSwell.dispose(); texChop.dispose(); texFoam.dispose();
       texBed.dispose(); texPuff.dispose(); dummyDepth.dispose();
       if (depthTex) depthTex.dispose();
+      if (shoreTex) shoreTex.dispose();
     },
 
     // --- debug / integration aids ---

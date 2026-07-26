@@ -79,13 +79,64 @@ const PIXEL_BUDGET = {
 // hold the target, recovering it when the load drops. The shed/recover thresholds are
 // deliberately far apart, a decision consumes a whole fresh window, and recovery needs
 // several consecutive good windows (a count that only ever grows) — so it cannot pump.
+//
+// R6 — VERIFICATION OF THE GOVERNOR, AND THE DEFECT IT FOUND.
+//
+// The thresholds below are sound; the *signal* they were being fed was not. Until this
+// revision `sampleGovernor()` was called with `now - lastFrameStamp` — the wall-clock
+// interval between the first render call of one frame and the first render call of the
+// next. On any vsync-locked display that interval is the REFRESH PERIOD, not the work:
+// a machine finishing its frame in 8 ms and a machine finishing it in 16 ms both report
+// 16.67 ms on a 60 Hz panel, because both then sit idle until the next vsync.
+//
+// 16.67 > GOV_SHED_MS (15.0) and 16.67 > GOV_RECOVER_MS (12.5). So on a perfectly
+// healthy 60 fps machine the mean sat permanently above the shed threshold and
+// permanently above the recover threshold: the governor shed one 1/16 step every
+// 30 frames until it reached GOV_MAX_TRIM and then could never give any of it back.
+// At `high` that drives 1.4375 → 0.6875, a 2.2x cut in rendered pixels, on hardware
+// with headroom to spare. It does not oscillate — it collapses, monotonically, and
+// silently. Nothing inside the old sampleGovernor() could have detected this, because
+// a frame period carries no information about how much of it was work.
+//
+// The repair is to measure the two quantities separately and give each its own job:
+//
+//   BUSY   — top of the animation frame to the last render call inside it, i.e. all
+//            seventeen system update()/lateUpdate() calls plus the entire postfx
+//            chain. This is the quantity the orchestrator measured at 10.35 / 13.13 /
+//            15.29 / 13.04 ms, and therefore the quantity GOV_SHED_MS is authored
+//            against. It is what `stats.frameMeanMs` now reports.
+//   PERIOD — the wall-clock interval. Worthless as a work estimate, but it is the only
+//            way to see the one failure BUSY cannot: a GPU-bound frame, where CPU-side
+//            submission returns early and the overrun shows up solely as missed
+//            vsyncs. Counted as a late-frame fraction, not as a mean.
+//
+// Shed on either signal; recover only when both are clear. Behaviour at the measured
+// working points, at `high` (applied ratio 1.4375, budget-derived 1.4232):
+//   open alpine   10.35 ms  → below both thresholds, 0 late  → hold at 1.4375
+//   jump line     13.13 ms  → inside the 12.5–15.0 dead band → hold at 1.4375
+//   dense forest  15.29 ms  → one shed → 1.375 (0.915x the pixels) → ~14.5 ms, which
+//                             lands back inside the dead band → holds there. One step,
+//                             no second shed, no recovery pump.
+//   final sprint  13.04 ms  → dead band → hold
+// Returning to open alpine clears the trim after govRecoverNeeded (now 3) consecutive
+// clean windows ≈ 1.5 s, and every further shed raises that count by one, so a rider
+// crossing in and out of the forest converges instead of pumping.
 const GOV_WINDOW = 30;              // frames per decision window
-const GOV_SHED_MS = 15.0;           // mean above this → shed a step (≈66 fps)
-const GOV_RECOVER_MS = 12.5;        // mean below this → a step back (≈80 fps); 2.5 ms band
+const GOV_SHED_MS = 15.0;           // busy mean above this → shed a step (≈66 fps)
+const GOV_RECOVER_MS = 12.5;        // busy mean below this → a step back; 2.5 ms band
 const GOV_STEP = 1 / 16;            // exactly one snap increment of the ratio grid
 const GOV_MAX_TRIM = 0.75;          // never shed more than 0.75 of ratio in total
 const GOV_RECOVER_WINDOWS = 2;      // consecutive good windows needed for the first recovery
 const GOV_RECOVER_WINDOWS_MAX = 8;  // …rising by one per shed, so oscillation dies out
+
+// Dropped-frame detection. A frame counts as late only when it exceeds BOTH a
+// multiple of the observed refresh period AND the contract's stated 60 fps target
+// (CONTRACT §0). The second clause is what keeps a 120 Hz ProMotion panel from
+// declaring a legitimate 60 fps run "late" and shedding resolution for no reason.
+const GOV_TARGET_MS = 18.0;         // 60 fps plus a frame of slack
+const GOV_LATE_MUL = 1.5;           // …and half a refresh period beyond the floor
+const GOV_LATE_SHED = 0.25;         // >25% of a window missing vsync → shed
+const GOV_LATE_OK = 0.02;           // recovery needs an essentially clean window
 
 const CAMERA_FOV = 62;     // chase camera drives this at runtime (speed FOV kick)
 const CAMERA_NEAR = 0.1;
@@ -481,25 +532,79 @@ export function createEngine(ctx) {
   let viewH = startH;
   let appliedPixelRatio = 1;
 
-  // Governor state. All module-lifetime; the sample ring is a typed array so the
+  // Governor state. All module-lifetime; every sample ring is a typed array so the
   // per-frame path below allocates nothing.
-  const govSamples = new Float64Array(GOV_WINDOW);
-  let govFill = 0;
-  let govIdx = 0;
-  let govSum = 0;
+  const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+  // BUSY ring — real per-frame work. Runs unconditionally, whether the governor is
+  // enabled or not and whether or not the backbuffer is pinned by the QA harness,
+  // because `stats.frameMeanMs` is a diagnostic first and the governor's input second.
+  // (Before this revision it was assigned only from inside sampleGovernor(), after two
+  // early-outs and only on a decision boundary, which is why it read 0 in the harness.)
+  const busySamples = new Float64Array(GOV_WINDOW);
+  let busyIdx = 0, busyFill = 0, busySum = 0;
+
+  // PERIOD ring — wall-clock frame interval, plus a per-slot "missed vsync" flag so
+  // the late fraction is maintained incrementally rather than rescanned.
+  const perSamples = new Float64Array(GOV_WINDOW);
+  const perLate = new Uint8Array(GOV_WINDOW);
+  let perIdx = 0, perFill = 0, perSum = 0, perLateCount = 0;
+  // Leaky minimum of the observed period: settles onto the display's refresh interval
+  // within a second, and creeps back up slowly enough that one fast frame cannot poison
+  // it. Asymmetric on purpose — the moment the machine can hit full rate again, the
+  // floor is pulled straight back down by the min().
+  let periodFloor = 16.7;
+
+  // Frame boundary marks. `frameTopMs` is stamped by our own rAF callback, which is
+  // registered during createEngine() and therefore runs *before* main.js's tick in
+  // every animation frame (rAF callbacks fire in registration order, and each
+  // re-registers from inside its own callback, so the order is stable for the life of
+  // the process). `lastRenderEndMs` is stamped after every renderer.render() call, so
+  // the final one of a frame marks the end of the postfx chain.
+  let frameTopMs = 0;
+  let lastRenderEndMs = 0;
+  let govRaf = 0;
+
   let govTrim = 0;                              // ratio subtracted by the governor
   let govRecoverStreak = 0;
   let govRecoverNeeded = GOV_RECOVER_WINDOWS;
   let govEnabled = true;
   let govPending = false;
+  let govHold = 0;                              // frames to wait out after a decision
   let govMeanMs = 0;
   let disposed = false;
 
   function govClearWindow() {
-    govSamples.fill(0);
-    govFill = 0;
-    govIdx = 0;
-    govSum = 0;
+    busySamples.fill(0); busyIdx = 0; busyFill = 0; busySum = 0;
+    perSamples.fill(0); perLate.fill(0);
+    perIdx = 0; perFill = 0; perSum = 0; perLateCount = 0;
+    govHold = 0;
+  }
+
+  /** One true frame-busy sample. Always live; never gated. No allocation. */
+  function pushBusy(ms) {
+    busySum += ms - busySamples[busyIdx];
+    busySamples[busyIdx] = ms;
+    busyIdx = (busyIdx + 1) % GOV_WINDOW;
+    if (busyFill < GOV_WINDOW) busyFill++;
+    govMeanMs = busySum / busyFill;
+    stats.frameMeanMs = govMeanMs;
+  }
+
+  /** One wall-clock frame-period sample, and the missed-vsync bookkeeping. */
+  function pushPeriod(ms) {
+    periodFloor = Math.min(ms, periodFloor + 0.04);
+    if (!(periodFloor >= 3.0)) periodFloor = 3.0;
+    else if (periodFloor > 20.0) periodFloor = 20.0;
+    const late = (ms > GOV_TARGET_MS && ms > periodFloor * GOV_LATE_MUL) ? 1 : 0;
+    perSum += ms - perSamples[perIdx];
+    perLateCount += late - perLate[perIdx];
+    perSamples[perIdx] = ms;
+    perLate[perIdx] = late;
+    perIdx = (perIdx + 1) % GOV_WINDOW;
+    if (perFill < GOV_WINDOW) perFill++;
+    stats.framePeriodMeanMs = perSum / perFill;
+    stats.frameLateFrac = perLateCount / perFill;
   }
 
   /**
@@ -566,7 +671,9 @@ export function createEngine(ctx) {
     }
     if (ctx.debug && ctx.debug.enabled) {
       ctx.debug.log('engine.governor', {
-        meanMs: +govMeanMs.toFixed(2),
+        busyMeanMs: +govMeanMs.toFixed(2),
+        periodMeanMs: +stats.framePeriodMeanMs.toFixed(2),
+        lateFrac: +stats.frameLateFrac.toFixed(3),
         trim: govTrim,
         pixelRatio: appliedPixelRatio,
         mpix: +((viewW * appliedPixelRatio) * (viewH * appliedPixelRatio) / 1e6).toFixed(2),
@@ -582,56 +689,81 @@ export function createEngine(ctx) {
   }
 
   /**
-   * One frame-time sample. Sheds 1/16 of the pixel ratio when the 30-frame mean exceeds
-   * GOV_SHED_MS and gives it back when the mean falls below GOV_RECOVER_MS, with three
-   * independent anti-oscillation guards: a 2.5 ms dead band between the two thresholds,
-   * a full fresh window after every decision (so a change is always judged on frames
-   * rendered at the new resolution), and a consecutive-good-window requirement for
-   * recovery that increases by one on every shed and is never reduced.
+   * Top-of-animation-frame mark, and the busy sample for the frame that just finished.
+   *
+   * Registered here rather than driven from main.js so this module owns its own
+   * measurement end to end: main.js is not ours to edit, and a governor whose input
+   * depends on another module remembering to call it is a governor that will silently
+   * stop working. rAF callbacks run in registration order and each re-registers from
+   * inside its own callback, so this stays ahead of main.js's tick permanently.
+   */
+  function govFrameTick() {
+    govRaf = requestAnimationFrame(govFrameTick);
+    const t = nowMs();
+    // The frame that just ended: from its top to its last render call. Rejected when
+    // no render happened inside it (paused, menu, context lost), when the ordering
+    // assumption above does not hold, and for hitches — a governor that reacts to a
+    // 400 ms GC pause or a tab-switch gap would drop several steps for one stall.
+    if (frameTopMs > 0 && lastRenderEndMs > frameTopMs) {
+      const busy = lastRenderEndMs - frameTopMs;
+      if (busy > 0.05 && busy < 120) pushBusy(busy);
+    }
+    frameTopMs = t;
+  }
+  if (typeof requestAnimationFrame === 'function') govRaf = requestAnimationFrame(govFrameTick);
+
+  /**
+   * One governor decision, at most one per frame.
+   *
+   * Sheds 1/16 of the pixel ratio when the 30-frame BUSY mean exceeds GOV_SHED_MS or
+   * more than GOV_LATE_SHED of the window missed a vsync, and gives a step back when
+   * the busy mean falls below GOV_RECOVER_MS on an essentially clean window. Four
+   * independent anti-oscillation guards: the 2.5 ms dead band between the two busy
+   * thresholds; a full fresh window after every decision (govHold, so a change is
+   * always judged on frames rendered at the new resolution); a consecutive-good-window
+   * requirement for recovery that increases by one on every shed and is never reduced;
+   * and asymmetric signals — shedding needs either symptom, recovery needs both clear.
+   *
+   * Note that the sample rings keep running through govHold. Only the *decision* is
+   * suspended, so `stats.frameMeanMs` stays live every frame while the window property
+   * the anti-oscillation argument depends on is preserved exactly.
    * No allocation.
    */
-  function sampleGovernor(deltaMs) {
+  function governorDecide() {
     if (!govEnabled || contextLost) return;
-    // Reject the first frame, hitches, tab-switch gaps and debugger pauses — a governor
-    // that reacts to a 400 ms stall would drop three steps for one GC.
-    if (!(deltaMs > 0.5) || deltaMs > 120) return;
     // If something else has pinned the backbuffer (the QA harness's shoot()/measure()
-    // both do exactly that), stay out of its way entirely.
+    // both do exactly that), stay out of its way entirely — but keep measuring.
     if (Math.abs(renderer.getPixelRatio() - appliedPixelRatio) > 1e-4) return;
+    if (govHold > 0) { govHold--; return; }
+    if (busyFill < GOV_WINDOW || perFill < GOV_WINDOW) return;
 
-    govSum += deltaMs - govSamples[govIdx];
-    govSamples[govIdx] = deltaMs;
-    govIdx = (govIdx + 1) % GOV_WINDOW;
-    if (govFill < GOV_WINDOW) { govFill++; return; }
+    const lateFrac = perLateCount / GOV_WINDOW;
 
-    govMeanMs = govSum / GOV_WINDOW;
-    stats.frameMeanMs = govMeanMs;
-
-    if (govMeanMs > GOV_SHED_MS) {
+    if (govMeanMs > GOV_SHED_MS || lateFrac > GOV_LATE_SHED) {
       if (govTrim < GOV_MAX_TRIM - 1e-6) {
         govTrim = Math.min(GOV_MAX_TRIM, govTrim + GOV_STEP);
         govRecoverNeeded = Math.min(GOV_RECOVER_WINDOWS_MAX, govRecoverNeeded + 1);
         scheduleGovernorApply();
       }
       govRecoverStreak = 0;
-      govClearWindow();
+      govHold = GOV_WINDOW;
       return;
     }
 
-    if (govMeanMs < GOV_RECOVER_MS && govTrim > 0) {
+    if (govMeanMs < GOV_RECOVER_MS && lateFrac <= GOV_LATE_OK && govTrim > 0) {
       govRecoverStreak++;
       if (govRecoverStreak >= govRecoverNeeded) {
         govTrim = Math.max(0, govTrim - GOV_STEP);
         govRecoverStreak = 0;
         scheduleGovernorApply();
       }
-      govClearWindow();
+      govHold = GOV_WINDOW;
       return;
     }
 
-    // In the dead band (or already at full resolution): hold, and start a fresh window.
+    // In the dead band (or already at full resolution): hold out a window.
     govRecoverStreak = 0;
-    govClearWindow();
+    govHold = GOV_WINDOW;
   }
 
   // A DPR change (dragging the window between a Retina and a 1x display) fires no
@@ -698,9 +830,27 @@ export function createEngine(ctx) {
     passes: 0,
     fps: 0,
     frameTimeMs: 0,
-    frameMeanMs: 0,          // 30-frame mean the governor decides on (0 until a full window)
+    // R6 — the real per-frame work: top of the animation frame to the last render call
+    // inside it, so it covers every system update()/lateUpdate() and the whole postfx
+    // chain. Directly comparable to the orchestrator's 10.35 / 13.13 / 15.29 / 13.04 ms
+    // measurements, live every frame from the 30th onwards, and NOT suppressed while the
+    // QA harness has the backbuffer pinned. This is the governor's input.
+    frameMeanMs: 0,
+    // Wall-clock frame interval. On a vsync-locked display this is the refresh period
+    // and says nothing about headroom — read frameMeanMs for that, not this.
+    framePeriodMeanMs: 0,
+    // Fraction of the last 30 frames that missed a vsync (see GOV_TARGET_MS). The only
+    // signal that catches a GPU-bound frame, where CPU submission returns early.
+    frameLateFrac: 0,
+    // CPU time inside renderer.render() calls this frame — submission only, not GPU.
+    renderMs: 0,
     gpuFrames: 0,
-    pixelRatio: appliedPixelRatio,        // the *effective* ratio actually applied (K2)
+    // R6 — read back from the renderer rather than echoed from our own intent, so this
+    // stays true when something else has pinned the backbuffer (harness shoot()/measure()
+    // both set setPixelRatio(1) directly). `pixelRatioApplied` is what this module asked
+    // for; a difference between the two means someone else is driving.
+    pixelRatio: appliedPixelRatio,
+    pixelRatioApplied: appliedPixelRatio,
     pixelRatioTrim: 0,       // how much of it the governor is currently withholding
     width: viewW,            // CSS pixels
     height: viewH,
@@ -713,6 +863,7 @@ export function createEngine(ctx) {
   let passCount = 0;
   let lastFrameStamp = (typeof performance !== 'undefined' ? performance.now() : Date.now());
   let smoothedFrameMs = 16.7;
+  let renderBusyAccum = 0;
 
   function rollFrameStats() {
     const info = renderer.info;
@@ -724,14 +875,20 @@ export function createEngine(ctx) {
     stats.geometries = info.memory.geometries;
     stats.textures = info.memory.textures;
     stats.programs = info.programs ? info.programs.length : 0;
-    stats.pixelRatio = appliedPixelRatio;
+    stats.pixelRatioApplied = appliedPixelRatio;
     stats.pixelRatioTrim = govTrim;
     stats.width = viewW;
     stats.height = viewH;
-    stats.drawWidth = Math.floor(viewW * appliedPixelRatio);
-    stats.drawHeight = Math.floor(viewH * appliedPixelRatio);
-    stats.renderMPix = (stats.drawWidth * stats.drawHeight) / 1e6;
+    // Ground truth, not intent: getDrawingBufferSize() is the size the driver actually
+    // allocated, which is what a shot or a benchmark is really costing.
+    renderer.getDrawingBufferSize(_drawSize);
+    stats.pixelRatio = renderer.getPixelRatio();
+    stats.drawWidth = _drawSize.x;
+    stats.drawHeight = _drawSize.y;
+    stats.renderMPix = (_drawSize.x * _drawSize.y) / 1e6;
     stats.gpuFrames = info.render.frame;
+    stats.renderMs = renderBusyAccum;
+    renderBusyAccum = 0;
 
     const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     const delta = now - lastFrameStamp;
@@ -742,9 +899,12 @@ export function createEngine(ctx) {
       stats.frameTimeMs = smoothedFrameMs;
       stats.fps = smoothedFrameMs > 0 ? 1000 / smoothedFrameMs : 0;
     }
-    // Governor runs off the raw delta, not the EMA: the EMA's ~0.4 s tail would stack a
-    // second lag on top of the 30-frame window and make the loop under-damped.
-    sampleGovernor(delta);
+    // Raw period, not the EMA: the EMA's ~0.4 s tail would stack a second lag on top of
+    // the 30-frame window and make the loop under-damped. This feeds ONLY the dropped-
+    // frame detector now; the work estimate comes from the busy ring (see the note at
+    // GOV_WINDOW for why a period cannot serve as one).
+    if (delta > 0.5 && delta < 500) pushPeriod(delta);
+    governorDecide();
 
     info.reset();
     passCount = 0;
@@ -765,6 +925,10 @@ export function createEngine(ctx) {
       statsFrame = ctx.frame;
     }
     passCount++;
+    // Bracketing every render call is what lets the frame's *end* be located without a
+    // hook in main.js: the last stamp written before the next animation frame's top is
+    // the end of the postfx chain. ~10 performance.now() calls a frame, tens of ns each.
+    const t0 = nowMs();
     try {
       rawRender(sceneArg, cameraArg);
     } catch (err) {
@@ -773,6 +937,8 @@ export function createEngine(ctx) {
         console.error('[engine] render threw', err);
       }
     }
+    lastRenderEndMs = nowMs();
+    renderBusyAccum += lastRenderEndMs - t0;
   };
 
   function onContextLost(event) {
@@ -854,7 +1020,12 @@ export function createEngine(ctx) {
     get pixelRatio() { return appliedPixelRatio; },
     /** Ratio the frame-time governor is currently withholding (0 = full resolution). */
     get pixelRatioTrim() { return govTrim; },
+    /** 30-frame mean of real per-frame work (updates, lateUpdates, postfx chain). */
     get frameMeanMs() { return govMeanMs; },
+    /** 30-frame mean wall-clock frame interval — the refresh period when vsync-locked. */
+    get framePeriodMeanMs() { return stats.framePeriodMeanMs; },
+    /** Fraction of the last window that missed a vsync (see GOV_TARGET_MS). */
+    get frameLateFrac() { return stats.frameLateFrac; },
     get width() { return viewW; },
     get height() { return viewH; },
 
@@ -979,6 +1150,8 @@ export function createEngine(ctx) {
 
     dispose() {
       disposed = true;   // a governor apply may still be queued on a rAF
+      if (govRaf && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(govRaf);
+      govRaf = 0;
       if (offQuality) offQuality();
       canvas.removeEventListener('webglcontextlost', onContextLost);
       canvas.removeEventListener('webglcontextrestored', onContextRestored);

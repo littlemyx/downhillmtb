@@ -102,6 +102,21 @@
 // The exposure controller's metering mask changed in the same pass: r3's hard upper-25% crop
 // became a centre-weighted field with the sky down-weighted rather than excluded, plus an
 // explicit bounded highlight term. See the constants for the measured derivation of each.
+//
+// CONTRACT-NOTE (r6 review): **the r5 roll-off had no white point, and that is its own
+// failure.** Measured across all sixteen 1920x1080 review shots: 0.000% crushed, 0.000%
+// clipped — and no pixel above L=242, no channel reaching 249. There is no true white, no sun
+// glint and no specular hit anywhere in the set. Walking the whole chain numerically, the r5
+// constants require 3,174 units of post-exposure radiance to exceed L=250 and 2.8e9 to reach
+// 255; the brightest pixel in sixteen frames is 50. The logarithm is unbounded but grows far
+// too slowly to ever reach ACES's saturation point, and raising its softness makes the sky
+// brighter *and* pushes the white point further away. Fixed by an additive specular-escape
+// term inside the same HDR curve — zero below the knee, C1 as it leaves it, linear far above,
+// so the sun's own disc and a mirror-angle glint saturate while the 7-15 unit sky moves by a
+// tenth of a level. See HL_SPEC_GAIN for the full derivation and the before/after table.
+// Two other r6 items live in this file: `TIERS.high` finally gets `msaa: 2` (the line
+// vegetation.js specified three rounds ago), and `init()` now precompiles the whole pipeline
+// behind the loading screen with `checkShaderErrors` gated — see `precompile()`.
 // ---------------------------------------------------------------------------------
 //
 // Everything is procedural — the grading LUT is generated in code at boot. No files,
@@ -221,10 +236,65 @@ const METER_HI_GAIN = 0.10;
 // radiance now maps 0.2 -> L135, 0.55 -> 202, 1.2 -> 221, 3 -> 234, 7 -> 241, 15 -> 245,
 // 50 -> 249, 400 -> 252. Everything at and below 0.55 is bit-identical to before.
 // The number that matters: a pixel needed **2.22** units of post-exposure radiance to exceed
-// L=250 through the r5 chain, and needs **135** through this one. The r5 sky measures 7-15.
+// L=250 through the r5 chain, and needs far more through this one. The r5 sky measures 7-15.
 // That single ratio is the regression and its fix.
 const HL_KNEE = 0.65;
 const HL_SOFT = 0.90;
+
+// --- specular escape (r6 review, item 2) -----------------------------------
+// The r5 roll-off above is correct and stays. What it did not have is a *white point*.
+//
+// The r6 measurement: across all sixteen 1920x1080 review shots no pixel exceeds L=242 and
+// no channel reaches 249. That is not a pass, it is the opposite failure — there is no true
+// white, no sun glint and no specular hit anywhere in the set. Real sunlit photography clips
+// somewhere.
+//
+// The cause is the shape of the curve, not its tuning, and it is worth being exact about
+// because "raise S" is the obvious answer and it is wrong. Walking the whole chain
+// numerically (roll-off -> ACES RRTAndODTFit -> the grading cube -> FilmEffect's OPEN
+// shoulder -> sRGB) the r5 constants require:
+//     L = 242  at   50 units of post-exposure radiance   <- exactly the measured peak
+//     L = 245  at  132
+//     L = 250  at  3,174
+//     L = 255  at  2.8e9                                 <- i.e. never
+// The logarithm is the problem. `K + S*ln(1 + over/S)` is unbounded but it grows so slowly
+// that ACES's saturation point (an input of 25.7) sits at m = 2.5e12. Raising S does not fix
+// it and makes it worse in the only band that matters: S = 3.0 would lift the 7-15 sky by
+// ~5 levels *and* push the white point out to m = 1.3e4.
+//
+// So the fix is a second, additive term that is asleep everywhere the r5 curve was doing its
+// job and wakes up only where a genuine specular lives:
+//
+//     y += G * over * over / (over + Q)
+//
+//   * exactly 0 below the knee (`over` is already clamped at 0 there), so the shadow floor,
+//     the whole midtone range and the r2 fix are still bit-identical;
+//   * quadratic at small `over` with zero slope at 0, so it is C1 where it joins — no
+//     contour ring at the hand-off, which a `max(m - SPEC, 0)` linear escape would give;
+//   * asymptotically linear with slope G, so it *does* reach ACES saturation at a finite,
+//     physically reachable radiance;
+//   * monotonic everywhere (derivative G*(over^2 + 2*over*Q)/(over+Q)^2 > 0) — verified
+//     numerically over m in [0, 5000] at 0.01 steps, 0 non-monotonic samples.
+//
+// G = 0.035, Q = 300 solved so that paper white lands at m = 595. Where that number comes
+// from: sky.js clamps its solar disc at 2200 linear (sky.js:1100) precisely so it cannot
+// write Inf into this buffer, so the sun's own radiance arrives here at ~2530 at the
+// measured working exposure. 595 is 4.2x below that — i.e. anything within about two stops
+// of a mirror reflection of the sun (a chrome stanchion at the mirror angle, water glitter,
+// a wet-rock or rotor glint) reaches 255, and a 4% dielectric reflection of the sun does not.
+// That is the correct discrimination and it is made in radiance, not by taste.
+//
+// The whole re-tune, measured end to end:
+//              m=7    m=15   m=50   m=100  m=200  m=400  m=600  m=2530 (sun disc)
+//   r5 curve   230.3  236.1  242.0  244.3  246.0  247.3  248.0  249.8
+//   with this  230.4  236.2  243.0  246.6  250.3  253.4  254.5  255.0
+// The measured peak of the entire r6 set is m = 50, so the set moves by ONE level at its
+// brightest pixel and by less than 0.3 of a level anywhere below m = 25. Nothing in the set
+// clips: it takes 595 units and the brightest thing in sixteen frames is 50. The proof that
+// the sun disc is in none of them is in the review's own figure — the disc renders at L=249.8
+// through the r5 curve, and no channel in the set reaches 249.
+const HL_SPEC_GAIN = 0.035;
+const HL_SPEC_SOFT = 300.0;
 
 // --- depth of field, far field only (r3 review, I2) ------------------------
 // Nothing nearer than this is ever defocused. The chase rigs sit 5–14 m from the rider, so
@@ -283,9 +353,14 @@ const DOF_SUBJECT_OFF = 70.0;
 const SHOULDER_KNEE_OPEN = 0.80;
 const SHOULDER_ROLLOFF_OPEN = 0.035;   // peak depth of the dip, at display 0.90
 // Solved rather than tasted: with the HDR roll-off in front of it, (0.64, 0.30) is the
-// strongest lift for which a pixel still needs 22 units of post-exposure radiance to exceed
-// L=250. The canopy holes in 07-forest-loam sit at 7-15, so the shot that has to come in
-// under 2% clipped comes in under it even if the metering classifies it as flat.
+// strongest lift that still keeps a real margin between the canopy holes and the top of the
+// range. Re-derived numerically through the whole chain for r6, because the figure that used
+// to be quoted here was computed without FilmEffect's own curve in the walk and was wrong by
+// two orders of magnitude. On the FLAT branch a pixel needs **85** units of post-exposure
+// radiance to exceed L=250 (174 before the specular escape landed) and **538** to reach 255.
+// The canopy holes in 07-forest-loam sit at 7-15 units and land at L=242-246 either way, so
+// the shot that has to come in under 2% clipped comes in at 0% even when the metering
+// classifies it as flat.
 const SHOULDER_KNEE_FLAT = 0.64;
 const SHOULDER_LIFT_FLAT = 0.30;       // < 1, so nothing below 1.0 is pushed to 1.0
 // Adapted-scene-luminance window that selects between them, in true (normalised) metered
@@ -377,7 +452,51 @@ const TIERS = {
     // the actual streak length in pixels.
     mbSamples: 10,
     smaa: SMAAPreset.HIGH,
-    msaa: 0,
+    // r6 review, item 1 — 2x MSAA at `high`, the line vegetation.js asked for three rounds
+    // ago (vegetation.js:3751-3758) and nothing here ever gave it.
+    //
+    // Why SMAA cannot cover this and MSAA can. SMAA is *morphological*: it re-shapes edges
+    // it can find in the final image, it runs last (after grain and chromatic aberration),
+    // and its `edgeDetectionThreshold` had to be raised to 0.06 so it would not fire on the
+    // film grain sitting in front of it. That threshold is a 6%-contrast floor on every edge
+    // in the frame, and it makes the pass structurally blind to the thing that is actually
+    // aliasing here: an alpha-tested needle silhouette against sky, where the *shading* on
+    // either side of the edge differs by far less than 6% but the coverage goes 0 -> 1 in
+    // one pixel. Morphological AA also cannot invent the sub-pixel coverage a 5.7 px needle
+    // stroke needs; it can only smooth the staircase it already has.
+    //
+    // MSAA solves exactly that case and only that case: the fragment shader still runs once
+    // per pixel (so this is NOT 2x the shading cost), and with `alphaToCoverage` on the
+    // foliage materials the alpha test resolves into 2 sub-samples instead of a binary
+    // keep/discard. vegetation.js:4792-4815 re-reads `composer.multisampling` on every
+    // quality change and flips `alphaToCoverage` on the five foliage materials by itself —
+    // that wiring has been finished and idle since r3, so this constant is the whole change.
+    //
+    // Cost, honestly, and checked against the library rather than assumed. I wanted to write
+    // "only the scene target is multisampled"; it is not true. `EffectComposer`'s constructor
+    // builds `inputBuffer` with the requested sample count and then does
+    // `outputBuffer = inputBuffer.clone()` (postprocessing/build/index.js, EffectComposer
+    // ctor), so BOTH ping-pong buffers carry it and every pass transition in the chain ends
+    // up resolving one. At 1920x1080 RGBA16F + depth that is:
+    //   memory   +16.6 MB colour and +8.3 MB depth per buffer for the multisampled
+    //            attachments — call it +50 MB across the pair.
+    //   time     the scene pass rasterises into a 2x target. Fragment shading is NOT doubled
+    //            (MSAA multiplies coverage samples, not shader invocations) so the terrain
+    //            shader's ~7 ms is untouched; what grows is colour/depth store bandwidth on
+    //            the one geometry pass, plus a full-target resolve at each of the 5-6 pass
+    //            transitions at roughly 0.2 ms each. Honest estimate: **+1.5 to +2.5 ms** at
+    //            1080p, i.e. 6-12% of the 20-25 ms shipping frame the final verdict derives
+    //            in §6 — not of the harness's 11.11 ms, which times `draw()` alone.
+    // That is a real price and it is worth stating plainly: this is the most expensive of the
+    // three changes in this file by an order of magnitude. It is still the right trade —
+    // foliage occupies 30-50% of pixels in nine of sixteen shots and its silhouette is the
+    // single most-visible aliasing in the set — but if the target machine cannot afford it,
+    // the knob is this constant and nothing else. There is no cheaper half: decoupling the
+    // scene target's sample count from the chain's would be a change to `postprocessing`,
+    // not to a number here.
+    // `ultra` already ran msaa: 4 through this exact path, N8AO's depth consumer included, so
+    // the multisampled-target-with-depth-texture case is exercised, not new.
+    msaa: 2,
     lutSize: 33,
     tetrahedralLUT: false,
   },
@@ -625,7 +744,8 @@ uniform vec4 exposureRange;   // x = base, y = key, z = min, w = max
 uniform float adaptStrength;
 uniform float meterNorm;      // E[w] of the metering weight field; turns the raw mean into
                               // a true weighted mean (see computeMeterNorm)
-uniform vec2 rolloff;         // x = knee, y = softness, both post-exposure linear
+uniform vec4 rolloff;         // x = knee, y = softness, z = specular gain, w = specular soft
+                              // (all in post-exposure linear radiance)
 
 void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor) {
 
@@ -651,10 +771,18 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
 	// — a blue sky comes down as blue, not as white. This is what has to happen *here*
 	// rather than after the tone map: ACES saturates at an input of 25.7 and everything
 	// above that is one identical clipped value by the time any display curve can see it.
+	// The specular escape (rolloff.z) is what gives the frame a reachable white point: it is
+	// exactly zero below the knee, quadratic-with-zero-slope as it leaves it, and linear far
+	// above, so the sun's disc and a mirror-angle glint saturate ACES while the sky at 7-15
+	// units moves by a tenth of a level. Written as over * (over / (over + Q)) rather than the
+	// algebraically identical over*over / (over + Q) deliberately: the second form squares a
+	// radiance that runs to ~2500 here, which is 6.3e6 and overflows a mediump float. This
+	// form never holds an intermediate larger than over itself.
 	if(rolloff.y > 0.0) {
 		float m = max(max(c.r, c.g), c.b);
 		float over = max(m - rolloff.x, 0.0);
 		float y = m - over + rolloff.y * log(1.0 + over / rolloff.y);
+		y += rolloff.z * over * (over / (over + rolloff.w));
 		c *= y / max(m, 1e-5);
 	}
 
@@ -749,7 +877,8 @@ class AdaptiveExposureEffect extends Effect {
   constructor({ base = 1.0, key = EXPOSURE_KEY, min = EXPOSURE_MIN, max = EXPOSURE_MAX,
                 strength = EXPOSURE_STRENGTH, adaptationRate = ADAPT_RATE, resolution = 256,
                 adaptive = true, weightedMetering = true,
-                rolloffKnee = HL_KNEE, rolloffSoft = HL_SOFT } = {}) {
+                rolloffKnee = HL_KNEE, rolloffSoft = HL_SOFT,
+                rolloffSpecGain = HL_SPEC_GAIN, rolloffSpecSoft = HL_SPEC_SOFT } = {}) {
     super('AdaptiveExposureEffect', exposureFrag, {
       blendFunction: BlendFunction.SRC,
       uniforms: new Map([
@@ -757,7 +886,8 @@ class AdaptiveExposureEffect extends Effect {
         ['exposureRange', new THREE.Uniform(new THREE.Vector4(base, key, min, max))],
         ['adaptStrength', new THREE.Uniform(strength)],
         ['meterNorm', new THREE.Uniform(1)],
-        ['rolloff', new THREE.Uniform(new THREE.Vector2(rolloffKnee, rolloffSoft))],
+        ['rolloff', new THREE.Uniform(new THREE.Vector4(
+          rolloffKnee, rolloffSoft, rolloffSpecGain, Math.max(rolloffSpecSoft, 1e-3)))],
       ]),
     });
 
@@ -834,7 +964,11 @@ class AdaptiveExposureEffect extends Effect {
   get range() { return this.uniforms.get('exposureRange').value; }
   /** E[w] of the metering weight field. 1 when the weighted-metering patch did not apply. */
   get meterNorm() { return this.uniforms.get('meterNorm').value; }
-  /** HDR highlight roll-off (knee, softness). Set y to 0 to disable it entirely. */
+  /**
+   * HDR highlight roll-off, as (knee, softness, specular gain, specular softness).
+   * Set y to 0 to disable the whole block — note that also disables the specular escape,
+   * which restores hard ACES clipping and is the intended meaning of "off".
+   */
   get rolloff() { return this.uniforms.get('rolloff').value; }
 
   get adaptationRate() { return this.adaptiveLuminancePass.fullscreenMaterial.adaptationRate; }
@@ -1266,7 +1400,11 @@ export function createPostFX(ctx) {
       frameBufferType: THREE.HalfFloatType,
       depthBuffer: true,
       stencilBuffer: false,
-      // MSAA is only worth its bandwidth at ultra; SMAA carries the other tiers.
+      // 2x at `high`, 4x at `ultra`, off below (r6 review item 1 — see TIERS.high). This is
+      // also the value vegetation.js polls to decide whether `alphaToCoverage` is worth
+      // enabling on the foliage materials, so the clamp matters: on a device that reports
+      // maxSamples 0 the coverage stays off rather than costing a per-draw state change for
+      // nothing.
       multisampling: Math.min(tier.msaa, renderer.capabilities.maxSamples || 0),
     });
 
@@ -1419,6 +1557,10 @@ export function createPostFX(ctx) {
       weightedMetering: true,
       rolloffKnee: HL_KNEE,
       rolloffSoft: HL_SOFT,
+      // r6 review item 2: the additive term that gives the chain a reachable white point.
+      // See the derivation at HL_SPEC_GAIN.
+      rolloffSpecGain: HL_SPEC_GAIN,
+      rolloffSpecSoft: HL_SPEC_SOFT,
     }));
 
     // -- 6. exposure + tone map + grade -----------------------------------
@@ -1633,6 +1775,152 @@ export function createPostFX(ctx) {
     // dissolve into invisibility on a Retina panel.
     const pr = renderer.getPixelRatio ? renderer.getPixelRatio() : 1;
     fx.film.grain.y = Math.max(1, Math.round(pr));
+  }
+
+  // -----------------------------------------------------------------------
+  // 3b-ii. Shader precompile (r6 review, item 3)
+  // -----------------------------------------------------------------------
+  //
+  // The defect: `engine.js:415` sets `renderer.debug.checkShaderErrors = true` and nothing
+  // anywhere calls `compile()`. So every material in a 22-module, ~200k-instance world
+  // compiles *lazily, on its first draw*, and each of those compiles is followed by a
+  // synchronous `getProgramParameter(LINK_STATUS)` + `getShaderInfoLog()` — a full CPU/GPU
+  // pipeline flush, per program, in the middle of the first seconds of a run. That is the
+  // exact inverse of what a console build does, and it lands on the frames where the rider
+  // is accelerating away from the gate.
+  //
+  // The fix has to live here rather than in engine.js for two reasons, and they are also why
+  // main.js's `postfx.init()` hook is the right place to hang it:
+  //   * postfx is wave 9, i.e. the first moment at which the scene is complete AND the
+  //     composer exists. Anything earlier would compile half a world.
+  //   * main.js `await`s `postfx.init()` before it starts the frame loop, so all of this
+  //     happens during boot, behind the menu overlay, and every millisecond it costs is a
+  //     millisecond the run does not spend linking programs.
+  //
+  // What gets compiled: `compileAsync()` covers every material reachable from the scene
+  // graph (three builds the real light state for it, so these are the shipping permutations,
+  // not stand-ins), and one throwaway composer render covers the shadow-depth variants and
+  // every pass material in the chain — *including* the two passes that are gated off at rest
+  // and would otherwise compile mid-run the first time the rider hits 8.6 m/s (motion blur)
+  // or a subject enters the DoF gate.
+  const nowMs = () => ((typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now());
+
+  const precompileStats = {
+    ran: false, ms: 0, sceneMs: 0, chainMs: 0,
+    programsBefore: 0, programsAfter: 0, compiled: 0,
+    parallel: false, gatedCheckShaderErrors: false, devBuild: false, error: null,
+  };
+
+  /**
+   * Is this a development build? Vite substitutes `import.meta.env.DEV` at build time; a
+   * plain `<script type="module">` load leaves `import.meta.env` undefined, and undefined
+   * means "assume production", which is the conservative answer for a *diagnostic* flag.
+   */
+  function isDevBuild() {
+    try {
+      return !!(import.meta && import.meta.env && import.meta.env.DEV);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Compile the whole pipeline up front. Idempotent; never throws.
+   *
+   * @return {Promise<Object>} `precompileStats`, also readable later via `debugPrecompile()`.
+   */
+  async function precompile() {
+    if (precompileStats.ran) return precompileStats;
+    precompileStats.ran = true;
+    precompileStats.devBuild = isDevBuild();
+    if (broken || !composer) return precompileStats;
+
+    const t0 = nowMs();
+    const info = renderer.info;
+    precompileStats.programsBefore = (info && info.programs) ? info.programs.length : 0;
+
+    // Gate the validation query. In a dev build it stays on — this project is mostly
+    // hand-written GLSL and a silent link failure there costs an afternoon — and the stall
+    // is paid here, once, during boot, instead of during the run. In a production
+    // build it goes off and STAYS off: the whole point is that the shipping binary does not
+    // flush the pipeline once per program, and by this point there is nothing left to
+    // validate anyway.
+    const prevCheck = renderer.debug ? renderer.debug.checkShaderErrors : false;
+    if (renderer.debug && !precompileStats.devBuild) {
+      renderer.debug.checkShaderErrors = false;
+      precompileStats.gatedCheckShaderErrors = true;
+    }
+
+    try {
+      // --- 1. every material in the scene ---------------------------------
+      // `compileAsync` uses KHR_parallel_shader_compile where the driver has it, so the
+      // link status is polled instead of blocked on; `compile` is the synchronous fallback.
+      const tScene = nowMs();
+      if (typeof renderer.compileAsync === 'function') {
+        precompileStats.parallel = true;
+        await renderer.compileAsync(scene, camera);
+      } else if (typeof renderer.compile === 'function') {
+        renderer.compile(scene, camera);
+      }
+      precompileStats.sceneMs = nowMs() - tScene;
+
+      // --- 2. every pass in the chain, gated ones included ----------------
+      // The `renderToScreen` flags are deliberately left EXACTLY as they are. It is tempting
+      // to force them all false so this render never touches the canvas, and it would be
+      // wrong: `Pass`'s setter does `material.needsUpdate = true` on every *change* of that
+      // flag, because the output pass compiles a different variant (it owns the sRGB
+      // conversion). Forcing it off and back on would precompile the variant that never runs
+      // and then throw away the one that does — the exact opposite of the point. One frame
+      // appears on the canvas instead, at the end of boot, behind the menu overlay.
+      //
+      // Only the two gated passes are toggled, and toggling `enabled` compiles nothing it
+      // should not: neither of them is ever the last enabled pass (SMAA is), so neither one's
+      // `renderToScreen` moves, and this compiles them in the configuration they will
+      // actually run in the first time the rider crosses 8.6 m/s or a subject enters the DoF
+      // gate — mid-run, at speed, which is the worst possible moment to link a program.
+      const tChain = nowMs();
+      const wasDof = passes.dof ? passes.dof.enabled : false;
+      const wasMotionBlur = passes.motionBlur ? passes.motionBlur.enabled : false;
+      if (passes.dof) passes.dof.enabled = true;
+      if (passes.motionBlur) passes.motionBlur.enabled = true;
+      try {
+        composer.render(1 / 60);
+      } finally {
+        if (passes.dof) passes.dof.enabled = wasDof;
+        if (passes.motionBlur) passes.motionBlur.enabled = wasMotionBlur;
+        refreshOutputPass();
+      }
+      precompileStats.chainMs = nowMs() - tChain;
+    } catch (err) {
+      precompileStats.error = String((err && err.message) || err);
+      console.warn('[postfx] precompile did not complete; the run will compile lazily:', err);
+    } finally {
+      if (renderer.debug) {
+        renderer.debug.checkShaderErrors = precompileStats.devBuild ? prevCheck : false;
+      }
+      // The precompile frame is a throwaway drawn from wherever the camera happened to be
+      // parked at the end of boot. Nothing about it may leak into the first real frame:
+      // `prevViewProj` would describe a camera somewhere else (one full-screen smear), and
+      // the camera-cut reference would make the first real frame adapt slowly from a pose
+      // that was never on screen — which is precisely the r5 defect this file already fixed
+      // once. Reset both, so frame 1 is treated as a cut and re-exposes immediately.
+      havePrevMatrices = false;
+      haveCutRef = false;
+      cutHold = 0;
+      adaptRateApplied = -1;
+    }
+
+    precompileStats.programsAfter = (info && info.programs) ? info.programs.length : 0;
+    precompileStats.compiled = precompileStats.programsAfter - precompileStats.programsBefore;
+    precompileStats.ms = nowMs() - t0;
+    console.info(
+      `[postfx] precompiled ${precompileStats.compiled} programs in ` +
+      `${precompileStats.ms.toFixed(1)} ms (scene ${precompileStats.sceneMs.toFixed(1)}, ` +
+      `chain ${precompileStats.chainMs.toFixed(1)}, ` +
+      `parallel=${precompileStats.parallel}, ` +
+      `checkShaderErrors=${renderer.debug ? renderer.debug.checkShaderErrors : 'n/a'})`);
+    return precompileStats;
   }
 
   function teardownChain() {
@@ -1939,6 +2227,18 @@ export function createPostFX(ctx) {
     passes,
     effects: fx,
 
+    /**
+     * main.js awaits this in wave 9, before the frame loop starts and while the loading
+     * screen is still up — which is the only window in the whole run where a multi-hundred-
+     * millisecond stall is free. See `precompile()` for what it does and why it lives here.
+     */
+    async init() {
+      return precompile();
+    },
+
+    /** Diagnostic: what the precompile actually did. For the QA harness. */
+    debugPrecompile() { return precompileStats; },
+
     /** CPU-side animation. main.js calls this before render(). */
     update(dt, c) {
       const context = c || ctx;
@@ -2088,14 +2388,27 @@ export function createPostFX(ctx) {
 
     /**
      * Tune the HDR highlight roll-off — the curve that actually decides how much of the
-     * frame can clip, because it runs before ACES saturates. `{ knee, soft }` in
-     * post-exposure linear radiance; `soft: 0` disables it and restores hard ACES clipping.
+     * frame can clip AND whether anything in it can be white, because it runs before ACES
+     * saturates. All four fields are in post-exposure linear radiance:
+     *
+     *   knee     where the roll-off starts. Below it the frame is bit-identical.
+     *   soft     the logarithmic softness above the knee. `soft: 0` disables the entire
+     *            block, specular escape included, and restores hard ACES clipping.
+     *   specGain slope the escape term approaches far above the knee. 0 removes the white
+     *            point again and reproduces the r5 curve exactly.
+     *   specSoft how far above the knee the escape takes to reach that slope.
+     *
+     * A QA sweep of the white point is `setHighlightRolloff({ specGain })` — at 0.035 paper
+     * white sits at 595 units, at 0.062 it sits at 400, at 0.017 at 1000.
      */
     setHighlightRolloff(o) {
       if (!fx.exposure || !o) return false;
       const r = fx.exposure.rolloff;
       if (Number.isFinite(o.knee)) r.x = Math.max(0, o.knee);
       if (Number.isFinite(o.soft)) r.y = Math.max(0, o.soft);
+      if (Number.isFinite(o.specGain)) r.z = Math.max(0, o.specGain);
+      // Clamped away from zero: it is a denominator.
+      if (Number.isFinite(o.specSoft)) r.w = Math.max(1e-3, o.specSoft);
       return true;
     },
 
