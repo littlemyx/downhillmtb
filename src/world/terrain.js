@@ -46,23 +46,40 @@
 //   `terrain.sampleDesign(x, z, out)` returns the design surface at a point so this can be
 //   measured rather than asserted; see the "committed vs design" note above applyCarve().
 //
-// CONTRACT-NOTE (terrain → trail, THE BAND LIMIT): the committed tread is LOW-PASSED at
-//   0.555 m (1.5 wheel radii) before it is written to the heightfield — see commitDetail().
-//   Terrain will not reproduce anything a 0.37 m wheel cannot roll over, and a stamp that
+// CONTRACT-NOTE (terrain → trail, THE BAND LIMIT): the committed tread is band-limited
+//   before it is written to the heightfield — see commitDetail(). Terrain will not
+//   reproduce anything a 0.37 m wheel cannot roll over ALONG the track, and a stamp that
 //   asks for it is not honoured. Two emissions currently fall in that class and arrive
 //   softened rather than as authored: the rut stamps (r 0.34 m, 0.012-0.252 m below the
 //   tread, alternate stations) and the rock-garden boulder stamps (r 0.22-0.56 m, 0.17-0.42 m
 //   proud). WHY: at the p50 design speed of 12.9 m/s a wheel leaves the ground above
 //   kappa = g/v^2 = 0.059 /m, which a 1 m-wavelength ripple reaches at an amplitude of
 //   1.5 mm. Committing the emitted cloud exactly threw the wheel off the ground at 37% of
-//   stations against 4% for the trail's own centreline; low-passing it gives 3.9%. If a
-//   feature is meant to be ridden over rather than filtered, trail.js must emit it at a
-//   scale a wheel can follow — the place to do that is the stamp radius and station
-//   spacing, not a deeper targetHeight on a small stamp.
+//   stations against 4% for the trail's own centreline. If a feature is meant to be ridden
+//   over rather than filtered, trail.js must emit it at a scale a wheel can follow — the
+//   place to do that is the stamp radius and station spacing, not a deeper targetHeight on
+//   a small stamp.
+//
+//   THE FILTER IS ANISOTROPIC AND THIS IS THE NUMBER THE TRAIL ENGINEER NEEDS. It is a
+//   Gaussian in the TRACK FRAME: sigma 0.555 m along the track, 0.35 m across it. The
+//   quantity to calibrate a banking solve against is the committed cross-slope as a
+//   fraction of tan(bank), measured on the +-0.36 x width secant:
+//         p50   0.921 / 0.922 / 0.926      (seeds 20260726 / 777 / 12345)
+//         p10   0.847 / 0.789 / 0.815
+//   and on the steepest berms alone (|tan bank| > 0.70), p50 0.92 / 0.78 / 0.86.
+//   It was 0.868 / 0.864 / 0.873 under the symmetric kernel this replaced.
+//   THE CEILING IS NOT 1.0. The EMITTED design surface itself only realises
+//   0.962 / 0.949 / 0.953 of its own declared bank on the same secant (0.956 / 0.893 /
+//   0.934 on the steepest berms), because five stamps per station reconstructed by a
+//   scattered-data interpolant do not reproduce a section exactly. So of the ~13% that
+//   was missing, ~4-6% is the stamp cloud and terrain cannot reach it from here. If the
+//   solve needs more bank than that, author more bank.
+//
 //   The consequence for `sampleDesign`: |sampleHeight - sampleDesign| at the emitted stamps
-//   is now p50 0.031 / p99 0.267 m where it was p50 0.007 / p99 0.090. That residual is the
-//   band limit doing its job, not the accumulator failing; it is measured at the stamps,
-//   which are exactly the points a low-pass is expected to miss.
+//   is p50 0.028 / p99 0.178-0.262 / max 0.62-1.04 m, where the symmetric kernel gave
+//   p99 0.258-0.312 and max 0.85-1.13. That residual is the band limit doing its job, not
+//   the accumulator failing; it is measured at the stamps, which are exactly the points a
+//   low-pass is expected to miss.
 //
 // CONTRACT-NOTE (terrain → everyone, DETERMINISM): world generation is a pure function of
 //   `ctx.seed` and the quality settings. It used to size the hydraulic-erosion droplet budget
@@ -2509,23 +2526,189 @@ export function createTerrain(ctx) {
   // for above ~2 m survives; everything below it, which the design does not ask
   // for and a wheel cannot follow, does not.
   //
-  // COST, measured, so nobody has to rediscover it: the committed cross-slope at
-  // banked stations falls from 0.994 to 0.896 of tan(bank) (a symmetric kernel
-  // preserves a linear cross-slope but not the curvature of a berm wall on a
-  // 2.4 m tread), and the committed 2-6 m band falls from 0.0452 to 0.0296 m
-  // r.m.s. against a design of 0.0432. The 6-20 and 20-60 m bands are untouched
-  // (0.1666 -> 0.1614 and 0.4057 -> 0.4032). Shaped features keep 97% of their
-  // detrended amplitude. An anisotropic (along-track only) variant was built and
-  // measured: it protects the cross-slope better (0.944) but costs twice as much
-  // 2-6 m content (0.0221) and half again as much 6-20 m spurious, so it loses.
+  // COST OF THE SYMMETRIC KERNEL, and why it is no longer the default.
+  //
+  // A world-axis-separable kernel low-passes ACROSS the track exactly as hard as
+  // it does along it. Along the track that is the whole point — a 0.37 m wheel
+  // cannot follow anything shorter, so nothing a rider can feel is lost. Across
+  // the track it is pure damage: the tread is only 2.4-3.0 m wide, so a sigma
+  // 0.555 m kernel sampled at the +-0.36 x width secant reaches 1.7 m out, past
+  // the tread edge, and mixes the batter and the untouched hillside into the
+  // berm wall. A wheel has no reason to pay for that.
+  //
+  // THE KERNEL IS THEREFORE ANISOTROPIC, IN THE TRACK FRAME: sigma_along
+  // unchanged at 1.5 wheel radii, sigma_cross at one detail cell. The track
+  // bearing is not assumed — it is accumulated per detail cell as a
+  // doubled-angle structure tensor (the dDirA/dDirB/dDirW triple in applyCarve),
+  // so two legs of a switchback running opposite ways REINFORCE (same line, same
+  // filter) and two crossing at right angles CANCEL, and a cell whose bearing
+  // cancels falls back to the isotropic kernel. An unknown bearing is a reason
+  // to be conservative, not a reason to guess.
+  //
+  // MEASURED, round 7. A/B in one process against one cached world, pre-carve
+  // fingerprint identical across every variant; seeds 20260726 / 777 / 12345;
+  // `sigmaCross: 0.555` reproduces the isotropic kernel to three decimals on
+  // every metric below, which is what says the gather is a faithful
+  // generalisation rather than a different filter.
+  //
+  //                              committed cross-slope / tan(bank), p50
+  //     sigma_cross   0.555 (iso)   0.868 / 0.864 / 0.873
+  //                   0.44          0.897 / 0.898 / 0.903
+  //                   0.35  SHIPPED 0.921 / 0.922 / 0.926
+  //                   0.26          0.942 / 0.943 / 0.946
+  //                   0.175         0.956 / 0.957 / 0.961
+  //     no filter at all            0.966 / 0.970 / 0.972
+  //     the DESIGN surface itself   0.962 / 0.949 / 0.953   <- the real ceiling
+  //
+  // and on the steepest berms alone (|tan bank| > 0.70), where it binds:
+  //     0.555 (iso)  0.87 / 0.60 / 0.74      0.35  0.92 / 0.78 / 0.86
+  //     0.26         0.94 / 0.85 / 0.91      0.175 0.95 / 0.92 / 0.95
+  //
+  // WHY 0.35 AND NOT 0.175, which retains more. Because below one lattice cell
+  // the discrete kernel stops being a low-pass: cross-track content survives at
+  // and above the 0.35 m lattice's Nyquist (0.7 m), and the bicubic
+  // reconstruction in detailField() turns it into ripple ALONG any line that is
+  // not exactly lattice-aligned. Wheel test, worst 25 m bin at the 0.05 m
+  // stencil (the sub-metre-sensitive one), same three seeds:
+  //     0.555 (iso)  11.6 / 10.0 / 15.8      0.35  11.4 / 10.0 / 11.4
+  //     0.26         17.6 / 17.8 / 21.2      0.175 34.4 / 38.4 / 37.6
+  // and 0.3-0.6 m band r.m.s. 7.5e-5 / 9.6e-5 / 7.8e-5 for iso, 9.7e-5 / 1.1e-4
+  // / 9.7e-5 at 0.35, 3.6e-4 / 3.4e-4 / 4.0e-4 at 0.175. Two points of bank is
+  // 0.6 deg of lean on a 30 deg berm; the 0.175 setting buys it with a 4.5x
+  // increase in exactly the content the last two rounds died on. It is not a
+  // trade worth making, and the fact that it looks free on band r.m.s. above
+  // 2 m is the round-6 lesson restated.
+  //
+  // WHAT IT BUYS THE RIDER, which is the only reason any of this matters. At the
+  // binding corner of each seed — the tightest banked corner at its governed
+  // speed — the lean the rider must still carry once the COMMITTED bank has done
+  // its share, against a 45 deg ceiling:
+  //     20260726 arc 297  r 7.9  v 9.7   31.3 -> 30.3 deg   (margin 13.7 -> 14.7)
+  //     777      arc 1867 r 9.3  v 11.8  32.8 -> 26.3 deg   (margin 12.2 -> 18.7)
+  //     12345    arc 1843 r 9.5  v 11.8  35.7 -> 28.9 deg   (margin  9.3 -> 16.1)
+  // i.e. 6.6 and 6.8 more degrees of committed bank at the two corners that were
+  // closest to washing out. That is the lowside failure mode, not the launch one.
+  //
+  // AN INVARIANT WORTH KEEPING: swapping the kernel changes `detail.heights` and
+  // NOTHING ELSE — `detail.material`, `detail.weight` and `detail.carve` hash
+  // identically under both. The filter touches the height field only; paint,
+  // corridor blend and the vegetation-exclusion mask are untouched by
+  // construction.
+  //
+  // Two things measured as making NO difference and were therefore removed
+  // rather than kept as knobs: weighting the bearing tensor by the Shepard mean
+  // weight instead of the blend strength (identical to three decimals on all
+  // three seeds), and pre-smoothing the tensor at sigma 1.05 m (identical, and
+  // 2.4x the carve time).
+  //
+  // CAVEAT ON THE ABSOLUTE FIGURES. trail.js was being rewritten in parallel
+  // while these were taken and changed four times during the session, so every
+  // absolute number above belongs to one trail revision. The A/B was re-run on
+  // each and the iso-vs-track deltas reproduced every time; the cross-slope
+  // figures quoted are from trail.js df2b1b8ec7f9, and 8107cc05a0ef gives
+  // 0.870/0.865/0.873 -> 0.926/0.922/0.928 for the same swap.
   const WHEEL_R = 0.37;             // contact patch the profile is integrated over
   // 1.5 wheel radii. Measured on the wheel test, seed 20260726 / 777 / 12345:
   //   1.0 R (4 passes)  4.73 / 5.93 / 6.34 %      1.5 R (5 passes) 4.07 / 5.29 / 5.48 %
   // The 4-pass setting misses the 6% acceptance on seed 12345, so the margin is
   // bought here rather than hoped for.
   const TREAD_LP_SIGMA = WHEEL_R * 1.5;
+  // Across the track: exactly one detail cell — see the Nyquist argument above.
+  const TREAD_LP_SIGMA_CROSS = DSTEP;
   // A [1,2,1]/4 pass has variance DSTEP^2/2, so N passes give sigma = DSTEP*sqrt(N/2).
+  // Only the 'iso' mode uses this; it is kept so the shipped round-5/6 surface can
+  // still be reproduced exactly for an A/B.
   const TREAD_LP_PASSES = Math.max(0, Math.round(2 * (TREAD_LP_SIGMA / DSTEP) * (TREAD_LP_SIGMA / DSTEP)));
+
+  // ---- filter selection ----------------------------------------------------
+  // `settings.treadFilter` is a QA/diagnostic override with the same contract as
+  // `settings.erosionDroplets`: explicit, logged, identical on every boot of the
+  // same settings, and never consulted by anything else. It exists so a harness
+  // can A/B two kernels against ONE cached world in ONE process, which is the
+  // only way any of the numbers above can be trusted.
+  //   { mode: 'track' | 'iso' | 'none', sigmaAlong, sigmaCross }
+  const TREAD_FILTER_DEFAULT = Object.freeze({
+    mode: 'track', sigmaAlong: TREAD_LP_SIGMA, sigmaCross: TREAD_LP_SIGMA_CROSS,
+  });
+  const treadFilter = (() => {
+    const o = settings.treadFilter;
+    if (!o || typeof o !== 'object') return TREAD_FILTER_DEFAULT;
+    const mode = (o.mode === 'iso' || o.mode === 'none' || o.mode === 'track')
+      ? o.mode : TREAD_FILTER_DEFAULT.mode;
+    const num = (v, d, min) => (typeof v === 'number' && isFinite(v) && v >= min ? v : d);
+    const sa = num(o.sigmaAlong, TREAD_FILTER_DEFAULT.sigmaAlong, 1e-6);
+    // Floored at half a lattice cell: below that the sampled Gaussian is
+    // narrower than the lattice it lives on and is a comb, not a filter.
+    const sc = Math.max(DSTEP * 0.5, num(o.sigmaCross, TREAD_FILTER_DEFAULT.sigmaCross, 0));
+    const spec = Object.freeze({ mode, sigmaAlong: sa, sigmaCross: sc });
+    console.info('[terrain] tread filter overridden by settings.treadFilter:', spec,
+      '(default', TREAD_FILTER_DEFAULT, ')');
+    return spec;
+  })();
+
+  // Direction bins for the anisotropic kernel. The kernel is symmetric under
+  // t -> -t, so the ring covers [0, pi) only. 64 bins is 2.8 deg of quantisation,
+  // i.e. at most 0.1% of misalignment in the projected sigma — far below the
+  // 5% the direction field itself is good to.
+  const LP_NDIR = 64;
+  let lpTaps = null;
+
+  /**
+   * Precompute the tap list of the anisotropic kernel for every direction bin,
+   * plus one extra isotropic set at index LP_NDIR used wherever the track
+   * direction is unknown.
+   *
+   * Taps are stored CSR-style (start[] into offI[]/offJ[]/wt[]) and weights are
+   * normalised per bin, so a gather is a plain weighted mean with no per-cell
+   * transcendentals. Nothing here reads a clock or an rng: the tables are a pure
+   * function of the two sigmas.
+   */
+  function buildLpTaps(sa, sc) {
+    const R = Math.max(1, Math.ceil((3 * Math.max(sa, sc)) / DSTEP));
+    const nBins = LP_NDIR + 1;
+    const start = new Int32Array(nBins + 1);
+    const oi = [], oj = [], wv = [];
+    const ia = 1 / (2 * sa * sa);
+    const ic = 1 / (2 * sc * sc);
+    for (let d = 0; d < nBins; d++) {
+      start[d] = wv.length;
+      // The extra bin (d === LP_NDIR) is isotropic at sigma_along.
+      const iso = d === LP_NDIR;
+      const th = ((d + 0.5) * Math.PI) / LP_NDIR;
+      const tx = Math.cos(th), tz = Math.sin(th);
+      let sum = 0;
+      const first = wv.length;
+      for (let dj = -R; dj <= R; dj++) {
+        for (let di = -R; di <= R; di++) {
+          const px = di * DSTEP, pz = dj * DSTEP;
+          let w;
+          if (iso) {
+            w = Math.exp(-(px * px + pz * pz) * ia);
+          } else {
+            const a = px * tx + pz * tz;
+            const c = -px * tz + pz * tx;
+            w = Math.exp(-a * a * ia - c * c * ic);
+          }
+          if (w < 1e-4) continue;
+          oi.push(di); oj.push(dj); wv.push(w); sum += w;
+        }
+      }
+      for (let t = first; t < wv.length; t++) wv[t] /= sum;
+    }
+    start[nBins] = wv.length;
+    lpTaps = {
+      R, nBins, start,
+      offI: Int8Array.from(oi),
+      offJ: Int8Array.from(oj),
+      wt: Float32Array.from(wv),
+    };
+    return lpTaps;
+  }
+
+  // Coherence below which a cell's accumulated bearing is not trusted and the
+  // isotropic kernel is used instead. |sum w e^(2 i theta)| / sum w is 1 for a
+  // single consistent tangent and 0 for two legs crossing at right angles.
+  const LP_DIR_COHERENCE = 0.5;
 
   /** Detail-lattice cell index for a GLOBAL lattice coordinate, or -1. */
   function detailCellAt(gi, gj) {
@@ -2540,60 +2723,157 @@ export function createTerrain(ctx) {
     return slot * DTS * DTS + lj * DTS + li;
   }
 
+  /** Slot -> tileIndex key, so a filter can walk tiles in slot order. */
+  function slotKeys() {
+    const k = new Int32Array(nTiles);
+    for (let key = 0; key < tileIndex.length; key++) {
+      const s = tileIndex[key];
+      if (s >= 0) k[s] = key;
+    }
+    return k;
+  }
+
   /**
-   * Build the target surface from the accumulators, low-pass it, and commit it.
+   * Separable [1,2,1]/4 over the detail lattice, `passes` per WORLD axis.
+   * Reads through the global lattice addressing so a sample two tiles share is
+   * computed from the same neighbourhood in both and the copies stay
+   * bit-identical — a one-ulp disagreement there would show as a seam in the
+   * normals. Returns whichever buffer holds the result.
    *
-   * The smoothing reads through `detailCellAt` rather than staying inside a
-   * tile, so a sample that two tiles share is computed from the same global
-   * neighbourhood in both and the copies stay bit-identical — the bicubic
-   * reconstruction reads a 4x4 window across tile seams and a disagreement of
-   * one ulp there would show as a seam in the normals.
+   * This is the shipped round-5/6 height kernel — isotropic, and therefore as
+   * hard across the track as along it. It is retained only for `mode: 'iso'`, so
+   * that the A/B in the note above can be reproduced from this file alone.
+   */
+  function smoothSeparable(srcIn, dCells, passes) {
+    let src = srcIn;
+    if (passes <= 0 || nTiles === 0) return src;
+    const keys = slotKeys();
+    let dst = new Float32Array(dCells);
+    for (let pass = 0; pass < passes * 2; pass++) {
+      const alongX = (pass & 1) === 0;
+      for (let s = 0; s < nTiles; s++) {
+        const key = keys[s];
+        const ti = key % DTILES;
+        const tj = (key / DTILES) | 0;
+        const gi0 = ti * DT_INNER - 1;
+        const gj0 = tj * DT_INNER - 1;
+        const base = s * DTS * DTS;
+        for (let j = 0; j < DTS; j++) {
+          for (let i = 0; i < DTS; i++) {
+            const p = base + j * DTS + i;
+            const c = src[p];
+            const pa = alongX ? detailCellAt(gi0 + i - 1, gj0 + j)
+              : detailCellAt(gi0 + i, gj0 + j - 1);
+            const pb = alongX ? detailCellAt(gi0 + i + 1, gj0 + j)
+              : detailCellAt(gi0 + i, gj0 + j + 1);
+            // A missing neighbour reflects the centre, so the filter is
+            // mass-preserving at the edge of the allocated corridor instead
+            // of pulling the surface toward zero there.
+            dst[p] = ((pa < 0 ? c : src[pa]) + 2 * c + (pb < 0 ? c : src[pb])) * 0.25;
+          }
+        }
+      }
+      const t = src; src = dst; dst = t;
+    }
+    return src;
+  }
+
+  /**
+   * The anisotropic kernel, evaluated in the TRACK FRAME of each cell.
+   *
+   * One gather per cell with precomputed, per-direction-bin, pre-normalised
+   * weights — not a cascade of resampled passes. That matters: every resampling
+   * of an off-axis 1-D pass drags a bilinear footprint across the track, so a
+   * cascade's effective cross-track sigma depends on the trail's bearing
+   * relative to the lattice. A single gather with lattice-aligned taps has
+   * exactly the cross-track sigma it says it has, at every bearing.
+   *
+   * Cells no stamp reached are not filtered at all — they are never committed,
+   * and skipping them is most of the cost. They are still READ as taps, which is
+   * correct: they hold the natural ground the tread has to daylight into.
+   *
+   * Reads go through the same global lattice addressing the isotropic path uses,
+   * so a sample two tiles share is computed from the same neighbourhood in both
+   * and the copies stay bit-identical.
+   */
+  function smoothTrackFrame(src, dCells, accW, dirA, dirB, dirW) {
+    if (nTiles === 0) return src;
+    const taps = lpTaps || buildLpTaps(treadFilter.sigmaAlong, treadFilter.sigmaCross);
+    const start = taps.start, offI = taps.offI, offJ = taps.offJ, wt = taps.wt;
+    const isoBin = LP_NDIR;
+    const dst = new Float32Array(dCells);
+    const keys = slotKeys();
+    const binScale = LP_NDIR / Math.PI;
+    for (let s = 0; s < nTiles; s++) {
+      const key = keys[s];
+      const ti = key % DTILES;
+      const tj = (key / DTILES) | 0;
+      const gi0 = ti * DT_INNER - 1;
+      const gj0 = tj * DT_INNER - 1;
+      const base = s * DTS * DTS;
+      for (let j = 0; j < DTS; j++) {
+        for (let i = 0; i < DTS; i++) {
+          const p = base + j * DTS + i;
+          // Cells no stamp reached are never committed; skipping them is most of
+          // the cost. They are still read as taps, from `src`, which is correct.
+          if (accW[p] === 0) { dst[p] = src[p]; continue; }
+          const wc = dirW[p];
+
+          // Bearing of the tread here, from the doubled-angle structure tensor.
+          let bin = isoBin;
+          const a = dirA[p], b = dirB[p];
+          const mag = Math.sqrt(a * a + b * b);
+          if (wc > 0 && mag > wc * LP_DIR_COHERENCE) {
+            let th = Math.atan2(b, a) * 0.5;      // (-pi/2, pi/2]
+            if (th < 0) th += Math.PI;
+            bin = (th * binScale) | 0;
+            if (bin >= LP_NDIR) bin = LP_NDIR - 1;
+            else if (bin < 0) bin = 0;
+          }
+
+          const t0 = start[bin], t1 = start[bin + 1];
+          let acc = 0, wsum = 0;
+          for (let t = t0; t < t1; t++) {
+            const li = i + offI[t], lj = j + offJ[t];
+            let q;
+            if (li >= 0 && li < DTS && lj >= 0 && lj < DTS) {
+              // Fast path: the tap is inside this tile. Same cell, same value
+              // and same address the global path would have produced.
+              q = base + lj * DTS + li;
+            } else {
+              q = detailCellAt(gi0 + li, gj0 + lj);
+              if (q < 0) continue;              // outside the allocated corridor
+            }
+            const w = wt[t];
+            acc += src[q] * w;
+            wsum += w;
+          }
+          // Renormalising by the weight actually used keeps the filter DC-exact
+          // at the edge of the corridor instead of pulling the surface toward
+          // zero there.
+          dst[p] = wsum > 0 ? acc / wsum : src[p];
+        }
+      }
+    }
+    return dst;
+  }
+
+  /**
+   * Build the target surface from the accumulators, band-limit it, and commit it.
    *
    * Buffers are Float32 offsets from BASE_Y rather than absolute elevations:
    * the world spans ~700 m of relief, so the worst resolution is 4e-5 m against
    * an error budget of 0.10 m. Absolute 1700 m elevations in Float32 would be
    * good to 2e-4 m, which is still fine, but the datum costs nothing.
    */
-  function commitDetail(accW, accWT, accMax, dCells) {
+  function commitDetail(accW, accWT, accMax, dCells, dirA, dirB, dirW) {
     let src = new Float32Array(dCells);
     for (let p = 0; p < dCells; p++) {
       const w = accW[p];
       src[p] = (w === 0 ? dHeights[p] : dHeights[p] + accWT[p] / w) - BASE_Y;
     }
-    if (TREAD_LP_PASSES > 0 && nTiles > 0) {
-      const slotKey = new Int32Array(nTiles);
-      for (let key = 0; key < tileIndex.length; key++) {
-        const s = tileIndex[key];
-        if (s >= 0) slotKey[s] = key;
-      }
-      let dst = new Float32Array(dCells);
-      for (let pass = 0; pass < TREAD_LP_PASSES * 2; pass++) {
-        const alongX = (pass & 1) === 0;
-        for (let s = 0; s < nTiles; s++) {
-          const key = slotKey[s];
-          const ti = key % DTILES;
-          const tj = (key / DTILES) | 0;
-          const gi0 = ti * DT_INNER - 1;
-          const gj0 = tj * DT_INNER - 1;
-          const base = s * DTS * DTS;
-          for (let j = 0; j < DTS; j++) {
-            for (let i = 0; i < DTS; i++) {
-              const p = base + j * DTS + i;
-              const c = src[p];
-              const pa = alongX ? detailCellAt(gi0 + i - 1, gj0 + j)
-                : detailCellAt(gi0 + i, gj0 + j - 1);
-              const pb = alongX ? detailCellAt(gi0 + i + 1, gj0 + j)
-                : detailCellAt(gi0 + i, gj0 + j + 1);
-              // A missing neighbour reflects the centre, so the filter is
-              // mass-preserving at the edge of the allocated corridor instead
-              // of pulling the surface toward zero there.
-              dst[p] = ((pa < 0 ? c : src[pa]) + 2 * c + (pb < 0 ? c : src[pb])) * 0.25;
-            }
-          }
-        }
-        const t = src; src = dst; dst = t;
-      }
-    }
+    if (treadFilter.mode === 'iso') src = smoothSeparable(src, dCells, TREAD_LP_PASSES);
+    else if (treadFilter.mode === 'track') src = smoothTrackFrame(src, dCells, accW, dirA, dirB, dirW);
     for (let p = 0; p < dCells; p++) {
       if (accW[p] === 0) continue;
       dHeights[p] += (src[p] + BASE_Y - dHeights[p]) * accMax[p];
@@ -2717,6 +2997,27 @@ export function createTerrain(ctx) {
     const dAccW = new Float32Array(dCells);
     const dAccWT = new Float32Array(dCells);
     const dAccMax = new Float32Array(dCells);
+    // Track bearing per detail cell, as a DOUBLED-ANGLE structure tensor
+    // (sum w*cos2th, sum w*sin2th) using the same Shepard weights as the height
+    // mean. Doubled angle because the kernel is symmetric under t -> -t: the two
+    // legs of a switchback that reach the same cell running opposite ways must
+    // REINFORCE (same line, same filter), while two legs crossing at right
+    // angles must CANCEL, so that the cell is filtered isotropically rather than
+    // smeared along a bearing that is only one of the two answers. A plain
+    // vector sum gets both of those cases backwards.
+    //
+    // The weight is the stamp's height-blend STRENGTH, which is ~1 across the
+    // whole bench for every stamp that reaches the cell, so the bearing is the
+    // average bearing of the neighbourhood rather than that of whichever stamp
+    // happens to be nearest. (The Shepard mean weight was tried and measures
+    // identically to three decimals on all three seeds — the doubled-angle sum
+    // is robust either way. Strength is kept because it is the cheaper claim to
+    // defend.) dDirW is the matching weight total: it is NOT accW, which sums
+    // Shepard weights, and the coherence test needs the denominator that goes
+    // with the numerator.
+    const dDirA = new Float32Array(dCells);
+    const dDirB = new Float32Array(dCells);
+    const dDirW = new Float32Array(dCells);
 
     for (let s = 0; s < list.length; s++) {
       const st = list[s];
@@ -2728,6 +3029,8 @@ export function createTerrain(ctx) {
       const halfW = prep.halfW[s];
       const tx = prep.tanX[s], tz = prep.tanZ[s];
       const rx = -tz, rz = tx;
+      // Doubled-angle form of this stamp's bearing; constant over its footprint.
+      const dir2a = tx * tx - tz * tz, dir2b = 2 * tx * tz;
       const arc0 = prep.arc[s];
       const grade = prep.grade[s];
       const isTread = st.kind === 'tread' || st.kind === 'rut' || st.kind === undefined;
@@ -2791,6 +3094,9 @@ export function createTerrain(ctx) {
 
               dAccW[p] += _scWM;
               dAccWT[p] += _scWM * (target - dHeights[p]);
+              dDirA[p] += _scWH * dir2a;
+              dDirB[p] += _scWH * dir2b;
+              dDirW[p] += _scWH;
               if (_scWH > dAccMax[p]) dAccMax[p] = _scWH;
 
               if (st.material !== undefined && st.material !== null) {
@@ -2822,7 +3128,7 @@ export function createTerrain(ctx) {
       }
     }
 
-    commitDetail(dAccW, dAccWT, dAccMax, dCells);
+    commitDetail(dAccW, dAccWT, dAccMax, dCells, dDirA, dDirB, dDirW);
 
     detailReady = true;
 
@@ -3814,6 +4120,7 @@ export function createTerrain(ctx) {
       resolution: RES,
       droplets: timings.droplets || 0,
       dropletTier,
+      treadFilter,
       world: hex8(all),
       heights: hex8(fnv1a(H0, heights)),
       materials: hex8(fnv1a(H0, materials)),
@@ -3889,6 +4196,9 @@ export function createTerrain(ctx) {
     // measures the committed heightfield against this; nothing on a hot path
     // reads it.
     sampleDesign,
+    // The tread band-limit kernel actually in force (see commitDetail()). Read
+    // only; changing it means changing `settings.treadFilter` before build.
+    treadFilter,
     // Determinism check (see fingerprint()).
     fingerprint,
     corridorDistance: corridorDist,

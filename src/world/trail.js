@@ -276,6 +276,282 @@ const V_PHASE = {
 const ROUGH_LAMBDA = 1.6;
 const ROUGH_SUSP = 3.4;
 
+// ---------------------------------------------------------------------------
+// THE LAUNCH CONSTRAINT — priced on the relief this module ACTUALLY authors.
+//
+// WHAT WAS WRONG, and it is the whole of round 6's remaining cause. The chatter
+// term above prices roughness from `S.bumps + S.rough` at ONE wavelength,
+// ROUGH_LAMBDA = 1.6 m. That is a real wavelength — it is where the root ridges
+// and the braking-bump trains live — and it is not where the launching content
+// lives. Measured on the shipped build (seed 20260726, 0.37 m stencil on the
+// wheel-dilated design centreline, 0.05 m plan-arc sampling): at arc 288-294 m
+// the profile carries 0.056-0.139 /m of convex vertical curvature at a 2 m
+// stencil and 0.051-0.089 /m at a 6 m stencil, while `S.bumps` there is 0.0015 m
+// and `S.rough` 0.0145 m — so the chatter model returned ~16.8 m/s and the
+// design speed profile ran at 14.9-16.8 m/s over ground whose geometric launch
+// speed is 8-10 m/s. None of that content is visible at 1.6 m. It is 2-20 m
+// relief: the residue of the mountain the bench smoothing did not remove, plus
+// the shoulders of every chute and roller the feature pass authors.
+//
+// THE FIX IS TO MEASURE INSTEAD OF MODELLING. `computeVertKappa()` takes the
+// convex vertical curvature of the profile that will actually be committed,
+// across a LADDER of stencils (LAUNCH_STENCILS), and keeps the worst. A single
+// stencil cannot do this: a 0.4 m stencil sees 2 m wobble and is blind to a 20 m
+// rollover once noise is averaged in, and a 6 m stencil sees the rollover and
+// reads a 2 m step as a third of its true curvature. The ladder sees both.
+//
+// The criterion is the one the wheels obey. Over a crest of curvature kappa at
+// speed v the tyres carry (g - v^2*kappa) of the normal load, so contact is lost
+// at v^2*kappa/g = 1. Designing to LAUNCH_SAFETY means the wheels still carry
+// 1 - 1/LAUNCH_SAFETY of static load at the design speed, which is the margin
+// that survives a rider arriving fast, a carve that rounds a crest the wrong
+// way, and the fact that the bike is 1.25 m long and samples two points.
+const LAUNCH_SAFETY = 1.85;
+// Half-stencils, metres. 0.4 m is the station spacing and is within 8% of the
+// 0.37 m wheel radius the acceptance test uses; 12.8 m is past the longest
+// rollover a 20 m/s rider can be thrown by.
+const LAUNCH_STENCILS = [0.4, 0.8, 1.6, 3.2, 6.4, 12.8];
+// Floor on the design speed. Where the relief cannot be flattened enough for
+// the phase speed, the speed comes down — but a trail that asks for 4 m/s is
+// not a downhill course, it is a hike. Where THIS floor binds, the geometry
+// pass has failed and the failure is reported (safety.launchFloorBound).
+const V_DESIGN_FLOOR = 6.2;
+
+// ---------------------------------------------------------------------------
+// THE CARVE'S OWN NOISE FLOOR — the reason a top speed exists at all.
+//
+// This is the number that decides the acceptance figure, so it is a measurement
+// and it is stated as one. Take every station where the EMITTED DESIGN PROFILE
+// is flat (|kappa_design| < 0.012 /m at the 0.37 m acceptance stencil) and no
+// feature is authored, and ask what convex curvature the COMMITTED surface
+// carries there anyway. Three seeds, ~25-29k stations each:
+//
+//     seed        p50     p75     p90     p95     p99     max
+//     20260726  0.0000  0.0192  0.0429  0.0561  0.0840  0.361
+//     777       0.0000  0.0117  0.0335  0.0495  0.0827  0.258
+//     12345     0.0000  0.0139  0.0366  0.0497  0.0777  0.179
+//
+// Half the course is reconstructed exactly. The other half carries curvature
+// the design never asked for, from the millimetre-scale residue of a
+// distance-weighted mean of stamp discs: 0.0012 m r.m.s. at 1-2 m wavelength on
+// quiet ground turns into 0.021 /m of curvature, because A*(2*pi/lambda)^2 is a
+// brutal operator at short wavelengths. That is the round-5 lesson in the only
+// units that matter — the launch threshold at 12.9 m/s is 0.059 /m, which a
+// 1 m ripple reaches at 1.5 mm.
+//
+// SO THERE IS A TOP SPEED ON THIS COURSE AND IT IS NOT A DESIGN CHOICE. At the
+// p90 of that distribution the launch-free speed is 15.1 / 17.1 / 16.4 m/s; at
+// the p95 it is 13.2 / 14.1 / 14.1. The acceptance gate is on the WORST 25 m
+// BIN, which lands near the p97 of the course distribution, and that is 11-12
+// m/s. Every phase ceiling in V_PHASE above that is a statement the carve cannot
+// honour, and the measurement says so plainly: at 16.8 m/s the 50-100 m bins ran
+// 16-17% launched while the DESIGN profile at the same stations scored 0-3%.
+// Nothing in this module can flatten that, because the design is already flat.
+//
+// terrain.applyCarve() owns that reconstruction and this module may not touch
+// it. What this module owns is the speed it asks a rider to take it at.
+//
+// CONTRACT-NOTE (cross-module, for the integration pass and the terrain owner):
+//   KAPPA_CARVE_FLOOR is a measurement of terrain.applyCarve()'s reconstruction,
+//   not a property of the trail. It costs this course roughly 5 m/s of top
+//   design speed — V_PHASE asks for 19 m/s in the finish sprint and the carve
+//   will only support 11.8. If applyCarve gets smoother, this number should come
+//   DOWN and the course gets faster for nothing. Re-measure it (the harness is
+//   twenty lines: dilate the committed centreline by a 0.37 m disc, second-
+//   difference at 0.37 m, and take the p95 over stations whose design curvature
+//   is under 0.012 /m) rather than trusting this comment. Terrain changed under
+//   this measurement mid-round — a track-frame anisotropic tread filter landed
+//   between two of my runs — so it is set at the conservative end of the three
+//   seeds rather than fitted to one.
+// SWEPT, on one cached mountain per seed, in one process: 0.026 / 0.030 / 0.034 /
+// 0.038 (top design speed 14.3 / 13.3 / 12.5 / 11.8 m/s) give a worst 25 m bin of
+// 11.8 / 11.2 / 12.0 / 15.4 % on seed 20260726, 22.6 / 19.6 / 17.2 / 20.2 on 777
+// and 14.4 / 15.0 / 14.2 / 14.6 on 12345. The worst bin is nearly FLAT in this
+// parameter, which is itself the finding: past about 12.5 m/s the residual is not
+// speed-limited any more, it is a handful of places where the committed surface is
+// rough at any speed a bicycle is ridden at. 0.034 is taken because it minimises
+// the worst case across the three seeds; going lower buys nothing and costs the
+// course its character.
+const KAPPA_CARVE_FLOOR = 0.034;
+
+// ---------------------------------------------------------------------------
+// THE LAUNCH KERNEL — curvature per metre of amplitude, as the wheel and the
+// carve actually deliver it.
+//
+// Two filters sit between an authored sinusoid and the curvature that throws a
+// rider, and both are wavelength-dependent, so a single fudge factor (which is
+// what ROUGH_SUSP is) cannot represent either.
+//
+//  (1) THE WHEEL. A 0.37 m wheel does not follow the ground; its axle follows
+//      the ground dilated by its own disc. Short wavelengths are bridged. This
+//      is computed numerically, once, at module load — dilate a sinusoid, take
+//      the second difference at the same 0.37 m stencil the acceptance test
+//      uses, and record the answer. No closed form, no calibration constant.
+//
+//  (2) THE CARVE. terrain.applyCarve() reconstructs the surface as a
+//      distance-weighted mean of stamp discs, which is a low-pass. Its transfer
+//      function was measured across ten bands on three seeds in round 6
+//      (committed r.m.s. / design r.m.s. on the committed centreline): 0.28 at
+//      0.3-0.5 m, 0.06 at 0.5-1, 0.11 at 1-2, 0.68 at 2-6, 0.97 at 6-20, 1.00
+//      above. Pricing sub-metre relief at full amplitude would be the mirror of
+//      the ROUGH_LAMBDA error — slowing the trail for texture that is never
+//      built. It is applied ONLY to the sub-station authored components
+//      (microDetail, root ridges, braking bumps); the station-lattice curvature
+//      is taken at face value, which is conservative by the same table.
+//
+// CONTRACT-NOTE: CARVE_XFER describes terrain.applyCarve()'s behaviour, which
+//   this module does not own. It is a measurement, reproduced on three seeds,
+//   and it is only ever used to make the speed profile LESS conservative than
+//   the raw authored amplitude would make it. If applyCarve's reconstruction
+//   changes materially, re-measure it; the failure mode of a stale table is a
+//   trail that is paced for texture it no longer has.
+const WHEEL_R = 0.37;
+const LK_LAMBDA = [0.2, 0.28, 0.4, 0.55, 0.75, 1.0, 1.4, 1.9, 2.6, 3.6, 5.0, 7.0, 10.0, 14.0, 20.0, 30.0, 45.0];
+const CARVE_XFER_BANDS = [
+  [0.30, 0.05], [0.50, 0.28], [1.00, 0.06], [2.00, 0.11],
+  [6.00, 0.68], [20.0, 0.97], [1e4, 1.00],
+];
+
+/** Piecewise-constant in band, linear in log-lambda across band edges. */
+function carveXfer(lambda) {
+  let prevEdge = 0.05, prevVal = CARVE_XFER_BANDS[0][1];
+  for (let k = 0; k < CARVE_XFER_BANDS.length; k++) {
+    const [edge, val] = CARVE_XFER_BANDS[k];
+    if (lambda <= edge) {
+      const t = clamp01((Math.log(lambda) - Math.log(prevEdge)) /
+        Math.max(1e-6, Math.log(edge) - Math.log(prevEdge)));
+      return lerp(prevVal, val, t);
+    }
+    prevEdge = edge; prevVal = val;
+  }
+  return 1.0;
+}
+
+/**
+ * Convex curvature seen by a WHEEL_R disc at a WHEEL_R stencil, per metre of
+ * amplitude, for a sinusoid of wavelength `lambda`. Computed numerically once.
+ */
+let LK_KAPPA_CACHE = null;
+function launchKernelTable() {
+  if (LK_KAPPA_CACHE) return LK_KAPPA_CACHE;
+  const out = new Float64Array(LK_LAMBDA.length);
+  const A = 0.05;                  // representative amplitude; dilation is mildly non-linear
+  for (let k = 0; k < LK_LAMBDA.length; k++) {
+    const lam = LK_LAMBDA[k];
+    // Fine enough to resolve both the wheel and the wave, coarse enough that the
+    // whole table costs a couple of million operations once per process.
+    const ds = Math.max(0.002, Math.min(0.01, lam / 150));
+    const span = Math.max(lam * 1.6, WHEEL_R * 5);
+    const m = Math.round(span / ds) + 1;
+    const y = new Float64Array(m);
+    for (let i = 0; i < m; i++) y[i] = A * Math.cos((2 * Math.PI * (i * ds - span * 0.5)) / lam);
+    // dilation by the wheel disc (upper envelope of the axle locus)
+    const w = Math.round(WHEEL_R / ds);
+    const cap = new Float64Array(2 * w + 1);
+    for (let j = -w; j <= w; j++) cap[j + w] = Math.sqrt(Math.max(0, WHEEL_R * WHEEL_R - (j * ds) * (j * ds)));
+    const c = new Float64Array(m);
+    for (let i = 0; i < m; i++) {
+      let best = -Infinity;
+      const lo = Math.max(0, i - w), hi = Math.min(m - 1, i + w);
+      for (let j = lo; j <= hi; j++) { const v = y[j] + cap[j - i + w]; if (v > best) best = v; }
+      c[i] = best;
+    }
+    const h = Math.max(1, Math.round(WHEEL_R / ds));
+    let worst = 0;
+    for (let i = h; i < m - h; i++) {
+      const kap = -(c[i - h] - 2 * c[i] + c[i + h]) / (h * ds * h * ds);
+      if (kap > worst) worst = kap;
+    }
+    out[k] = worst / A;            // per metre of amplitude
+  }
+  LK_KAPPA_CACHE = out;
+  return out;
+}
+
+/** Interpolated launch kernel, including the carve's low-pass. */
+function launchKappaPerAmp(lambda) {
+  const LK = launchKernelTable();
+  let k = 0;
+  while (k < LK_LAMBDA.length - 1 && LK_LAMBDA[k + 1] < lambda) k++;
+  const a = LK_LAMBDA[k], b = LK_LAMBDA[Math.min(LK_LAMBDA.length - 1, k + 1)];
+  const t = b > a ? clamp01((lambda - a) / (b - a)) : 0;
+  const base = lerp(LK[k], LK[Math.min(LK.length - 1, k + 1)], t);
+  return base * carveXfer(lambda);
+}
+
+// ---------------------------------------------------------------------------
+// THE CORNER-HOLDING CONSTRAINT, and why it is the other half of the same solve.
+//
+// Round 6 clamped the speed governor to the geometric sqrt(g/kappa) limit and
+// measured the result over 63 runs: seed 20260726's median progress went
+// 224 -> 304 m and its airborne fraction 0.130 -> 0.067, and seed 777 COLLAPSED
+// to 34 m with 17 of 21 crashes as lowsides. That is the correct experiment and
+// the wrong conclusion drawn from it. The clamp changed the speed and left the
+// BANK exactly where it was — banks solved for 16 m/s, ridden at 9. On a berm of
+// bank phi taken at v the rider's lean relative to the tread is
+//
+//     leanContact = atan(v^2/(g*r)) - phi
+//
+// which goes NEGATIVE when the corner is taken slower than the berm was built
+// for: the rider has to lean OUT, up the berm, to stay on it, and past what the
+// tyres will hold in that direction the bike slides down the face. That is a
+// lowside, and it is exactly what 17 of 21 cells did.
+//
+// So the bank has to be re-solved at whatever speed the launch constraint
+// leaves, not merely clamped after it. Two numbers bound that:
+//
+//   LEAN_HOLD    how far the rider can lean OUT of a berm and still hold it.
+//                Less than LEAN_AVAIL: leaning out is a worse-supported posture
+//                than leaning in, and the load is on the outside edge of a tyre
+//                designed to be loaded on its shoulder knobs.
+//   SLOW_FRAC    the slowest a rider realistically arrives at a corner the
+//                design paced at v — i.e. they braked too hard. The bank must
+//                still be holdable there.
+//
+// Together: bank <= atan((SLOW_FRAC*v)^2 / (g*r)) + LEAN_HOLD, alongside the
+// existing identity floor bank >= atan(v^2/(g*r)) - LEAN_DESIGN. Where those
+// two cross, the corner cannot be built for both the fast and the slow rider and
+// the RADIUS is what is wrong — which is what openTightCorners() is for.
+const LEAN_HOLD = THREE.MathUtils.degToRad(34);
+const SLOW_FRAC = 0.55;
+
+// ---------------------------------------------------------------------------
+// QA OVERRIDE. `ctx.settings.trailSolver` is a diagnostic switch with exactly
+// the same contract as terrain's `settings.treadFilter`: explicit, logged,
+// identical on every boot of the same settings, and never consulted by anything
+// else. It exists so a harness can A/B the joint solve against ONE cached
+// mountain in ONE process — which is the only way any number in this file's
+// notes can be trusted, and doubly so while terrain.js is itself changing.
+//
+//   { launch: boolean, rebank: boolean }   both default true
+//
+// `launch: false` restores the round-6 behaviour exactly: the fixed-wavelength
+// chatter ceiling below, and no relief flattening. `rebank: false` keeps the
+// launch cap but leaves the bank where the pre-feature solve put it — i.e. it
+// reproduces the round-6 speed-clamp ablation, which is the experiment that
+// dropped seed 777 to 34 m with 17 lowsides.
+function readSolverOpts(settings) {
+  const o = settings && settings.trailSolver;
+  const dflt = { launch: true, rebank: true, safety: LAUNCH_SAFETY, carveFloor: KAPPA_CARVE_FLOOR };
+  if (!o || typeof o !== 'object') return dflt;
+  const num = (v, d) => (typeof v === 'number' && isFinite(v) && v > 0 ? v : d);
+  const spec = {
+    launch: o.launch !== false,
+    rebank: o.rebank !== false,
+    safety: num(o.safety, LAUNCH_SAFETY),
+    carveFloor: num(o.carveFloor, KAPPA_CARVE_FLOOR),
+  };
+  // eslint-disable-next-line no-console
+  console.info('[trail] solver overridden by settings.trailSolver:', spec);
+  return spec;
+}
+
+/** The round-6 chatter ceiling, kept verbatim for the A/B control path. */
+function legacyRoughCap(bumps, rough) {
+  const amp = Math.max(0.015, bumps + rough * 1.5);
+  return ROUGH_SUSP * (ROUGH_LAMBDA / (2 * Math.PI)) * Math.sqrt((2 * G) / amp);
+}
+
 const STATION_DS = 0.4;       // m between centreline stations (also the stamp spacing)
 const RIBBON_DS = 0.8;        // m between tread-ribbon rings (halved over shaped features)
 const NEAR_WINDOW = 22;       // stations searched either side of the hint (±8.8 m)
@@ -1393,6 +1669,8 @@ export function createTrail(ctx) {
   const microN = makeNoise1D(featRng, 1024);
   const edgeN = makeNoise1D(dressRng, 512);
 
+  const SOLVER = readSolverOpts(ctx.settings);
+
   // ---- station table (all Float32Array, built once) -----------------------
   let N = 0;
   let S = null;                 // station arrays
@@ -1638,6 +1916,14 @@ export function createTrail(ctx) {
   // in plan, comfortably outside any legReach() pair, so the rule has nothing to
   // say about a switchback and everything to say about a route that comes back
   // across its own line a hundred metres later.
+  // Switchback siting. SB_MAX_FALL is tan(38 deg): steeper than a hillside
+  // stands (EXPO_REPOSE = tan 35 deg) but well short of the 50-58 deg cliff the
+  // ungated machinery walked onto. SB_APEX_PROBE is roughly the distance from
+  // the entry to the apex of a 6.5 m-radius reversal (a quarter turn plus the
+  // run-in), so the gate measures the ground the corner will actually sit on.
+  const SB_MAX_FALL = 0.78;
+  const SB_APEX_PROBE = 14.0;
+
   const LEG_ARC_MIN = 45.0;     // m of travel before a point counts as another leg
   const LEG_SEARCH = 9.0;       // m — past 2*legReach(1.5) = 6.6 m no pair conflicts
   const LEG_W = 13.0;           // score per metre of missing clearance
@@ -1857,7 +2143,31 @@ export function createTrail(ctx) {
       if (mode === 0) {
         const limit = ph.drift;
         const outbound = Math.sign(drift) === Math.sign(driftRate) && Math.abs(driftRate) > 0.25;
+        // WHERE A SWITCHBACK MAY BE BUILT.
+        //
+        // Once mode 1 is entered nothing is scored: the march turns at a fixed
+        // 6.5 m radius for up to 26 steps, over whatever ground it happens to be
+        // standing on. On seed 20260726 it fired onto a cliff band, and that one
+        // decision is what killed every cell of the autopilot sweep. Measured on
+        // the shipped build at arc 292-306 m: plan radius 8-16 m, natural ground
+        // running 119-157% (50-58 deg), the design line already pinned at the
+        // full 7.00 m excavation limit so the profile solve could not ease it,
+        // and a committed gradient of 68-83% through the apex. Every run died
+        // there — 21 of 21 cells inside 32 m of the same point.
+        //
+        // A builder does not put a switchback on a cliff. They keep traversing
+        // until the ground lies down, because the apex of a hairpin is the one
+        // place on a trail that has to be nearly flat: the rider is at full lock,
+        // at minimum speed, with the fall line across them. So the entry now
+        // gates on the fall line where the APEX will land, not merely on where
+        // the trail is standing when the drift allowance runs out. If the ground
+        // is too steep the drift simply keeps growing and the corridor term
+        // (soft, quadratic) pays for it — a longer traverse is a trail; a hairpin
+        // down a 55 deg face is not.
+        gradAt(terrain, x + dirX * SB_APEX_PROBE, z + dirZ * SB_APEX_PROBE, 9, gTmp);
+        const apexFall = Math.max(fallSteep, gTmp.mag);
         if (Math.abs(drift) > limit && outbound && fallSteep > 0.26 &&
+            apexFall < SB_MAX_FALL &&
             travelled - lastSwitchback > 110 && z > zFinish + 220) {
           mode = 1;
           sbSign = -Math.sign(drift) || 1;
@@ -2648,6 +2958,11 @@ export function createTrail(ctx) {
       crown: new Float32Array(N),      // tread crown (m)
       rough: new Float32Array(N),      // micro-roughness amplitude (m)
       bumps: new Float32Array(N),      // transverse ridge amplitude (roots/brake bumps)
+      kapV: new Float32Array(N),       // convex vertical curvature of the committed centre
+                                       // profile, worst over LAUNCH_STENCILS (see
+                                       // computeVertKappa) — the launch constraint's input
+      vWant: new Float32Array(N),      // the speed the design intends here, ignoring relief;
+                                       // capLaunchCurvature() flattens the ground to it
       feat: new Int16Array(N),
       wallride: new Float32Array(N),   // extra wall height on the outside of the turn
       // ---- exposure safety (applyExposureSafety) --------------------------
@@ -2729,8 +3044,45 @@ export function createTrail(ctx) {
    * with mu = tan(LEAN_DESIGN) this returns the speed at which the rider's
    * lean relative to the tread is exactly LEAN_DESIGN.
    */
-  function cornerSpeedCap(i) {
+  /**
+   * The lateral friction actually left over after the fall line has been paid
+   * for — the friction circle, which the corner cap did not have.
+   *
+   * MEASURED, and it is the reason every one of 21 autopilot cells died within
+   * 32 m of the same point on seed 20260726 once the launch problem was fixed.
+   * At arc 296-301 m the plan radius runs 21 -> 9 m while the gradient runs
+   * 30% -> 72%. The corner cap looked at the radius, the bank and the surface,
+   * saw 10.1 m/s of grip, and paced it at 8.5-9.2. But a rider holding speed on
+   * a 72% pitch is already asking the tyres for g*sin(theta) = 0.58 g just to
+   * not accelerate, and the design friction on dirt is tan(28 deg) = 0.53 g in
+   * total. There is nothing left to turn with. The trace shows exactly that:
+   * skid 0.84-0.98, the bike's own leanLimit collapsed to 19-26 deg, and the
+   * lateral error going 0.6 -> 3.0 m in 0.9 s straight off the outside.
+   *
+   * The circle is the standard one. The tyres carry mu*N in total; holding
+   * speed on the slope spends tan(theta) of it; what is left for the corner is
+   *
+   *     mu_lat = sqrt( mu^2 - (tan theta)^2 )
+   *
+   * floored at MU_CORNER_MIN so a genuinely steep chute is paced as a chute
+   * rather than as a stop. On the flat this returns mu unchanged, so nothing
+   * outside the steeps moves at all: at 25% grade dirt goes 0.53 -> 0.47, at
+   * 50% it goes 0.53 -> 0.18, and at 72% it is on the floor.
+   *
+   * This is the third constraint in the joint solve. The other two — do not get
+   * launched, and hold the corner at the speed you arrive at — are useless on
+   * their own if the tyres are already spent resisting gravity.
+   */
+  const MU_CORNER_MIN = 0.12;
+  function cornerGripBudget(i) {
     const mu = clamp(MU_DESIGN * SURF_MU[S.surface[i]], 0.22, 1.0);
+    const fall = Math.abs(S.grade[i]);
+    return Math.max(MU_CORNER_MIN, Math.sqrt(Math.max(0, mu * mu - fall * fall)));
+  }
+
+  function cornerSpeedCap(i) {
+    const mu = SOLVER.launch ? cornerGripBudget(i)
+      : clamp(MU_DESIGN * SURF_MU[S.surface[i]], 0.22, 1.0);
     // Clamp the bank contribution: past ~50 deg the formula's denominator runs
     // away, and no rider is relying on a berm steeper than that anyway.
     const tb = Math.tan(clamp(helpfulBank(i), -0.55, 0.87));
@@ -2739,21 +3091,124 @@ export function createTrail(ctx) {
     return Math.min(V_CAP, Math.sqrt(Math.max(1, G * S.radius[i] * num / denom)));
   }
 
+  // -------------------------------------------------------------------------
+  // VERTICAL CURVATURE OF THE COMMITTED PROFILE — the measurement techSpeedCap
+  // was missing. See the LAUNCH_SAFETY note at the head of the file.
+  // -------------------------------------------------------------------------
+
   /**
-   * The design speed of the section itself, independent of any corner: what a
-   * rider carries down a straight of this width, on this surface, at this
-   * roughness. See the V_PHASE note.
+   * Convex vertical curvature of profile `y` at station `i` over a half-stencil
+   * of `h` metres of PLAN arc. Positive = crest (the direction that throws the
+   * rider). Converted to true path curvature by the (1+y'^2)^(3/2) term, because
+   * stations are spaced in plan and a 50% grade would otherwise over-read by 20%.
    */
-  function techSpeedCap(i) {
+  function vertKappaAt(y, i, h) {
+    const k = Math.max(1, Math.round(h / STATION_DS));
+    const a = i - k, b = i + k;
+    if (a < 0 || b >= S.n) return 0;
+    const d = k * STATION_DS;
+    const d2 = (y[a] - 2 * y[i] + y[b]) / (d * d);
+    const yp = (y[Math.min(S.n - 1, i + 1)] - y[Math.max(0, i - 1)]) / (2 * STATION_DS);
+    return -d2 / Math.pow(1 + yp * yp, 1.5);
+  }
+
+  /**
+   * Fill S.kapV with the worst convex curvature over the stencil ladder.
+   *
+   * WHY A LADDER AND NOT A WAVELENGTH. The relief on this profile is not a
+   * sinusoid and it is not one scale: measured on seed 20260726 at arc 178-180 m
+   * the 2 m stencil reads 0.063-0.079 /m while the 6 m stencil reads 0.021-0.023,
+   * and 110 m further down at 290-294 m it is the other way round (2 m: 0.099-0.139,
+   * 6 m: 0.085-0.089). A single stencil is guaranteed to miss one of those two
+   * places, and both of them launch the rider. Taking the worst over the ladder
+   * is conservative by construction and cannot miss either.
+   *
+   * The smallest rung is the station spacing, which is within 8% of the wheel
+   * radius the acceptance test stencils at; anything shorter than that is
+   * sub-station relief and is priced separately by chatterKappa().
+   */
+  function computeVertKappa() {
+    const n = S.n;
+    // Measure on the profile FILTERED the way the wheel and the carve filter it,
+    // not on the raw station lattice. Without this the shortest rung reads its
+    // own quantisation: a 5 mm station-to-station step is 0.06 /m at a 0.4 m
+    // stencil, three times the cap at 16 m/s, and it is neither built (the carve
+    // passes 6-11% of 0.5-2 m content) nor felt (a 0.37 m wheel bridges it). The
+    // sigma is 0.45 m, whose Gaussian transfer — 0.21 at 1.6 m, 0.64 at 3 m,
+    // 0.90 at 6 m, 0.97 at 12 m — tracks the measured carve transfer in
+    // CARVE_XFER_BANDS to within the spread of the three seeds it came from.
+    const raw = new Float32Array(n);
+    for (let i = 0; i < n; i++) raw[i] = S.by[i] + S.hOff[i];
+    const y = gaussianSmooth(raw, 4, 0.45 / STATION_DS);
+    for (let i = 0; i < n; i++) {
+      let worst = 0;
+      for (let s = 0; s < LAUNCH_STENCILS.length; s++) {
+        const k = vertKappaAt(y, i, LAUNCH_STENCILS[s]);
+        if (k > worst) worst = k;
+      }
+      S.kapV[i] = worst;
+    }
+  }
+
+  /**
+   * Convex curvature from the sub-station relief this module authors — the
+   * microDetail fbm, the root ridges and the braking-bump trains — priced at the
+   * wavelengths they are actually emitted at, through the wheel and the carve.
+   *
+   * This is what ROUGH_LAMBDA was trying to be. The difference is that it names
+   * every component and its own wavelength instead of collapsing all of them
+   * onto one number: microDetail's fundamental is ROUGH_LAMBDA*2.4 = 3.84 m and
+   * its second octave (lacunarity 2.4, gain 0.5) lands on ROUGH_LAMBDA itself,
+   * and the ridge trains are at 2.42 m (roots, sin(s*2.6)) and 1.1 m (braking
+   * bumps). Those are four different filters, not one.
+   */
+  function chatterKappa(i) {
+    const r = S.rough[i];
+    let k = r * launchKappaPerAmp(ROUGH_LAMBDA * 2.4);
+    const k2 = r * 0.5 * launchKappaPerAmp(ROUGH_LAMBDA);
+    if (k2 > k) k = k2;
+    if (S.bumps[i] > 0.001) {
+      // The ridge trains: roots at 2.42 m, braking bumps at 1.1 m. Both are
+      // emitted into S.bumps, so price the worse of the two.
+      const kb = S.bumps[i] * Math.max(launchKappaPerAmp(2.42), launchKappaPerAmp(1.1));
+      if (kb > k) k = kb;
+    }
+    return k;
+  }
+
+  /** Geometric launch-speed limit at station i, with the design margin. */
+  function launchSpeedCap(i) {
+    let k = Math.max(S.kapV[i], SOLVER.carveFloor);
+    const kc = chatterKappa(i);
+    if (kc > k) k = kc;
+    return Math.sqrt(G / (SOLVER.safety * k));
+  }
+
+  /**
+   * The speed the design INTENDS at this station, before the relief is priced:
+   * the phase ceiling modulated by tread width. capLaunchCurvature() flattens the
+   * ground toward this, and only where it cannot does techSpeedCap() give way.
+   */
+  function wantSpeedCap(i) {
     const ph = PHASES[S.phase[i]];
     const base = V_PHASE[ph.id] === undefined ? 17.0 : V_PHASE[ph.id];
     // Tread width, relative to the phase's own design width. A pinch is slower
     // than the section it is in; a corner that has been widened is faster.
     const wf = clamp(0.74 + 0.30 * (S.width[i] / Math.max(0.8, ph.width)), 0.70, 1.14);
-    // Chatter.
-    const amp = Math.max(0.015, S.bumps[i] + S.rough[i] * 1.5);
-    const rough = ROUGH_SUSP * (ROUGH_LAMBDA / (2 * Math.PI)) * Math.sqrt((2 * G) / amp);
-    return Math.min(base * wf, rough);
+    return base * wf;
+  }
+
+  /**
+   * The design speed of the section itself, independent of any corner: what a
+   * rider carries down a straight of this width, on this surface, at this
+   * roughness — bounded by the speed at which the relief that will ACTUALLY be
+   * committed here throws the wheels off the ground.
+   */
+  function techSpeedCap(i) {
+    if (!SOLVER.launch) {
+      return Math.min(wantSpeedCap(i), legacyRoughCap(S.bumps[i], S.rough[i]));
+    }
+    return Math.max(V_DESIGN_FLOOR, Math.min(wantSpeedCap(i), launchSpeedCap(i)));
   }
 
   /** Clamp the solved speed to the corner and section caps, then re-brake. */
@@ -2950,7 +3405,11 @@ export function createTrail(ctx) {
         // test was a bare `r > 220`, which left a 240 m-radius bend taken at
         // 20 m/s with no bank at all and 24 deg of lean to find from nowhere.
         if (need <= 0.015 && r > st.minRadius * 4.5) { S.bank[i] = 0; continue; }
-        const mag = clamp(Math.max(ideal * st.style, need), 0, st.maxBank);
+        let mag = clamp(Math.max(ideal * st.style, need), 0, st.maxBank);
+        // The slow-rider ceiling. See the LEAN_HOLD note: a berm banked for a
+        // speed the rider does not arrive at is a surface they slide down.
+        const hold = Math.atan((SLOW_FRAC * SLOW_FRAC * v[i] * v[i]) / (G * r)) + LEAN_HOLD;
+        if (SOLVER.rebank && mag > hold) mag = Math.max(0, hold);
         S.bank[i] = -Math.sign(S.curv[i]) * mag;
       }
       // Smooth the bank along the trail so a berm builds and releases instead
@@ -3937,6 +4396,20 @@ export function createTrail(ctx) {
     // countCrestViol(). crestViolAfter is the cap's own exit, not the shipped
     // profile, and the two are not the same number.
     crestStage: { afterCap: 0, afterFeatures: 0, afterRecap: 0, afterSafety: 0 },
+    // ---- the joint launch/bank solve (capLaunchCurvature, rebankAtSolvedSpeed) ----
+    // `launchViol*` count stations violating the launch cap at ANY rung of the
+    // stencil ladder, measured against S.vWant (the speed the design intends),
+    // not against the speed the ground happened to leave. `launchWorst*` is the
+    // worst ratio kappa/cap. `launchSpeedGiven` counts stations where the
+    // geometry could not be flattened and the SPEED gave way instead;
+    // `launchFloorBound` counts the ones where even that hit V_DESIGN_FLOOR and
+    // the design is knowingly over the cap. `bankConflict` counts corners where
+    // the fast-rider floor and the slow-rider ceiling crossed.
+    launchViolBefore: 0, launchViolAfter: 0,
+    launchWorstBefore: 0, launchWorstAfter: 0,
+    launchWorstAtBefore: 0, launchWorstAtAfter: 0,
+    launchSpeedGiven: 0, launchFloorBound: 0, bankConflict: 0,
+    launchStage: { afterJoint: 0, afterSafety: 0 },
   };
 
   /**
@@ -4185,6 +4658,40 @@ export function createTrail(ctx) {
   }
 
   /**
+   * Launch violations on the CURRENT profile at the CURRENT governed speed,
+   * over the whole stencil ladder. This is the design-time proxy for the
+   * acceptance metric, and the two agree closely enough to steer by: measured on
+   * seed 20260726, the acceptance harness scores the interpolated station
+   * profile at 4.5% of stations against the committed surface's 3.53%, so this
+   * runs about 1.3x conservative, in the safe direction.
+   *
+   * Same discipline as countCrestViol(): the mask is not optional once features
+   * exist, because a jump lip is convex past any launch cap BY CONSTRUCTION.
+   */
+  function countLaunchViol(mask) {
+    if (!S) return 0;
+    const n = S.n;
+    const raw = new Float32Array(n);
+    for (let i = 0; i < n; i++) raw[i] = S.by[i] + S.hOff[i];
+    const y = gaussianSmooth(raw, 4, 0.45 / STATION_DS);
+    let c = 0;
+    for (let i = 0; i < n; i++) {
+      if (mask && mask[i]) continue;
+      const v = Math.max(4, S.speed[i]);
+      const k = Math.max(SOLVER.carveFloor, (() => {
+        let w = 0;
+        for (let s = 0; s < LAUNCH_STENCILS.length; s++) {
+          const q = vertKappaAt(y, i, LAUNCH_STENCILS[s]);
+          if (q > w) w = q;
+        }
+        return w;
+      })());
+      if (k * v * v > G) c++;
+    }
+    return c;
+  }
+
+  /**
    * Relax the vertical profile until every crest is flat enough to hold the
    * wheels down at that station's design speed. Writes into S.hOff, leaves
    * S.by alone, and never moves a station carrying authored relief.
@@ -4272,6 +4779,294 @@ export function createTrail(ctx) {
       if (k > safety.crestWorstAfter) { safety.crestWorstAfter = k; safety.crestWorstAtAfter = i * ds; }
       if (k > capOf[i]) safety.crestViolAfter++;
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // THE JOINT SOLVE — speed, vertical curvature and bank, together.
+  //
+  // capCrestCurvature() above is the same idea at one stencil and one safety
+  // factor, and it was measured (round 6) leaving 54 violations of its OWN cap on
+  // the shipped profile while the acceptance stencil found 40-56% of stations in
+  // the worst 25 m bin launching. Three things were wrong with it and all three
+  // are fixed here rather than by tuning it:
+  //
+  //  1. ONE MEASUREMENT STENCIL (4 m). Content at 2 m reads at a third of its
+  //     curvature through it, and content at 20 m reads correctly but is relaxed
+  //     by a stencil that cannot reach it. LAUNCH_STENCILS is a ladder.
+  //  2. ONE RELAXATION STENCIL (11 m), fixed, for every violation regardless of
+  //     the scale of the thing that caused it. Here the relaxation is at the SAME
+  //     scale as the measurement that fired: a 2 m defect gets a 2 m Laplacian, a
+  //     20 m rollover gets a 20 m one. That is the only way a single pass can
+  //     take both out without either ringing or doing nothing.
+  //  3. IT CAPPED AGAINST THE SPEED THE PROFILE ALREADY HAD, which is circular:
+  //     wherever the speed had already been dragged down by the geometry the cap
+  //     relaxed, so did the requirement. Here the cap is written against
+  //     `S.vWant` — the speed the DESIGN intends, from the phase ceiling and the
+  //     corner — so the ground is flattened toward the design instead of the
+  //     design being quietly flattened toward the ground.
+  //
+  // What it may not do: fill more than GRADE_FILL_MAX, cut more than
+  // RAMP_CUT_MAX, move a station carrying authored relief, or make the trail
+  // climb. Where those bind, the speed gives way instead (techSpeedCap), and the
+  // count of stations where THAT happened is safety.launchSpeedGiven.
+  // -------------------------------------------------------------------------
+  const LAUNCH_KAPPA_MIN = 0.008;   // /m — never demand a vertical radius over 125 m
+  const LAUNCH_KAPPA_MAX = 0.150;   // /m — nor bother below ~6.7 m
+
+  // -------------------------------------------------------------------------
+  // THE SWITCHBACK RULE — gradient bounded by the corner it is in.
+  //
+  // MEASURED. With the launch problem fixed, the airborne fraction on seed
+  // 20260726 fell 0.130 -> 0.041 and every one of 21 autopilot cells then died
+  // within 32 m of the SAME point, arc 301 m. The trace says why and it is not
+  // ambiguous: plan radius 21 -> 9 m while the gradient runs 30% -> 72%, the
+  // bike's own leanLimit collapsing to 19-26 deg, skid 0.84-0.98, and the
+  // lateral error going 0.6 -> 3.0 m in nine tenths of a second straight off the
+  // outside of the corner. Seed 777 dies the same way at 84-88 m: radius 31 m at
+  // 63-68% of gradient, lateral error 0.9 -> 4.5 m, then over the edge.
+  //
+  // A 70% pitch spends tan(35 deg) = 0.70 g of tyre just holding speed. That is
+  // more than the whole design friction budget on dirt (tan(28 deg) = 0.53), so
+  // there is nothing left to turn with at ANY speed — which is why the round-6
+  // speed ablation could not fix seed 777 either. cornerGripBudget() prices that
+  // into the speed; this bounds the geometry that creates it, which is the only
+  // real answer.
+  //
+  // It is also what a trail builder does. Nobody builds a switchback down the
+  // fall line: the apex is cut in near-flat and the drop is spent on the
+  // straights either side. `shapePhaseGrade` already caps the gradient at
+  // GRADE_HARD_MAX inside each phase — but it runs in buildStations(), six
+  // passes before the profile that ships, and it measures over a 6 m window that
+  // a two-station 70% spike walks straight through. Measured on the shipped
+  // build, the start phase (design gradient 11%, shapePhaseGrade cap 26.7%)
+  // carried 72% at arc 300.
+  //
+  // CONTRACT §4 asks for "steepest chutes to 35%". This is also that.
+  const GRADE_CORNER_R0 = 10.0;   // m — full switchback
+  const GRADE_CORNER_R1 = 60.0;   // m — open enough that the corner costs nothing
+  const GRADE_CORNER_F = 0.45;    // fraction of the hard max left at R0
+  const GRADE_CAP_WIN = 5.0;      // m — half-window the gradient is bounded over
+
+  /** The steepest gradient the corner at station i can be ridden on. */
+  function gradeCapAt(i) {
+    const r = S.radius[i];
+    const f = clamp(GRADE_CORNER_F + (1 - GRADE_CORNER_F) *
+      (r - GRADE_CORNER_R0) / (GRADE_CORNER_R1 - GRADE_CORNER_R0), GRADE_CORNER_F, 1);
+    return GRADE_HARD_MAX * f;
+  }
+
+  /** Fill S.vWant with the speed the design intends, ignoring the relief. */
+  function computeWantSpeed() {
+    for (let i = 0; i < S.n; i++) {
+      S.vWant[i] = Math.max(V_DESIGN_FLOOR,
+        Math.min(wantSpeedCap(i), cornerSpeedCap(i), V_CAP));
+    }
+  }
+
+  /**
+   * Flatten the vertical profile until the wheels stay down at S.vWant, at every
+   * scale in the ladder. Writes into S.hOff; leaves S.by alone.
+   */
+  function capLaunchCurvature(vertMask) {
+    const n = S.n, ds = S.ds;
+    const y = new Float64Array(n);
+    for (let i = 0; i < n; i++) y[i] = S.by[i] + S.hOff[i];
+    const y0 = Float64Array.from(y);
+    const cap = new Float32Array(n);
+    computeWantSpeed();
+    // The target is the speed the design wants, bounded by the speed the CARVE
+    // can deliver a surface for. Asking the relaxation to flatten below
+    // KAPPA_CARVE_FLOOR is asking it to remove curvature that is not in the
+    // design profile at all — it would smooth real trail away chasing a
+    // reconstruction artefact, which is how a course gets flattened to pass a
+    // metric. See the KAPPA_CARVE_FLOOR note.
+    const vTop = Math.sqrt(G / (SOLVER.safety * SOLVER.carveFloor));
+    for (let i = 0; i < n; i++) {
+      const v = clamp(S.vWant[i], 4, vTop);
+      cap[i] = clamp(G / (SOLVER.safety * v * v), LAUNCH_KAPPA_MIN, LAUNCH_KAPPA_MAX);
+    }
+    const wgt = new Float32Array(n);
+    const yf = new Float32Array(n);
+    const RELAX = 0.38;
+    // Measure through the same wheel/carve filter computeVertKappa() uses, or
+    // the pass spends 260 iterations chasing lattice quantisation it can neither
+    // remove nor be thrown by. `y` is what gets relaxed; `yf` is what is judged.
+    const refilter = () => {
+      const s = gaussianSmooth(y, 4, 0.45 / STATION_DS);
+      for (let i = 0; i < n; i++) yf[i] = s[i];
+    };
+    refilter();
+
+    // Worst violation on entry, over the whole ladder, for the audit.
+    const yf0 = Float32Array.from(yf);
+    for (let i = 0; i < n; i++) {
+      if (vertMask[i]) continue;
+      for (let s = 0; s < LAUNCH_STENCILS.length; s++) {
+        const k = vertKappaAt(yf0, i, LAUNCH_STENCILS[s]);
+        if (k > cap[i]) {
+          safety.launchViolBefore++;
+          if (k / cap[i] > safety.launchWorstBefore) {
+            safety.launchWorstBefore = k / cap[i];
+            safety.launchWorstAtBefore = i * ds;
+          }
+          break;
+        }
+      }
+    }
+
+    for (let pass = 0; pass < 260; pass++) {
+      let any = false;
+      refilter();
+      // Largest scale first: taking a 20 m rollover out changes what the 2 m
+      // stencil sees, and doing it the other way round makes the small-scale
+      // work be undone by the large-scale pass.
+      for (let s = LAUNCH_STENCILS.length - 1; s >= 0; s--) {
+        const h = LAUNCH_STENCILS[s];
+        const k = Math.max(1, Math.round(h / ds));
+        if (n <= 2 * k + 2) continue;
+        wgt.fill(0);
+        let fired = false;
+        for (let i = k; i < n - k; i++) {
+          if (vertMask[i]) continue;
+          const kap = vertKappaAt(yf, i, h);
+          if (kap <= cap[i]) continue;
+          fired = true; any = true;
+          const over = clamp01((kap - cap[i]) / cap[i]) * 0.65 + 0.35;
+          // Spread over the stencil so the correction is a rounded crest, not a
+          // notch at the measurement point.
+          for (let j = Math.max(0, i - k); j <= Math.min(n - 1, i + k); j++) {
+            const w = over * (1 - Math.abs(j - i) / (k + 1));
+            if (w > wgt[j]) wgt[j] = w;
+          }
+        }
+        if (!fired) continue;
+        for (let i = k; i < n - k; i++) {
+          const w = wgt[i];
+          if (w <= 0 || vertMask[i]) continue;
+          y[i] += w * RELAX * (0.5 * (y[i - k] + y[i + k]) - y[i]);
+          const lo = S.rawS[i] - RAMP_CUT_MAX, hi = S.rawS[i] + GRADE_FILL_MAX;
+          if (y[i] < lo) y[i] = lo; else if (y[i] > hi) y[i] = hi;
+        }
+      }
+      // ---- the switchback rule, in the same relaxation ---------------------
+      //
+      // CUT-BIASED, and that is not a preference. Easing a pitch means lowering
+      // its top and raising its bottom; the mountain always grants the cut and
+      // terrain.applyCarve() builds at most GRADE_FILL_MAX of the fill. So the
+      // pass lowers the upper half of an over-steep window by the whole excess
+      // and lets the clamp take whatever the fill side cannot have. Repeated,
+      // that walks the excavation back UP the pitch, which is exactly how a
+      // bench gets cut into a steep face.
+      {
+        const m = Math.max(2, Math.round(GRADE_CAP_WIN / ds));
+        for (let i = m; i < n - m; i++) {
+          if (vertMask[i]) continue;
+          const win = 2 * m * ds;
+          const g = (yf[i - m] - yf[i + m]) / win;
+          const gc = gradeCapAt(i);
+          if (g <= gc) continue;
+          any = true;
+          const excess = (g - gc) * win;      // metres of drop to take out of the window
+          const A = 0.5 * RELAX * excess;
+          for (let j = i - m; j <= i + m; j++) {
+            if (vertMask[j]) continue;
+            const u = (j - i) / m;            // -1 upstream .. +1 downstream
+            // Antisymmetric: lower the top (u<0), raise the bottom (u>0). sin is
+            // used rather than a ramp because its slope is zero at u = +-1, so the
+            // correction joins the untouched profile without a kink — a kink here
+            // would be a launcher, which is the constraint running next door.
+            y[j] += A * Math.sin(Math.PI * 0.5 * u);
+            const lo = S.rawS[j] - RAMP_CUT_MAX, hi = S.rawS[j] + GRADE_FILL_MAX;
+            if (y[j] < lo) y[j] = lo; else if (y[j] > hi) y[j] = hi;
+          }
+        }
+      }
+      if (!any) break;
+    }
+
+    // Descent guard — CONTRACT §4 is absolute about climbing, and a Laplacian
+    // that lowers a crest can raise the hollow on the far side of it.
+    for (let i = 1; i < n; i++) {
+      if (vertMask[i]) continue;
+      const c = y[i - 1] + 0.035 * ds;
+      if (y[i] > c) y[i] = Math.max(c, S.rawS[i] - RAMP_CUT_MAX);
+    }
+
+    for (let i = 0; i < n; i++) {
+      S.hOff[i] += y[i] - y0[i];
+      S.py[i] = S.by[i] + S.hOff[i];
+    }
+    refilter();
+    for (let i = 0; i < n; i++) {
+      if (vertMask[i]) continue;
+      for (let s = 0; s < LAUNCH_STENCILS.length; s++) {
+        const k = vertKappaAt(yf, i, LAUNCH_STENCILS[s]);
+        if (k > cap[i]) {
+          safety.launchViolAfter++;
+          if (k / cap[i] > safety.launchWorstAfter) {
+            safety.launchWorstAfter = k / cap[i];
+            safety.launchWorstAtAfter = i * ds;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-solve the bank at the speed the joint solve actually left, everywhere the
+   * feature pass has not authored the cross-section itself.
+   *
+   * THIS IS THE HALF OF THE FIX THE ROUND-6 ABLATION WAS MISSING. Clamping the
+   * governor without re-banking leaves berms built for 16 m/s being ridden at 9,
+   * which asks the rider to lean OUT of every corner — 17 of 21 cells lowsided.
+   * The bank is a function of the speed; change one and the other has to move.
+   *
+   * Both bounds are applied, and they are the two halves of the contract at the
+   * head of this file:
+   *   floor    bank >= atan(v^2/(g*r)) - LEAN_DESIGN     (fast enough to need it)
+   *   ceiling  bank <= atan((SLOW_FRAC*v)^2/(g*r)) + LEAN_HOLD   (holdable slow)
+   * Where the ceiling is below the floor the corner cannot be built for both and
+   * the ceiling wins — a corner you can hold slowly and have to brake for beats
+   * one you slide off the moment you are not perfect. That is counted as
+   * safety.bankConflict.
+   */
+  function rebankAtSolvedSpeed(mask) {
+    const n = S.n;
+    const b = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      b[i] = S.bank[i];
+      if (mask && mask[i]) continue;
+      const st = styleAt(i);
+      const r = S.radius[i];
+      const v = S.speed[i];
+      const ideal = Math.atan((v * v) / (G * r));
+      const need = ideal - LEAN_DESIGN;
+      const hold = Math.atan((SLOW_FRAC * SLOW_FRAC * v * v) / (G * r)) + LEAN_HOLD;
+      if (need <= 0.015 && r > st.minRadius * 4.5) { b[i] = 0; continue; }
+      let mag = clamp(Math.max(ideal * st.style, need), 0, st.maxBank);
+      if (mag > hold) { mag = Math.max(0, hold); safety.bankConflict++; }
+      b[i] = -Math.sign(S.curv[i]) * mag;
+    }
+    const bS = gaussianSmooth(b, 16, 6);
+    for (let i = 0; i < n; i++) {
+      // The smoother must not reach into a station whose cross-section the
+      // feature pass authored — a jump lip is deliberately flat and the wallride
+      // deliberately past any berm ceiling.
+      if (mask && mask[i]) continue;
+      S.bank[i] = bS[i];
+    }
+    // Straight sections keep their drainage outslope.
+    for (let i = 0; i < n; i++) {
+      if ((mask && mask[i]) || Math.abs(S.bank[i]) > 0.05) continue;
+      const e = 4;
+      const hR = terrainSampleCache(S.px[i] + S.rx[i] * e, S.pz[i] + S.rz[i] * e);
+      const hL = terrainSampleCache(S.px[i] - S.rx[i] * e, S.pz[i] - S.rz[i] * e);
+      const out = Math.sign(hR - hL) * 0.030;
+      S.bank[i] = S.bank[i] * 0.4 + out * 0.6;
+    }
+    // Nothing below this line may raise a corner's speed.
+    applyCornerSpeedCap();
   }
 
   /** Recompute tangents, right vectors and grade from the current px/py/pz. */
@@ -4963,6 +5758,9 @@ export function createTrail(ctx) {
     }
     for (const r of routeAudit) r.chosen = r.variant === route.variant;
     buildStations(terrain, route);
+    // The relief has to be measured before the first speed solve, or the first
+    // solve prices it at zero and every pass downstream inherits that.
+    computeVertKappa();
     solveSpeeds();
     // Bound the crest curvature against the speed the profile itself asks for,
     // BEFORE any feature is placed — so the jump line, the drops and the
@@ -4975,7 +5773,21 @@ export function createTrail(ctx) {
       for (let k = 0; k < 2; k++) {
         capCrestCurvature(empty);
         refreshBasis();
+        computeVertKappa();
         solveSpeeds();
+      }
+      // ---- the joint solve, on bare ground, before any feature exists -------
+      // Flatten the relief to the speed the design wants, re-measure it,
+      // re-solve the speed and the bank against what is left, and repeat. Three
+      // rounds: the ground moves, which moves the corner speed, which moves the
+      // bank, which moves the corner speed again.
+      if (SOLVER.launch) {
+        for (let k = 0; k < 3; k++) {
+          capLaunchCurvature(empty);
+          refreshBasis();
+          computeVertKappa();
+          solveSpeeds();
+        }
       }
     }
     safety.crestStage.afterCap = countCrestViol();
@@ -5012,10 +5824,40 @@ export function createTrail(ctx) {
       safety.crestStage.afterFeatures = countCrestViol(vm);
       capCrestCurvature(vm);
       refreshBasis();
+      computeVertKappa();
       solveSpeeds(false);
       for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
       safety.crestStage.afterRecap = countCrestViol(vm);
       crestMask = vm;
+
+      // ---- the joint solve again, on the profile the features left ----------
+      //
+      // Same reason capCrestCurvature runs twice: buildFeatures() authors relief
+      // on top of the flattened ground and the ground BETWEEN the authored
+      // relief is not flat any more — roller crests, berm entries, the shoulders
+      // either side of a chute. Under the same authored mask, so the jump table
+      // is untouched to the millimetre.
+      //
+      // Then, and this is the part the round-6 speed ablation left out, the bank
+      // is re-solved at whatever speed the flattening left. A berm built for a
+      // speed the rider no longer arrives at is a lowside.
+      for (let k = 0; k < 3; k++) {
+        if (SOLVER.launch) {
+          capLaunchCurvature(vm);
+          refreshBasis();
+          computeVertKappa();
+          solveSpeeds(false);
+          for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
+        }
+        if (SOLVER.rebank) rebankAtSolvedSpeed(vm);
+      }
+      // Book-keeping: where did the geometry fail and the speed have to give way?
+      computeWantSpeed();
+      for (let i = 0; i < S.n; i++) {
+        if (S.speed[i] < S.vWant[i] - 0.25) safety.launchSpeedGiven++;
+        if (launchSpeedCap(i) < V_DESIGN_FLOOR - 1e-3) safety.launchFloorBound++;
+      }
+      safety.launchStage.afterJoint = countLaunchViol(vm);
     }
 
     // Level-design safety audit and mitigation. Must run AFTER the features have
@@ -5024,6 +5866,14 @@ export function createTrail(ctx) {
     // shelf geometry). See the long note above applyExposureSafety().
     applyExposureSafety(terrain);
     safety.crestStage.afterSafety = countCrestViol(crestMask);
+    // applyExposureSafety() benches the line and re-runs capGradeRamp, both of
+    // which move S.py. Re-measure, re-pace and re-bank against what shipped —
+    // reporting a launch figure from four passes upstream is exactly the mistake
+    // countCrestViol() exists to document.
+    computeVertKappa();
+    solveSpeeds(false);
+    if (SOLVER.rebank) rebankAtSolvedSpeed(crestMask);
+    safety.launchStage.afterSafety = countLaunchViol(crestMask);
 
     // Two-leg conflicts, measured on the FINAL stations and resolved by pinching
     // the contesting limbs. See auditLegConflicts(). The speed profile is re-run
