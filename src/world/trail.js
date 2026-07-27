@@ -28,6 +28,18 @@
 //                          bicycle can ride and descend, which test the chosen
 //                          one failed if not, and whether the extended variant
 //                          budget was used. See routeAdmissible().
+//
+// CONTRACT-NOTE (BEHAVIOUR CHANGE — build() can now THROW):
+//   `trail.build(terrain)` throws if no marched variant is admissible. The error
+//   message names the seed, the test every variant failed, and each variant's
+//   numbers; `err.trailRouteAudit` carries the rows. This replaces the previous
+//   behaviour of shipping the best inadmissible route with a flag on
+//   `safety.routeAdmissible`, which three consecutive audits found being ignored.
+//   `routeAdmissible` tests conditions no downstream pass can repair, so a build
+//   that trips it has not produced a course. Known affected seed: 2 (every
+//   variant climbs 18.7-93 m against a 12 m limit). The A/B control path
+//   `ctx.settings.trailSolver = { feasible: false }` never throws — it exists to
+//   reproduce the pre-rideability build bit-identically.
 //     trail.safety.feasViol / feasFrac / feasCorner / feasLaunch / feasWorstDeg
 //                       -> the joint (v, phi) feasibility of the SHIPPED
 //                          stations: how many have NO speed in
@@ -537,102 +549,262 @@ const LEAN_HOLD = THREE.MathUtils.degToRad(34);
 const SLOW_FRAC = 0.55;
 
 // ===========================================================================
-// THE RIDEABILITY ENVELOPE — why LEAN_DESIGN could never have been a constant,
-// and the model that replaces it.
+// THE RIDEABILITY ENVELOPE — MEASURED OFF bike.js, not derived from a free-body
+// diagram of it.
 //
-// WHAT SEVEN ROUNDS OF DOWNSTREAM WORK COULD NOT REACH. Measured on a
-// known-good SYNTHETIC course with no roughness, no exposure, zero vertical
-// curvature and berms at 60% of the required lean — i.e. with this module's
-// entire output removed from the experiment — driving the real bike:
+// WHAT THE PREVIOUS CUT OF THIS BLOCK GOT WRONG, and it is worth stating in
+// full because two rounds were spent on the consequences.
 //
-//     dead straight, 15-45% grade : 6/6 finishes at every speed v6..v14
-//     r_min 64 m, 15% grade       : 6/6 at every speed
-//     r_min 64 m, 25% grade       : 6/6 to v12, 0/6 at v14
-//     r_min 64 m, 30% grade       : 2/6 at v12, 0/6 at v14
-//     r_min 64 m, 36% grade       : 0/6 at v12, 6/6 at v10
-//     r_min 64 m, 45% grade       : 0/6 at EVERY speed from 6 to 14 m/s
+// It mirrored leanCeiling()'s arithmetic by hand: the two-end moment balance,
+// the friction ellipse per wheel, and one fitted smoothstep on the rear load
+// fraction. Verified against a published table to 0.01 deg — of its own output.
+// Three terms that dominate on steep ground were missing:
 //
-// A 64 m-radius corner needs 5.2 deg of contact lean at 6 m/s. It cannot be
-// taken on a 45% grade. The same 45% grade, straight, is fine at 14 m/s.
+//   1. `T.LEAN_LIMIT_PLANTED` (0.34 rad = 19.5 deg). bike.js floors the ceiling
+//      there whenever ANY tyre is on the ground, in terms: "no amount of derate
+//      can take away the ability to steer while a tyre is on the ground". The
+//      mirror had no floor at all and returned exactly zero above ~48% grade.
+//   2. `T.RIDER_SHIFT` (0.30 m). Full aft pitch input moves the centre of mass
+//      0.246 m back, which takes the rear load fraction on a 45% grade from
+//      0.134 to 0.331 — from below the model's own skipping band to well above
+//      it. CONTRACT section 6 requires the rider to do exactly this ("body
+//      English: weight back on steeps"). The mirror rode with its weight over
+//      the bars on a 90% grade.
+//   3. mu on DIRT. bike.js's `SURF_MU[DIRT]` is 1.08; the mirror used 1.00.
 //
-// THE NAIVE FRICTION CIRCLE DOES NOT EXPLAIN THIS and cornerGripBudget() used
-// to be exactly that circle. At 45%: sin 0.410, cos 0.912, holding speed costs
-// g*sin = 4.02 m/s^2 against mu*g*cos = 8.05, leaving sqrt(8.05^2 - 4.02^2) =
-// 6.97 m/s^2 of lateral — which at r = 64 would allow 21 m/s. It fails at 6.
+// And its one fitted parameter — the smoothstep between REAR_LO and REAR_HI —
+// was calibrated against synthetic cells produced by an autopilot that held
+// `input.pitch` at zero for the whole sweep. An instrument defect was laundered
+// into a route-planning constant, and the term then refused ground a rider who
+// moves can ride: on 45% ground it answered 2.4 deg where the bike delivers 35.
 //
-// THE MECHANISM IS LOAD TRANSFER, and it is in bike.js in plain sight.
-// leanCeiling() (bike.js:1738) does not return atan(mu). It returns
+// SO THIS IS NOT A MODEL ANY MORE. IT IS A MEASUREMENT.
 //
-//     atan( min(capF*L/b, capR*L/a) / N_total * LEAN_GRIP_MARGIN )
+// `RIDE_CEIL` below is `bike.state.leanLimit` — the number leanCeiling() itself
+// returns, which is also the number bike.js's own low-side test is judged
+// against — recorded while driving the REAL src/physics/bike.js and
+// src/physics/collision.js over an ANALYTIC helicoid (no grid, no bilinear
+// facets, no trail), at a grid of gradient x deceleration, at the reference
+// rider's pitch schedule, on DIRT. Each cell is the p10 of the published
+// ceiling over the run — the tenth percentile, not the median, so a cell that
+// spends part of its time light is scored at the value it spends it at.
 //
-// where capX = lateralCapacity(wheel) = mu*N_x*LAT_GRIP*sqrt(1 - (fx/(mu*N_x))^2).
-// So the ceiling is set by whichever END saturates first under the moment
-// balance — and braking hard enough to hold a steep grade moves load off the
-// rear until there is nothing left there to corner with. The rear load fraction
-// under a longitudinal demand of mu_long = a_long/(g cos theta) is
+// Everything about the probe that could bias it is stated:
+//   * straight-line runs, speeds 6.2 / 10 / 15 m/s, worst of the three, for the
+//     decel = 0 column; for decel > 0 a single ramp from 16 m/s to 5.5 m/s at
+//     the column's rate, scored only while the ramp is live.
+//   * the governor modulates the brakes against `state.skid`, because holding a
+//     locked wheel is a controller defect and not a property of the bike.
+//     Measured mean skid over the grid is 0.003.
+//   * cells where the run did not complete are entered as ZERO, which is why
+//     the table falls off a cliff rather than tapering: past a gradient of
+//     about 0.75 the bike crashes on a DEAD STRAIGHT run at every speed.
 //
-//     N_r/N = (a_cg - mu_long * h_cg) / L        a_cg = 0.640, h_cg = 1.05, L = 1.25
+// THE TABLE LANDS ON THE MECHANISM, which is the strongest evidence that the
+// probe is measuring the bike and not the harness. With the reference rider's
+// weight shift the cg-to-front-axle arm is
+//     0.640 + 0.30*(78/95) = 0.886 m,
+// so the endo gradient is 0.886/1.05 = 0.844. The measured ceiling is nonzero
+// at 0.70 and zero at 0.75-and-above at every deceleration — i.e. the bike
+// stops being rideable within one grid step of its own shifted endo point, a
+// number that appears nowhere in the probe.
 //
-// which is 0.302 at a 25% grade, 0.260 at 30%, 0.210 at 36%, 0.134 at 45% and
-// ZERO at 61% — the endo point, where the trail's own p99 grades live. A wheel
-// carrying 13% of static load on real ground is not a wheel that holds a corner:
-// it skips, `bothDown` goes false several times a second, and leanCeiling's
-// asymmetric fall filter (LEAN_LIMIT_FALL = 2.5x) latches the low value.
+// WHAT IT SAYS, next to what the mirror said (design budget, degrees, decel 0):
 //
-// THE MODEL BELOW IS THAT ARITHMETIC, MIRRORED, plus ONE calibrated term for the
-// skipping — `rel`, a smoothstep on the rear load fraction between REAR_LO and
-// REAR_HI. It is calibrated against the 30 synthetic cells above and nothing
-// else. Usable lean (deg) predicted vs the envelope the cells bracket:
+//     grade     mirror     MEASURED      grade     mirror   MEASURED
+//      flat      28.0        28.0         45%        2.4      24.5
+//      25%       16.9        25.5         55%        0.0      24.1
+//      30%       14.4        25.5         70%        0.0      20.3
+//      36%       11.3        25.5         75%        0.0       0.0
 //
-//     grade   N_r/N   model   cells bracket the truth at
-//      25%    0.302   16.9    between 12.9 (v12 passes) and 17.3 (v14 fails)
-//      30%    0.260   14.5    ~12.9 (v12 marginal, 2/6)
-//      36%    0.210   11.3    between  9.1 (v10 passes) and 12.9 (v12 fails)
-//      45%    0.134    2.4    below 3.3 (v6 fails)
+// The flat-ground figure is 28.0 deg in BOTH columns and that is deliberate:
+// RIDE_USE is chosen (not tuned) so the measured ceiling on flat dirt maps
+// exactly onto LEAN_DESIGN. Everywhere the old constant was right, the answer
+// is still the old constant to the last digit; what changes is only the steeps.
 //
-// All four bracket correctly, including the factor-of-five collapse between 36%
-// and 45% that no friction circle produces. That collapse is the whole finding.
+// THE REFERENCE RIDER, stated explicitly because the whole course design is now
+// priced off it. `RIDE_PITCH_G` and `RIDE_PITCH_A` define
 //
-// TWO DELIBERATE CONSERVATISMS, both stated so nobody re-derives them as bugs.
-//  1. Aerodynamic drag and rolling resistance are NOT credited against the
-//     longitudinal demand. Physically they do reduce the braking required; but
-//     crediting them puts 36% + r64 + v12 back inside the envelope, where the
-//     measurement says it is outside. A rider who arrives fast has to brake
-//     harder than the design profile, and drag is a bonus, not an entitlement.
-//  2. The demand is evaluated at the SLOWEST speed the design permits, because
-//     lower speed is always easier for the corner and harder for nothing.
+//     input.pitch = -clamp( tanTheta/0.55 + decel/12, 0, 1 )
 //
-// WHAT IT REDUCES TO ON FLAT GROUND. With mu_long = 0 the rear fraction is
-// a/L = 0.512, `rel` = 1, and min(muF, muR)/N = mu*LAT_GRIP, so the budget is
-// atan(mu*LAT_GRIP*LEAN_GRIP_MARGIN*LEAN_USE) = 28 deg on dirt, EXACTLY
-// LEAN_DESIGN. That is the point of LEAN_USE: on the ground where the old
-// constant was right, the model returns the old constant to the last digit, so
-// nothing outside the steeps moves at all. What changes is only that on a 45%
-// grade it now says 2.4 deg instead of 28.
+// (negative = weight BACK — bike.js's own axis convention). It is not a guess:
+// the optimum aft shift was mapped over gradient x deceleration by sweeping
+// `input.pitch` in five steps at each cell and taking the ceiling each produced.
+// The schedule tracks the measured optimum to within one 0.25 step everywhere
+// the ground is rideable, and it is a real control input with an interior
+// optimum, not a cheat — a constant `pitch = -1` is WORSE than zero below about
+// a 20% grade (0 deg of ceiling on the flat: the front is unweighted and the
+// FRONT then limits), and a constant `pitch = 0` is worse than the schedule
+// everywhere above 25%. Any harness quoting a completion figure against this
+// course must drive this schedule, or it is measuring a different rider.
+//
+// WHAT THE MEASUREMENT DOES NOT COVER, so nobody quotes it past its evidence:
+//   * The corner-HOLD half of the probe — the largest lean actually sustained
+//     round a constant-radius helicoid — agrees with the derated budget at
+//     plan radii above ~33 m (measured usable fractions 0.58-0.76 of the
+//     ceiling in tangent space, against the 0.596 used here) and is BELOW it at
+//     radii of 22-30 m. Whether that is the bike or the harness's own pursuit
+//     controller could not be separated: at 6.2 m/s those cells are limited by
+//     the probe's speed governor (they fail `stuck` with 0.1 m of tracking
+//     error). Tight radii are governed here by the radius machinery —
+//     openTightCorners(), SB_RADIUS, rideRadius() — and NOT by this term.
+//   * Bank is not an axis. The probe runs unbanked ground; a berm is credited
+//     downstream, additively, exactly as before.
 // ===========================================================================
 const RIDE_WB = 1.25;             // bike.js T.WHEELBASE
 const RIDE_CG_FWD = -0.015;       // bike.js T.CG_FWD
 const RIDE_CG_H = 1.05;           // bike.js T.ROLL_H — cg above the contact line
 const RIDE_A = RIDE_WB * 0.5 - RIDE_CG_FWD;   // 0.640 m, cg -> front axle
 const RIDE_B = RIDE_WB * 0.5 + RIDE_CG_FWD;   // 0.610 m, cg -> rear axle
-const RIDE_LAT_GRIP = 0.94;       // bike.js T.LAT_GRIP
-const RIDE_GRIP_MARGIN = 0.92;    // bike.js T.LEAN_GRIP_MARGIN
-const RIDE_MU0 = 1.00;            // bike-side peak mu on DIRT; SURF_MU scales it
-// The calibrated skipping band. Below REAR_LO the rear is not a cornering wheel
-// at all; above REAR_HI it is fully trusted. See the table above.
+const RIDE_SHIFT = 0.30;          // bike.js T.RIDER_SHIFT
+const RIDE_SHIFT_FRAC = 78 / 95;  // bike.js T.RIDER_MASS / T.MASS
+// The reference rider's pitch schedule. See the note above.
+const RIDE_PITCH_G = 0.55;        // tan(theta) per unit of aft pitch input
+const RIDE_PITCH_A = 12.0;        // m/s^2 of deceleration per unit of aft pitch
+const RIDE_DEC_CAP = 5.0;         // m/s^2 of design deceleration worth pricing
+                                  // (also the last column of the table)
+
+/** input.pitch the reference rider is holding here. Negative = weight back. */
+function ridePitch(tanTheta, decel) {
+  const t = Math.max(0, tanTheta) / RIDE_PITCH_G
+    + clamp(decel, 0, RIDE_DEC_CAP) / RIDE_PITCH_A;
+  return -clamp01(t);
+}
+
+/**
+ * cg-to-front-axle arm with the reference rider's weight shift applied. This is
+ * bike.js line 1258-1259 exactly:
+ *     riderFore = input.pitch * RIDER_SHIFT
+ *     cgFwd     = CG_FWD + riderFore * (RIDER_MASS / MASS)
+ * and a = WHEELBASE/2 - cgFwd, so an AFT shift LENGTHENS the arm.
+ */
+function rideArmA(tanTheta, decel) {
+  return RIDE_A - ridePitch(tanTheta, decel) * RIDE_SHIFT * RIDE_SHIFT_FRAC;
+}
+
+// bike.js's own SURF_MU. The trail's SURF_MU array (further down) is a DESIGN
+// scale used for rolling resistance and pacing; this one is the bike's, and it
+// is what the tyre actually has. They disagree on dirt (1.08 vs 1.00), which is
+// the third of the three terms the mirrored model was missing.
+const RIDE_SURF_MU = [1.08, 1.15, 0.95, 0.78, 0.86, 0.70, 0.58, 0.52];
+const RIDE_MU_REF = RIDE_SURF_MU[0];
+
+// --- the measurement -------------------------------------------------------
+// Rows: tan(theta), rise/run. Columns: deceleration demanded ON TOP of holding
+// the grade, m/s^2. Values: bike.state.leanLimit p10, DEGREES.
+//
+// Post-processed exactly once, and only in the conservative direction: a
+// monotone non-increasing lower envelope in both axes (running min from the
+// top-left). The raw grid is non-monotone by up to 3 deg where the pitch
+// schedule crosses a step, and a route-planning term that is non-monotone in
+// gradient produces routes nobody can explain.
+const RIDE_TAN_AX = [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
+  0.50, 0.55, 0.60, 0.65, 0.70, 0.75];
+const RIDE_DEC_AX = [0, 1, 2, 3, 4, 5];
+const RIDE_CEIL = [
+  [41.73, 41.07, 39.16, 36.68, 33.89, 30.75],   // 0%
+  [41.56, 39.41, 37.40, 34.70, 31.65, 28.20],   // 5%
+  [40.08, 38.11, 35.76, 34.00, 31.50, 28.17],   // 10%
+  [38.65, 38.11, 35.76, 34.00, 31.50, 28.17],   // 15%
+  [38.65, 38.11, 35.76, 34.00, 31.50, 28.17],   // 20%
+  [38.65, 38.11, 35.76, 34.00, 31.50, 28.17],   // 25%
+  [38.65, 38.11, 35.76, 34.00, 31.44, 26.61],   // 30%
+  [38.65, 37.48, 35.30, 32.29, 28.03, 25.11],   // 35%
+  [37.46, 35.56, 32.90, 29.10, 27.18, 25.11],   // 40%
+  [37.46, 35.56, 32.90, 29.10, 20.10, 0.61],    // 45%
+  [37.46, 35.56, 32.90, 24.71, 5.66, 0.61],     // 50%
+  [36.94, 35.56, 28.94, 15.13, 0.84, 0.61],     // 55%
+  [36.94, 32.49, 22.25, 0.57, 0.57, 0.57],      // 60%
+  [35.41, 27.62, 10.77, 0.57, 0.57, 0.57],      // 65%
+  [31.76, 20.76, 0.71, 0.57, 0.57, 0.57],       // 70%
+  [0, 0, 0, 0, 0, 0],                           // 75% — the bike crashes straight
+];
+// The design's share of the bike's own measured ceiling. CHOSEN, not tuned, so
+// that the budget on flat dirt is exactly LEAN_DESIGN — the same argument the
+// old LEAN_USE made, against a measured ceiling instead of a modelled one. It
+// is also inside the corner-hold measurement's usable band (0.58-0.76) at every
+// plan radius the hold probe could read cleanly.
+const RIDE_USE = Math.tan(LEAN_DESIGN) / Math.tan(RIDE_CEIL[0][0] * Math.PI / 180);
+// Below this the rider has no usable lean at all: they cannot correct a line,
+// let alone turn. Used to locate the gradient at which the ground stops being
+// rideable, for the refusal term in corridorRide().
+const RIDE_MIN_DEG = 4.0;
+// The rear-load band, kept from the previous cut BUT no longer carrying any
+// fitted weight: it was a smoothstep inside the lean model, and the measurement
+// has replaced everything it was doing there. What survives is its use as a
+// GATE — below RIDE_REAR_LO the rear is not a cornering wheel and a switchback
+// apex has nothing to turn on. Evaluated against the SHIFTED arm, it now fires
+// at a gradient of about 0.79, i.e. within one grid step of where the measured
+// ceiling goes to zero (0.75). Two independent statements of the same physics
+// agreeing to 5% of gradient is the reason both are kept.
 const RIDE_REAR_LO = 0.08;
 const RIDE_REAR_HI = 0.22;
-// Grade at which the rear leaves the ground under speed-holding braking:
-// mu_long = a/h = 0.610. Nothing above this is admissible at any radius, even
-// dead straight — it is an endo, not a gradient.
-const RIDE_ENDO_MU = RIDE_A / RIDE_CG_H;
-// The design's share of the bike's own ceiling. Chosen — not tuned — so that
-// leanBudget() on flat dirt returns exactly LEAN_DESIGN, i.e. this is the
-// number that makes the change a no-op everywhere the old constant was right.
-const LEAN_USE = Math.tan(LEAN_DESIGN) / (RIDE_MU0 * RIDE_LAT_GRIP * RIDE_GRIP_MARGIN);
-// Floor on the longitudinal demand fed to the model, as a fraction of what
-// holding the grade costs. A rider is never perfectly neutral.
-const RIDE_DEC_CAP = 5.0;         // m/s^2 of design deceleration worth pricing
+// Longitudinal demand at which the rear leaves the ground for the reference
+// rider — the ENDO limit, at full aft shift. 0.844, against 0.610 for a rider
+// sitting still. This is the real bound on a bicycle's front brake.
+const RIDE_ENDO_MU = (RIDE_A + RIDE_SHIFT * RIDE_SHIFT_FRAC) / RIDE_CG_H;
+
+/** Bilinear read of the measured ceiling, RADIANS. Zero past the table. */
+function rideCeiling(tanTheta, decel) {
+  let t = tanTheta > 0 ? tanTheta : 0;
+  const last = RIDE_TAN_AX.length - 1;
+  if (t >= RIDE_TAN_AX[last]) return 0;
+  let a = decel > 0 ? decel : 0;
+  if (a > RIDE_DEC_CAP) a = RIDE_DEC_CAP;
+  let i = 0;
+  while (i < last - 1 && RIDE_TAN_AX[i + 1] <= t) i++;
+  const ft = (t - RIDE_TAN_AX[i]) / (RIDE_TAN_AX[i + 1] - RIDE_TAN_AX[i]);
+  let j = 0;
+  while (j < RIDE_DEC_AX.length - 2 && RIDE_DEC_AX[j + 1] <= a) j++;
+  const fa = clamp01((a - RIDE_DEC_AX[j]) / (RIDE_DEC_AX[j + 1] - RIDE_DEC_AX[j]));
+  const lo = RIDE_CEIL[i][j] * (1 - fa) + RIDE_CEIL[i][j + 1] * fa;
+  const hi = RIDE_CEIL[i + 1][j] * (1 - fa) + RIDE_CEIL[i + 1][j + 1] * fa;
+  return (lo * (1 - ft) + hi * ft) * Math.PI / 180;
+}
+
+/**
+ * The gradient at which the design budget falls to RIDE_MIN_DEG, for a given
+ * deceleration. Ground steeper than this is not "expensive" — the reference
+ * rider does not get down it upright at any radius, so no berm and no line
+ * choice rescues it. Precomputed off the table itself; nothing here is tuned.
+ */
+const RIDE_TAN_ZERO = (() => {
+  const out = new Float64Array(RIDE_DEC_AX.length);
+  const minRad = RIDE_MIN_DEG * Math.PI / 180;
+  for (let j = 0; j < RIDE_DEC_AX.length; j++) {
+    let g = RIDE_TAN_AX[RIDE_TAN_AX.length - 1];
+    for (let s = 0; s <= 200; s++) {
+      const t = (s / 200) * RIDE_TAN_AX[RIDE_TAN_AX.length - 1];
+      const b = Math.atan(RIDE_USE * Math.tan(rideCeiling(t, RIDE_DEC_AX[j])));
+      if (b < minRad) { g = t; break; }
+    }
+    out[j] = g;
+  }
+  return out;
+})();
+
+/**
+ * Interpolated RIDE_TAN_ZERO at an arbitrary deceleration, ON A GIVEN SURFACE.
+ *
+ * The surface term is not cosmetic and it was the second half of the seed-2026
+ * 0726 wall. leanBudget() indexes the table at demand/k where k is the surface's
+ * grip relative to dirt, so the gradient at which the budget dies scales with k
+ * too: a 65% pitch on ROOT (k = 0.648) is a 100% pitch as far as the tyre is
+ * concerned, and the reference rider does not get down it. Reading the dirt
+ * figure there says 0.74 and permits it.
+ */
+function rideGradeMax(decel, surf) {
+  const mu = RIDE_SURF_MU[surf] === undefined ? RIDE_MU_REF : RIDE_SURF_MU[surf];
+  const k = mu / RIDE_MU_REF;
+  const a = clamp(decel, 0, RIDE_DEC_CAP) / k;
+  if (a >= RIDE_DEC_AX[RIDE_DEC_AX.length - 1]) {
+    return k * RIDE_TAN_ZERO[RIDE_DEC_AX.length - 1];
+  }
+  let j = 0;
+  while (j < RIDE_DEC_AX.length - 2 && RIDE_DEC_AX[j + 1] <= a) j++;
+  const f = clamp01((a - RIDE_DEC_AX[j]) / (RIDE_DEC_AX[j + 1] - RIDE_DEC_AX[j]));
+  return k * (RIDE_TAN_ZERO[j] * (1 - f) + RIDE_TAN_ZERO[j + 1] * f);
+}
 
 /**
  * sin(theta) -> tan(theta), SIGN PRESERVED. S.grade is the y-component of a
@@ -648,54 +820,54 @@ function tanFromSin(s) {
 
 /**
  * Rear load fraction under a longitudinal demand of `muLong` (tyre force /
- * normal force, SIGNED: + = braking). Negative means the rear is off the
- * ground — an endo. Under drive it is the FRONT that goes light instead, which
- * is why leanBudget() takes the smaller of the two ends rather than the rear.
+ * normal force, SIGNED: + = braking), FOR THE REFERENCE RIDER — i.e. with the
+ * weight shift the pitch schedule is holding at that demand. Negative means the
+ * rear is off the ground: an endo.
+ *
+ * This is the arithmetic bike.js does at line 1258; the only thing that changed
+ * is that `riderFore` is no longer assumed to be zero. With the shift the endo
+ * gradient moves from 0.610 to 0.844, and the measured ceiling above goes to
+ * zero at 0.75 — within one grid step of it.
  */
-function rearLoadFrac(muLong) {
-  return (RIDE_A - muLong * RIDE_CG_H) / RIDE_WB;
+function rearLoadFrac(muLong, tanTheta, decel) {
+  const a = (tanTheta === undefined)
+    ? rideArmA(muLong, 0)              // demand-keyed shift when no grade is given
+    : rideArmA(tanTheta, decel === undefined ? 0 : decel);
+  return (a - muLong * RIDE_CG_H) / RIDE_WB;
 }
 
 /**
  * THE LEAN A RIDER CAN ACTUALLY HOLD AGAINST THE TREAD, in radians, on ground
  * of gradient `tanTheta` while shedding `decel` m/s^2 on top of holding the
- * grade, on a surface whose grip scale is `muSurf` (SURF_MU).
+ * grade, on SurfaceId `surf`.
  *
- * Returns 0 when no lean at all is available — which is a statement that the
- * ground is unrideable at any radius, not a small number.
+ * Returns 0 when the reference rider cannot descend this ground upright at all
+ * — which is a statement that the ground is unrideable at any radius, not a
+ * small number.
+ *
+ * SURFACE. The measurement was taken on DIRT and the surface enters twice, both
+ * validated against probes on all eight SurfaceIds:
+ *   - the ceiling scales in TANGENT space with the bike's own SURF_MU relative
+ *     to dirt (measured 1.06 / 0.87 / 0.70 / 0.78 / 0.62 / 0.48 / 0.40 against
+ *     a predicted 1.065 / 0.880 / 0.722 / 0.796 / 0.648 / 0.537 / 0.481);
+ *   - and low-mu ground behaves like STEEPER ground, so the table is indexed at
+ *     the demand divided by the same scale. Six of the eight surfaces are then
+ *     predicted to within 1.5 deg; mud and snow on 50% ground are predicted
+ *     conservatively (0 against a measured 15.6 and 18.0 deg), which is the
+ *     direction to be wrong in on a surface the phases barely use.
  */
-function leanBudget(tanTheta, decel, muSurf) {
-  const mu = clamp(RIDE_MU0 * muSurf, 0.30, 1.10);
-  const cosT = 1 / Math.sqrt(1 + tanTheta * tanTheta);
-  const sinT = tanTheta * cosT;                    // SIGNED: + = descending
-  const gN = G * cosT;
-  // What the TYRES must supply: gravity along the slope, plus whatever the
-  // speed profile is asking to be shed. Signed, so a station that is climbing
-  // is not charged for braking gravity is doing for it. Drag and rolling
-  // resistance are deliberately not credited — see conservatism (1) above.
-  // Clamped at zero from below. A station the design profile happens to be
-  // ACCELERATING through is not a station where the rider is guaranteed to be:
-  // they may arrive at the design speed and merely hold it, which is the demand
-  // the calibration cells were governed to. Crediting the acceleration measured
-  // 26 deg of budget on a 40% grade at seed 20260726 arc 177-183 m, authorised
-  // 22 m/s of corner cap on a 150 m radius, and put the run into the corner at
-  // 190 m carrying 10.2 m/s. The grade itself stays SIGNED, so a climb is still
-  // not charged for braking gravity is doing for it.
-  const muLong = (G * sinT + clamp(decel, 0, RIDE_DEC_CAP)) / gN;
-  const muAbs = Math.abs(muLong);
-  if (muAbs >= mu * 0.995) return 0;               // nothing left, at any radius
-  const nR = rearLoadFrac(muLong);
-  const nF = 1 - nR;
-  if (nR <= 0 || nF <= 0) return 0;                // endo, or the front is gone
-  const u = muAbs / mu;
-  const shed = Math.sqrt(Math.max(0, 1 - u * u));  // friction ellipse, per wheel
-  // The light END is the one that skips, and under drive that is the front.
-  const rel = smoothstep(RIDE_REAR_LO, RIDE_REAR_HI, Math.min(nR, nF));
-  // capX * L / arm, normalised by N_total — exactly leanCeiling()'s two-end form.
-  const muR = nR * (RIDE_WB / RIDE_A) * mu * RIDE_LAT_GRIP * shed;
-  const muF = nF * (RIDE_WB / RIDE_B) * mu * RIDE_LAT_GRIP * shed;
-  const muEff = Math.min(muF, muR) * RIDE_GRIP_MARGIN * rel;
-  return Math.atan(muEff * LEAN_USE);
+function leanBudget(tanTheta, decel, surf) {
+  const mu = RIDE_SURF_MU[surf] === undefined ? RIDE_MU_REF : RIDE_SURF_MU[surf];
+  const k = mu / RIDE_MU_REF;
+  // A station the design profile happens to be ACCELERATING through is not a
+  // station where the rider is guaranteed to be: they may arrive at the design
+  // speed and merely hold it, which is the demand the probe was governed to.
+  // The grade itself stays SIGNED, so a climb is not charged for braking that
+  // gravity is doing for it.
+  const dec = clamp(decel, 0, RIDE_DEC_CAP);
+  const ceil = rideCeiling(Math.max(0, tanTheta) / k, dec / k);
+  if (ceil <= 0) return 0;
+  return Math.atan(RIDE_USE * k * Math.tan(ceil));
 }
 
 /** Contact lean a corner of plan radius r demands at speed v, radians. */
@@ -756,6 +928,15 @@ const FEAS_W_SPEED = 60.0;        // per m/s the launch cap falls below the floo
 const FEAS_CAP_SPEED = 120.0;
 const FEAS_W_ENDO = 900.0;        // per unit of rear-load fraction past the endo
 const FEAS_CAP_ENDO = 260.0;
+// GROUND THE REFERENCE RIDER CANNOT DESCEND UPRIGHT AT ALL. Refusal class — the
+// same scale as the march's climb gates, and deliberately below their 1600 dead
+// end, so a route can never buy its way out of a cliff by climbing. The step is
+// what the term is worth AT the boundary: without it the penalty starts at zero
+// exactly where the ground stops being rideable, which is a cliff edge with a
+// zero-cost first step onto it.
+const FEAS_W_GROUND = 1100.0;
+const FEAS_CAP_GROUND = 1300.0;
+const FEAS_GROUND_STEP = 0.10;
 // The plan radius a candidate heading commits to is estimated from the turn it
 // asks for, blended with the turn the march is already carrying — a corner is a
 // SUSTAINED turn, and pricing one 6 m step in isolation lets the route spiral
@@ -2224,8 +2405,7 @@ export function createTrail(ctx) {
     const dec = vLaunch < vPhase
       ? (vPhase * vPhase - vLaunch * vLaunch) / (2 * span) : 0;
     const tanT = gNear;                               // rise/run, signed
-    const muSurf = SURF_MU[ph.surface] === undefined ? 1 : SURF_MU[ph.surface];
-    const budget = leanBudget(tanT, dec, muSurf);
+    const budget = leanBudget(tanT, dec, ph.surface);
     const st = BERM_STYLE[ph.id] || BERM_STYLE_DEFAULT;
     // What a berm here would ACTUALLY realise, not what the phase ceiling says:
     // the emitted design realises ~0.95 of its declared cross-slope on the
@@ -2241,13 +2421,50 @@ export function createTrail(ctx) {
     out.grade = tanT;
     const cosT = 1 / Math.sqrt(1 + tanT * tanT);
     const muLong = (G * tanT * cosT + clamp(dec, 0, RIDE_DEC_CAP)) / (G * cosT);
-    const nR = rearLoadFrac(muLong);
+    const nR = rearLoadFrac(muLong, tanT, dec);
     out.rearFrac = nR;
+    out.budget = budget;
     let c = 0;
     // (a) TURN WHERE IT IS FLATTER. Priced on the ground, not on the turn, so a
     // heading cannot dodge it by pointing straight down the face.
     const loss = LEAN_DESIGN - budget;
     if (loss > 0) c += Math.min(FEAS_CAP_BUDGET, loss * FEAS_W_BUDGET);
+    // (a2) ...AND GROUND YOU CANNOT DESCEND UPRIGHT IS NOT "EXPENSIVE", IT IS
+    // REFUSED. This is the half of (a) that was missing, and it is the defect
+    // that shipped 30 m of 49-91% fall line on seed 12345.
+    //
+    // The mechanism is worth stating because it is not obvious. Every other
+    // rideability term here is scaled by the CORNER: `shortfall` and `headroom`
+    // are both differences against leanRequired(v, radius), and on a dead
+    // straight heading the radius is FEAS_R_MAX, so leanRequired is 0.56 deg and
+    // any berm at all covers it. A fall line therefore costs nothing under
+    // (hard) no matter how steep it is — the budget can be exactly zero and the
+    // shortfall still negative. `loss` does price the ground, but it is a
+    // tie-break-class term capped at 110, and on a face where every heading is
+    // steep it cancels out of the comparison entirely.
+    //
+    // So the gradient at which the measured ceiling reaches RIDE_MIN_DEG gets
+    // its own term, in the REFUSAL class alongside the climb gates (900/1100/
+    // 1600) — because it is the same kind of statement: not "this is a poor
+    // trail", but "this is not a trail". The escape is the one the file already
+    // documents: a traverse, which is a descending heading with a smaller
+    // gradient. It deliberately does NOT outbid the climb gates, so a route
+    // still cannot climb its way out of a cliff.
+    // ON DIRT, DELIBERATELY, and this is a measured choice rather than an
+    // oversight. Reading the refusal gradient on the PHASE's own surface is more
+    // faithful — a 65% pitch on roots is a 100% pitch as far as the tyre is
+    // concerned — and it makes the course worse: it redrew all five routes and
+    // took the reference seed's autopilot from 452 m back to 325 m, because on a
+    // low-mu phase it condemns most of the available headings at once and the
+    // march then has nothing left to choose between. The march is a LOCAL search;
+    // a term that is saturated across the whole fan decides nothing and only
+    // displaces the route. The surface is priced where it can be acted on — in
+    // leanBudget() at every station, and in the speed profile through
+    // cornerGripBudget() — not in the heading fan.
+    const tanOver = tanT - rideGradeMax(dec, Surface.DIRT);
+    if (tanOver > 0) {
+      c += Math.min(FEAS_CAP_GROUND, (FEAS_GROUND_STEP + tanOver) * FEAS_W_GROUND);
+    }
     if (out.shortfall > 0) {
       c += Math.min(FEAS_CAP_HARD, out.shortfall * FEAS_W_HARD);
     } else if (out.headroom < 0) {
@@ -2481,6 +2698,19 @@ export function createTrail(ctx) {
     // Find where a straight probe down the corridor has given up TARGET_DROP of
     // altitude and finish there; that keeps the run near the 2.6 km / 420 m spec
     // whatever the mountain happens to be doing.
+    //
+    //
+    // MEASURED AND REJECTED, stated so it is not re-derived: scoring the far end
+    // of the corridor on the climb its straight probe contains — a fan of 17
+    // candidate bearings, each walked and each penalised for a hill in the
+    // middle — does NOT fix seed 2, which is the only reason to write it. Every
+    // one of sixteen variants still climbed 18.7 m or more. It redrew all five
+    // routes to do it (feasibility 0.91/0.88/3.39/1.32/1.56% -> 1.19/0.83/0.90/
+    // 1.57/2.09%: better on two seeds, worse on three, attributable on none).
+    // A change that misses its own motivating case and moves every other course
+    // is a redraw, not a repair. Seed 2's mountain cannot carry a 2.6 km / 430 m
+    // descent without crossing a rise, and the answer to that is the refusal at
+    // the end of build(), not a different random draw.
     const TARGET_DROP = 430;
     const rawFinX = clamp(startX + (vrng() - 0.5) * 520, B.minX + margin, B.maxX - margin);
     let finishX = rawFinX, zFinish = B.minZ + 170;
@@ -2601,14 +2831,18 @@ export function createTrail(ctx) {
           corridorAt(terrain, ax, az, dirX, dirZ, ph.width * 0.5, cTmp);
           const st = BERM_STYLE[ph.id] || BERM_STYLE_DEFAULT;
           const phi = st.maxBank * clamp01(bankFactorFor(cTmp.deficit));
-          const muSurf = SURF_MU[ph.surface] === undefined ? 1 : SURF_MU[ph.surface];
-          const avail = phi + leanBudget(apexFall, 0, muSurf) + SB_FEAS_TOL;
+          const avail = phi + leanBudget(apexFall, 0, ph.surface) + SB_FEAS_TOL;
           // The hard half: past the endo grade the rear wheel is not on the
           // ground under the braking a hairpin entry needs, and no berm makes
           // that rideable. This is the "5 m radius corners on 69% grades" case.
           // Holding speed on a grade costs mu_long = tan(theta) exactly, and
           // apexFall IS rise/run, so it is the longitudinal demand directly.
-          const apexRear = rearLoadFrac(apexFall);
+          // Evaluated for the REFERENCE RIDER, i.e. with the weight shift they
+          // are holding on that gradient. The previous cut evaluated it for a
+          // rider sitting still, which put the endo point at 0.610 and refused
+          // every hairpin above about a 51% face — on a mountain whose hairpins
+          // are the only thing keeping the route off the fall line.
+          const apexRear = rearLoadFrac(apexFall, apexFall, 0);
           sbOk = apexRear >= RIDE_REAR_LO
             && leanRequired(SB_V_APEX, SB_RADIUS) <= avail;
           // The relief valve. A mountain with no flat ground anywhere must not
@@ -2953,9 +3187,27 @@ export function createTrail(ctx) {
   // vegetation and every screenshot ever taken of a given seed; a trail that
   // cannot find a line is a trail problem and must be paid for by the trail.
   //
-  // If no variant is admissible the best-scoring one still ships — a course is
-  // better than an exception — and `safety.routeAdmissible` says so in terms,
-  // with the first failing test named in `safety.routeFail`.
+  // IF NO VARIANT IS ADMISSIBLE, GENERATION NOW FAILS. That is a reversal of the
+  // previous cut, which shipped the best-scoring inadmissible route with
+  // `safety.routeAdmissible = false` and a note. Three rounds of audit have said
+  // the same thing about the same seed — "seed 2 must not ship" — and a flag
+  // nobody is required to read is not a gate. `routeAdmissible` names conditions
+  // that no downstream pass can repair (a 2.0 m plan radius on a 1.25 m
+  // wheelbase; 106.8 m of non-descending trail; two legs contesting one
+  // heightfield), so a build that trips it has not produced a course and should
+  // not pretend it has.
+  //
+  // What that costs, stated plainly: seed 2 no longer generates. Every one of
+  // its sixteen marched variants climbs between 18.7 and 93 m against a 12 m
+  // gate, and the floor of 18.7 m does not move when the corridor's far end is
+  // re-chosen (measured — see the note in marchRoute). Its mountain will not
+  // carry a 2.6 km / 430 m descent without crossing a rise. The honest answers
+  // are a different seed or a shorter design drop, and both belong to the
+  // caller; silently shipping a course with a hill in the middle of it does not.
+  //
+  // The A/B control path (`settings.trailSolver.feasible = false`) is exempt: it
+  // exists to reproduce the previous build bit-identically and must not acquire
+  // a new failure mode.
   // The two thresholds below are on the MARCHED line, before enforceDescent()
   // has cut anything, so they are deliberately looser than the shipped limits
   // they protect: enforceDescent holds the shipped climb to 7 m and can do it
@@ -3812,11 +4064,12 @@ export function createTrail(ctx) {
   /**
    * The lean this station's rider can actually hold against the tread, radians.
    * On flat dirt this is LEAN_DESIGN to the last digit; on a 45% grade under
-   * speed-holding braking it is about 2 deg. See the RIDEABILITY ENVELOPE note.
+   * speed-holding braking it is 24.5 deg (the previous, modelled, cut of this
+   * said 2.4 — see the RIDEABILITY ENVELOPE note for what was missing).
    */
   function leanBudgetAt(i) {
     if (!SOLVER.feasible) return LEAN_DESIGN;
-    return leanBudget(tanFromSin(S.grade[i]), decelDemand(i), SURF_MU[S.surface[i]]);
+    return leanBudget(tanFromSin(S.grade[i]), decelDemand(i), S.surface[i]);
   }
 
   /**
@@ -3845,6 +4098,38 @@ export function createTrail(ctx) {
     return Math.max(MU_CORNER_MIN_FEAS, Math.tan(leanBudgetAt(i)));
   }
 
+  // A HAIRPIN IS RIDDEN AT HAIRPIN SPEED, and the lean identity on its own does
+  // not know that.
+  //
+  // This is the answer to "is a 5.4 m hairpin a legitimate feature at
+  // V_DESIGN_FLOOR, or a defect?" — it is legitimate, and what was defective was
+  // the speed the profile entered it at. Measured on the shipped build at seed
+  // 20260726 arc 296-306: plan radius 5.1-7.7 m, built bank 24-28 deg, design
+  // speed 8.4-9.2 m/s. The identity closes there — it is exactly what
+  // cornerSpeedCap solved for, v^2 = g*r*(mu + tan phi)/(1 - mu*tan phi) with
+  // mu = tan(budget) and a 28 deg berm gives 8.15 m/s at r = 5.1 — and the
+  // rider still cannot hold it. EVERY autopilot cell died inside 305-311 m.
+  //
+  // Two independent probes say the same thing, on different ground and with
+  // different controllers. The corner-hold probe on the analytic helicoid holds
+  // 0.58-0.76 of the measured ceiling at plan radii above 33 m and only
+  // 0.43-0.50 at 22-30 m; and on FLAT ground it holds a 5 m radius perfectly
+  // well at 6.2 m/s while failing far larger radii at 10-14 m/s. So the variable
+  // is not the radius on its own — it is the radius AT SPEED. At 8.4 m/s in a
+  // 5.1 m circle the bike is turning at 1.65 rad/s with the front tyre at a slip
+  // angle the single-track solver in bike.js has to run right up against its
+  // saturation to supply, and the quasi-static identity is blind to all of it.
+  //
+  // The cap below is a design statement rather than a fitted curve: below
+  // HAIRPIN_R0 a corner is a hairpin and is paced at the switchback apex speed
+  // the march already builds to (SB_V_APEX), easing back to the identity's own
+  // answer by HAIRPIN_R1. Above HAIRPIN_R1 it is inert — it never binds on an
+  // ordinary corner, which is checkable: the term changes nothing on any station
+  // with r > 14 m on any seed.
+  const HAIRPIN_R0 = 6.5;    // = SB_RADIUS, the tightest reversal the march builds
+  const HAIRPIN_R1 = 15.0;   // open enough that the identity is the only bound
+  const HAIRPIN_V1 = 9.5;    // m/s — the pace a 15 m corner is entered at
+
   function cornerSpeedCap(i) {
     const mu = SOLVER.launch ? cornerGripBudget(i)
       : clamp(MU_DESIGN * SURF_MU[S.surface[i]], 0.22, 1.0);
@@ -3853,7 +4138,11 @@ export function createTrail(ctx) {
     const tb = Math.tan(clamp(helpfulBank(i), -0.55, 0.87));
     const denom = Math.max(0.20, 1 - mu * tb);
     const num = Math.max(0.02, mu + tb);
-    return Math.min(V_CAP, Math.sqrt(Math.max(1, G * rideRadius(i) * num / denom)));
+    const r = rideRadius(i);
+    const v = Math.min(V_CAP, Math.sqrt(Math.max(1, G * r * num / denom)));
+    if (!SOLVER.feasible || r >= HAIRPIN_R1) return v;
+    const f = smoothstep(HAIRPIN_R0, HAIRPIN_R1, r);
+    return Math.min(v, SB_V_APEX + (HAIRPIN_V1 - SB_V_APEX) * f);
   }
 
   // -------------------------------------------------------------------------
@@ -3998,10 +4287,13 @@ export function createTrail(ctx) {
   // the course had no cornering capacity at all for a reason that had nothing
   // to do with the ground.
   //
-  // mu_brake is the design's longitudinal share — the same LEAN_USE fraction of
-  // the bike's own grip, without the LAT_GRIP factor because that one is
-  // lateral — capped by the ENDO limit, which is the real bound on a bicycle's
-  // front brake and lands within 1% of the same number on dirt.
+  // mu_brake is the design's longitudinal share — the same RIDE_USE fraction of
+  // the bike's own grip — capped by the ENDO limit, which is the real bound on
+  // a bicycle's front brake. Both moved with the measurement: the grip scale is
+  // now the bike's own SURF_MU (1.08 on dirt, not 1.00) and the endo limit is
+  // the reference rider's shifted one (0.844, not 0.610), so the profile is
+  // allowed to brake harder than the previous cut let it — which is what stops
+  // the backward pass manufacturing the deceleration that then eats the corner.
   // ...AND IT IS SPENT AT A FRACTION, NOT IN FULL. A speed profile that brakes
   // at 100% of the longitudinal budget has, by definition, no lateral capacity
   // left anywhere it is braking — leanBudget() returns literally zero — so every
@@ -4022,7 +4314,7 @@ export function createTrail(ctx) {
   function brakeAccel(i) {
     if (!SOLVER.feasible) return A_BRAKE;
     const muS = SURF_MU[S.surface[i]] === undefined ? 1 : SURF_MU[S.surface[i]];
-    const muB = BRAKE_USE * Math.min(LEAN_USE * RIDE_MU0 * muS, RIDE_ENDO_MU);
+    const muB = BRAKE_USE * Math.min(RIDE_USE * RIDE_MU_REF * muS, RIDE_ENDO_MU);
     const tanT = tanFromSin(S.grade[i]);          // signed, + = descending
     const cosT = 1 / Math.sqrt(1 + tanT * tanT);
     return Math.max(BRAKE_A_MIN, G * (muB * cosT - tanT * cosT));
@@ -6823,6 +7115,29 @@ export function createTrail(ctx) {
     safety.routeAdmissible = !!bestAdm;
     safety.routeFail = bestAdm ? '' : (route.admFail || '');
     safety.routeReseeded = routeAudit.length > ROUTE_VARIANTS;
+    // LOUD FAILURE. See the note above routeAdmissible(). The message carries
+    // every variant's numbers so the reason is in the failure and not in a
+    // debugger session.
+    if (SOLVER.feasible && !bestAdm) {
+      const rows = routeAudit.map((r) => `    v${r.variant}: ${r.fail}`
+        + ` climb=${r.climb} m, flat=${r.flat} m, minR=${r.minR} m,`
+        + ` conflict=${r.conflict} m, unrideable=${(r.feasFrac * 100).toFixed(1)}%`).join('\n');
+      const msg = `[trail] GENERATION FAILED for seed ${ctx.seed}: no admissible route.\n`
+        + `  ${routeAudit.length} independent variants were marched and every one failed`
+        + ` "${route.admFail}".\n`
+        + `  Limits: climb <= ${ROUTE_MAX_CLIMB} m, non-descending <= ${ROUTE_MAX_FLAT} m,`
+        + ` plan radius >= ${ROUTE_MIN_R} m, leg conflict <= ${ROUTE_CONFLICT_TOL} m,`
+        + ` unrideable <= ${(ROUTE_MAX_FEAS * 100).toFixed(0)}%.\n${rows}\n`
+        + `  This mountain will not carry the design descent. Change ctx.seed, or lower`
+        + ` the design drop. The trail deliberately does NOT ship a course it has`
+        + ` measured as unrideable.`;
+      // eslint-disable-next-line no-console
+      console.error(msg);
+      const err = new Error(msg);
+      err.trailRouteAudit = routeAudit.slice();
+      err.trailRouteFail = route.admFail;
+      throw err;
+    }
     if (bestAdm) { route = bestAdm; bestScore = bestAdmScore; }
     safety.routeFeasFrac = route.feasFrac || 0;
     safety.routeClimb = route.admClimb || 0;

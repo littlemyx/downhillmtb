@@ -34,6 +34,9 @@
 // CONTRACT-NOTE: the rider consumes several documented-additive fields on
 //   ctx.bike.state (riderCrouch, riderFore, pumpDrive, whip, lean, gForce,
 //   lastLanding, pitch) and degrades to sane defaults when they are absent.
+//   `state.riderFore` is the ONE that carries a scale (metres of weight shift,
+//   + = forward); `RIDER_SHIFT` below is its unit and the only number here that
+//   mirrors a bike.js constant. The shift is never re-derived from input.pitch.
 // CONTRACT-NOTE: the rider owns TWO UV channels on its own geometry.
 //   `uv`  (channel 0) = the baked garment atlas — unique per surface patch.
 //   `uv1` (channel 1) = the tiling weave/rubber normal UV; the kit/skin/helmet
@@ -55,6 +58,22 @@
 //   C3  hands are a palm + four wrapped fingers + a thumb around the bar axis;
 //       shoes are a flat sole slab + upper + strap; knee pads are a hard cap.
 //   C7  the whole stack is ~10% shorter and the limb radii are well down.
+//
+// LANE R9 (round-9 work order) — make the weight shift VISIBLE, because the
+// game now depends on the player performing it:
+//   R9a `state.riderFore` owns the fore/aft travel. The old driver moved the
+//       rider aft on GRADE with more authority (0.80) than the player's own
+//       command had (0.70), so on a 45% grade two thirds of the shift happened
+//       for free and the player-attributable hip travel collapsed to 74 mm —
+//       the animation was performing the input it was meant to be teaching.
+//       Grade now amplifies the command instead of substituting for it, and
+//       player-owned hip travel runs 0.220 m (flat) to 0.332 m (45%).
+//   R9b Getting back is hips back AND DOWN with the chest dropping and the
+//       arms straightening: 0.31 m of hip travel, 0.16 m of hip drop and a
+//       0.36 m head-height swing on a 45% grade, at 98% arm extension.
+//   R9c The arms are now a real limit (`ARM_REACH`, closed-form clamp after
+//       the spine FK). Before R9 the driver envelope exceeded the arm by up to
+//       75 mm, which `solveLimb` absorbed by silently stretching the forearm.
 
 import * as THREE from 'three';
 import { makeRng, subSeed, clamp, clamp01, lerp, smoothstep, damp } from '../core/rng.js';
@@ -106,6 +125,22 @@ const HAND_IN = 0.052;
 const ANKLE_UP = 0.088, ANKLE_BACK = 0.042;
 // Shoe sole plane, measured down from the ankle joint in the foot's own frame.
 const SOLE_DROP = 0.080, SOLE_THICK = 0.016;
+
+// R9 — the fore/aft weight shift.
+//
+// `bike.js` publishes `state.riderFore` = `input.pitch * T.RIDER_SHIFT`, in
+// metres, + = forward. This is the ONLY thing here that knows the scale; the
+// weight shift itself is never re-derived. See the R9 block in update().
+const RIDER_SHIFT = 0.30;
+// A rider gets behind the saddle until they run out of arm, and so does this
+// rig. `solveTwoBone` clamps the ELBOW to (l1+l2)*0.998 but `solveLimb` still
+// snaps the hand onto the grip regardless of distance, so an over-commanded
+// shift renders as a *stretched forearm* rather than as a rider at full
+// extension — it fails silently and it looks wrong. Measured over the whole
+// driver envelope, the code before R9 exceeded the arm by up to 75 mm.
+// 0.975 leaves the clavicle shrug (applied after this clamp, ~4 mm at full
+// crouch) and the lateral lean their margin; it costs 4 mm of rearward travel.
+const ARM_REACH = (L_UPPERARM + L_FOREARM) * 0.975;
 
 // ===========================================================================
 // 1. Module-scope scratch — nothing in update() may allocate.
@@ -3125,6 +3160,11 @@ export function createRider(ctx) {
   // ---- persistent animation state (all preallocated) ----------------------
   const aGripL = new THREE.Vector3(), aGripR = new THREE.Vector3();
   const aPedalL = new THREE.Vector3(), aPedalR = new THREE.Vector3();
+  // Hand IK targets and the inboard bar axis, derived from the grips once per
+  // frame: the reach clamp needs them before the arms are solved, and the arm
+  // solve then reuses them instead of rebuilding the same vectors.
+  const aHandL = new THREE.Vector3(), aHandR = new THREE.Vector3();
+  const aBarL = new THREE.Vector3(), aBarR = new THREE.Vector3();
   const gazeWorld = new THREE.Vector3();
   const gazeLocal = new THREE.Vector3();
   const lastBikePos = new THREE.Vector3();
@@ -3133,7 +3173,8 @@ export function createRider(ctx) {
   const hitScratch = { height: 0, normal: new THREE.Vector3(0, 1, 0), material: 0, slope: 0 };
 
   const D = {
-    crouch: 0, fore: 0, roll: 0, twist: 0, tuck: 0, brace: 0, elbowOut: 1,
+    crouch: 0, fore: 0, aft: 0, fwd: 0, roll: 0, twist: 0, tuck: 0,
+    brace: 0, elbowOut: 1,
     comp: 0.3, compRate: 0, hipX: 0, land: 0, headRollX: 0,
   };
   let spineX = 0, spineV = 0;          // spine bend spring (overshoot = weight)
@@ -3265,6 +3306,22 @@ export function createRider(ctx) {
     readAnchor('pedalL', aPedalL, FB_PEDAL_L);
     readAnchor('pedalR', aPedalR, FB_PEDAL_R);
 
+    // C3 — palm centre, not bar centre: HAND_IN inboard of the grip's outer end
+    // so the glove sits WITHIN the grip's length, and HAND_UP above the bar axis
+    // so the palm rests on top of it and the fingers (built as arcs about that
+    // axis) close underneath.
+    for (let side = 0; side < 2; side++) {
+      const grip = side === 0 ? aGripL : aGripR;
+      const other = side === 0 ? aGripR : aGripL;
+      const bar = side === 0 ? aBarL : aBarR;
+      const hand = side === 0 ? aHandL : aHandR;
+      bar.copy(other).sub(grip);
+      if (bar.lengthSq() < 1e-6) bar.set(side === 0 ? 1 : -1, 0, 0);
+      bar.normalize();                              // inboard along the bar
+      hand.copy(grip).addScaledVector(bar, HAND_IN);
+      hand.y += HAND_UP;
+    }
+
     // ---- drivers -----------------------------------------------------------
     const fork = s.suspension && s.suspension.fork;
     const shock = s.suspension && s.suspension.shock;
@@ -3328,15 +3385,70 @@ export function createRider(ctx) {
     crouchT += brace * 0.80;
     D.crouch = damp(D.crouch, clamp(crouchT, -0.55, 1.30), 15, dtc);
 
-    // Fore/aft weight.
-    const gradient = -(s.forward ? s.forward.y : 0);
-    let foreT = clamp((s.riderFore || 0) / 0.30, -1, 1) * 0.70;
-    foreT -= smoothstep(0.12, 0.46, gradient) * 0.80;
-    foreT -= brake * 0.38;
-    foreT += (s.pedalling || 0) * 0.45;
+    // ---- R9: fore/aft weight — the player's, not the animator's ------------
+    //
+    // Round 8 established that the fore/aft shift is not decoration: full pitch
+    // moves the CG 0.246 m aft, which on a 45% grade takes the rear load
+    // fraction from ~0.13 to ~0.33 and the lean ceiling with it. A player who
+    // does not know to do it finds the game unridable. So the animation must
+    // TELL them — which means the rider must look meaningfully different when
+    // they shift and when they do not.
+    //
+    // The code here used to do the opposite. `smoothstep(0.12, 0.46, gradient)
+    // * 0.80` moved the rider aft on grade ALONE, with more authority (0.80)
+    // than the player's own command had (0.70). Evaluating this module's own
+    // arithmetic across the grade range:
+    //
+    //   grade   D.fore, no input   D.fore, full S   player-owned hip travel
+    //     0%         0.000            -0.700              0.130 m
+    //    30%        -0.435            -1.135              0.130 m
+    //    45%        -0.798            -1.200              0.074 m   <- worst
+    //
+    // i.e. on the ground where the mechanic decides whether you finish the run,
+    // two thirds of the shift happened for free and the player's contribution
+    // shrank to 74 mm — the least legible signal exactly where it mattered
+    // most. The animation was quietly performing the input it was supposed to
+    // be teaching.
+    //
+    // Now: `state.riderFore` owns the travel, and grade AMPLIFIES the player's
+    // expression instead of substituting for it (a rider getting back on a 45%
+    // chute goes much further behind the saddle than one doing it on a fire
+    // road). Same measurement, after:
+    //
+    //   grade   D.fore, no input   D.fore, full S   player-owned hip travel
+    //     0%        +0.000            -1.000              0.220 m
+    //    30%        +0.120            -1.200              0.284 m
+    //    45%        +0.230            -1.350              0.332 m   <- best
+    //
+    // and the silhouette at the two ends of the 45% row: hips 0.31 m back and
+    // 0.16 m down, head 0.36 m lower, arms 74% -> 98% extended.
+    //
+    const gradient = -(s.forward ? s.forward.y : 0);      // + = descending
+    const steep = smoothstep(0.10, 0.50, gradient);
+    // The command, in units of RIDER_SHIFT. bike.js derives this from
+    // input.pitch; we never re-derive it, we only rescale it to ±1.
+    const foreCmd = clamp((s.riderFore || 0) / RIDER_SHIFT, -1, 1);
+    let foreT = foreCmd * (1 + steep * 0.40);
+    // Un-commanded on a steep, the rider is stacked over the bars — high, hips
+    // over the saddle, nothing in reserve. Kept small (a few cm) so the neutral
+    // pose never reads as a bug, but deliberately on the WRONG side of neutral:
+    // it must not look like the shift the player has not made.
+    foreT += steep * (1 - clamp01(-foreCmd)) * 0.24;
+    foreT += (s.pedalling || 0) * 0.40;
+    // Braking is a brace, not a weight shift — `brace`/`crouch` already carry
+    // it. The old -0.38 here was a third automatic term competing with the
+    // player for the same axis.
+    foreT -= brake * 0.10;
     foreT -= clamp01(s.endo || 0) * 0.55;
     foreT += clamp01(s.wheelie || 0) * 0.30;
-    D.fore = damp(D.fore, clamp(foreT, -1.2, 0.9), 7, dtc);
+    D.fore = damp(D.fore, clamp(foreT, -1.35, 0.9), 8, dtc);
+
+    // Split, because the two directions are not the same movement: getting back
+    // is hips back AND down with the chest dropping onto the top tube, going
+    // forward is a smaller move over the stem.
+    const aft = Math.max(0, -D.fore);
+    const fwd = Math.max(0, D.fore);
+    D.aft = aft; D.fwd = fwd;
 
     // Lean separation: the rider stays more upright than the bike, and the gap
     // widens with lean angle and speed. This is the thing that reads as "skilled".
@@ -3351,14 +3463,22 @@ export function createRider(ctx) {
     // Hips counter-rotate against a whip; on the ground a touch of lead into the turn.
     let twistT = -clamp(s.whip || 0, -1.1, 1.1) * 0.55 - (inp.steer || 0) * 0.07;
     D.twist = damp(D.twist, clamp(twistT, -0.6, 0.6), 10, dtc);
-    D.elbowOut = damp(D.elbowOut, 1 - D.tuck * 0.55 + clamp01(D.crouch) * 0.20, 6, dtc);
+    // Elbows come in as the arms straighten — a rider at full extension behind
+    // the saddle is not chicken-winging, they are hanging off the bar.
+    D.elbowOut = damp(D.elbowOut,
+      1 - D.tuck * 0.55 + clamp01(D.crouch) * 0.20 - aft * 0.22, 6, dtc);
     D.brace = brace;
 
     // ---- pose: root + spine ------------------------------------------------
     restPose();
 
     // Vertical hip spring: mass has inertia, so the hips lag the bike a little.
-    const hipTargetY = -D.crouch * 0.148;          // C7: scaled with the body
+    // R9: getting back is also getting LOW — the seat passes under the rider's
+    // chest, not behind their hips. The drop is what makes the shift read from
+    // the chase camera, and it is nearly free against the arm budget (dropping
+    // the shoulder shortens the vertical leg of the shoulder→grip triangle, so
+    // it buys back most of what the rearward translation spends).
+    const hipTargetY = -D.crouch * 0.148 - aft * 0.095;   // C7: scaled with the body
     const hipAcc = (hipTargetY - hipY) * 300 - hipYV * 24;
     hipYV += hipAcc * dtc; hipY += hipYV * dtc;
     hipY = clamp(hipY, -0.234, 0.126);
@@ -3366,19 +3486,29 @@ export function createRider(ctx) {
     const rp = rig.localPos[B_PELVIS];
     rp.copy(rig.restLocal[B_PELVIS]);
     rp.y += hipY;
-    rp.z += D.crouch * 0.076 - D.fore * 0.185;
+    // Asymmetric: 0.22 m of rearward travel (against bike.js's own 0.30 m of
+    // CG shift) versus 0.17 m forward. The reach clamp below decides how much
+    // of the rearward demand the arms will actually allow.
+    rp.z += D.crouch * 0.076 + aft * 0.22 - fwd * 0.17;
     rp.x += D.hipX;
 
     // Spine bend spring — slight overshoot so the torso has weight.
-    const spineTarget = 0.30 * D.crouch + 0.22 * brake + 0.42 * D.tuck - 0.14 * D.fore
+    // R9: chest down as the hips go back (the flat-back steep-chute shape), and
+    // no back-ARCH on the forward side — a rider moving over the stem is not
+    // leaning away from it, and that term was what pushed the tall-and-forward
+    // corner 56 mm past the end of the arm.
+    const spineTarget = 0.30 * D.crouch + 0.22 * brake + 0.42 * D.tuck + aft * 0.14
       + D.land * 0.18;
     const spineAcc = (spineTarget - spineX) * 165 - spineV * 17;
     spineV += spineAcc * dtc; spineX += spineV * dtc;
     spineX = clamp(spineX, -0.45, 0.95);
 
     // Rotation about +X is "look up", so bending forward is negative X.
+    // R9: the extra `aft * 0.11` is anterior pelvic tilt — the hips rotate
+    // forward as they translate back, which is what puts the tailbone behind
+    // the saddle instead of merely sliding the whole rider rearwards.
     setEuler(rig.localQuat[B_PELVIS],
-      -(D.crouch * 0.14 - D.fore * 0.10), D.twist * 0.55, D.roll * 0.40);
+      -(D.crouch * 0.14 - D.fore * 0.10 + aft * 0.11), D.twist * 0.55, D.roll * 0.40);
     for (let i = 0; i < 3; i++) {
       setEuler(rig.localQuat[SPINE_BONES[i]],
         -spineX * SPINE_SHARE[i],
@@ -3387,6 +3517,41 @@ export function createRider(ctx) {
     }
 
     fk(rig);
+
+    // ---- R9: the arms are the limit on how far back a rider can get --------
+    //
+    // This is a real constraint, not a safety net: arms-length behind the
+    // saddle is exactly where a downhill rider runs out of travel, and it is
+    // why the pose bottoms out into "arms extended, chest down" rather than
+    // continuing to slide backwards. Without it the rig does not fail loudly —
+    // `solveLimb` snaps the hand onto the grip whatever the distance, so the
+    // forearm simply renders longer than it is.
+    //
+    // Closed form, not iteration: the correction is a pure translation of the
+    // root along z, the spine rotation is already fixed at this point, so the
+    // shoulder translates by exactly the same z while the lateral and vertical
+    // separations from the grip do not move at all. Solving
+    // `dx² + dy² + (dz − fix)² = ARM_REACH²` for `fix` is therefore exact.
+    {
+      let fix = 0;
+      for (let side = 0; side < 2; side++) {
+        const sh = rig.worldPos[side === 0 ? B_UARML : B_UARMR];
+        const hand = side === 0 ? aHandL : aHandR;
+        const dx = hand.x - sh.x, dy = hand.y - sh.y, dz = hand.z - sh.z;
+        const rem = ARM_REACH * ARM_REACH - dx * dx - dy * dy;
+        // rem <= 0 means the grip is out of reach on the lateral/vertical legs
+        // alone; the best we can do is put the shoulder level with it in z.
+        const m = rem > 0 ? Math.sqrt(rem) : 0;
+        let f = 0;
+        if (dz < -m) f = dz + m;            // too far back  -> pull forward
+        else if (dz > m) f = dz - m;        // too far forward -> push back
+        if (Math.abs(f) > Math.abs(fix)) fix = f;
+      }
+      if (Math.abs(fix) > 1e-4) {
+        rig.localPos[B_PELVIS].z += fix;
+        fk(rig);
+      }
+    }
 
     // ---- gaze --------------------------------------------------------------
     if (!crashed) {
@@ -3431,7 +3596,7 @@ export function createRider(ctx) {
       const left = side === 0;
       const iC = left ? B_CLAVL : B_CLAVR, iU = left ? B_UARML : B_UARMR,
             iL = left ? B_LARML : B_LARMR, iH = left ? B_HANDL : B_HANDR;
-      const grip = left ? aGripL : aGripR, other = left ? aGripR : aGripL;
+      const hand = left ? aHandL : aHandR, bar = left ? aBarL : aBarR;
       const sgn = left ? -1 : 1;
 
       // Shrug the shoulders a little when braced or crouched.
@@ -3444,16 +3609,11 @@ export function createRider(ctx) {
       rig.worldPos[iU].copy(rig.restLocal[iU]).applyQuaternion(rig.worldQuat[iC])
         .add(rig.worldPos[iC]);
 
-      // C3 — palm centre, not bar centre. HAND_IN inboard of the grip's outer
-      // end so the glove sits WITHIN the grip's length, and HAND_UP above the
-      // bar axis so the palm rests on top of it and the fingers (built as arcs
-      // about that axis) close underneath. Round 3: "the bar passes through the
-      // glove volume and the grip re-emerges outboard".
-      _v6.copy(other).sub(grip);
-      if (_v6.lengthSq() < 1e-6) _v6.set(-sgn, 0, 0);
-      _v6.normalize();                              // inboard along the bar
-      _v0.copy(grip).addScaledVector(_v6, HAND_IN);
-      _v0.y += HAND_UP;
+      // C3 — the palm centre (`aHandL/R`) and the inboard bar axis (`aBarL/R`)
+      // were built from the grips at the top of update(), because the reach
+      // clamp needs them before the spine is committed. Round 3: "the bar
+      // passes through the glove volume and the grip re-emerges outboard".
+      _v0.copy(hand);
 
       // Pole: C4 — elbows OUTBOARD of the torso silhouette. The lateral term now
       // dominates (0.98 vs 0.58) and the rearward term is cut, which is what
@@ -3464,7 +3624,7 @@ export function createRider(ctx) {
 
       // Hand: fingers wrap the bar (long axis inboard), back of the hand follows
       // the forearm so the wrist does not read as broken.
-      _v11.copy(_v6);
+      _v11.copy(bar);
       solveLimb(iU, iL, iH, _v0, _v2, _v11, null);
     }
 

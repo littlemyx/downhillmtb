@@ -23,6 +23,14 @@
 //     development. `trick:landed` wins over `bike:landed` once it has fired even once.
 //   * `ctx.engine.stats` is used for the debug block (engine is not in CONTRACT §2 but is
 //     assigned by main.js and documented in ADDENDUM §G's spirit).
+//   * R9 balance cue: the key glyph is the only place the HUD hard-codes a binding.
+//     CONTRACT §7 does not publish a name→key map, so it is derived from the shipped
+//     input.js mapping (W = pitch +1 = weight forward, S = pitch −1 = weight back;
+//     stick Y is inverted into the same convention) and from `input.hasGamepad`.
+//     If input.js ever publishes a binding table, read it instead. Note that
+//     input.js's own inline comment on the stick axis states the OPPOSITE sign
+//     convention to its code and to bike.js — the code and bike.js agree, the
+//     comment is stale, and this module follows the code.
 
 import { clamp, clamp01, damp } from '../core/rng.js';
 
@@ -42,6 +50,40 @@ const GA = { cx: 150, cy: 140, r: 116, a0: 196, a1: 344, w: 300, h: 124 };
 const GEAR_COUNT = 12;
 /** Pseudo-cassette: km/h at which each gear "engages". Non-linear, like a real 1x12. */
 const GEAR_SPEEDS = [0, 5, 9, 13, 17.5, 22, 27, 32.5, 38.5, 45, 52.5, 61];
+
+// ---------------------------------------------------------------------------
+// R9 — rider balance.
+//
+// The rear load fraction is taken from `bike.state.wheels[i].load`, which
+// bike.js publishes in newtons. Nothing here re-derives it from grade, from the
+// input axis, or from a free-body diagram: the whole point of the affordance is
+// that it shows what the tyres are actually carrying.
+//
+// Where the dot sits: for a two-wheeled body, the front load fraction IS the
+// centre of mass's position along the wheelbase measured from the rear axle
+// (N_front/W = b/L, b = CG-to-rear-axle). So one measured number places the dot,
+// with no model in between.
+//
+// Calibration and its provenance, stated so it is not re-litigated. bike.js's
+// static split is FRONT_BIAS 0.45, i.e. a rear fraction of 0.55 on the flat.
+// The one published measurement of this quantity on steep ground (round 8, 45%
+// grade) puts an un-shifted rider at ~0.13 rear and a shifted one at ~0.33. So
+// BAL_LO sits just above the value that was measured to be unrideable, and
+// BAL_HI between the two — the caution arrives before the state does, which is
+// the entire job. Those are static free-body figures and the live loads will
+// not match them exactly, so nothing here is a hard trip: the dot ramps
+// continuously against the band and only the cue is discrete — and the cue is
+// hysteretic, gated on grade, and suppressed once the player is already at full
+// shift, because at that point it has nothing left to tell them.
+const BAL_LO = 0.16;           // rear fraction — the state that precedes an OTB
+const BAL_HI = 0.25;           // rear fraction — caution
+const BAL_FRONT_LO = 0.18;     // front fraction below this = looping out
+const BAL_CUE_GRADE = 0.16;    // no cue below this grade; balance is not the story
+const BAL_CUE_HOLD = 0.60;     // s the cue holds after the state clears
+const BAL_X0 = 0.17, BAL_X1 = 0.83;   // rail extent, as fractions of the box
+// bike.js publishes `state.riderFore` in metres (+ = forward) and T.RIDER_SHIFT
+// is its full-deflection value. This is only a scale, not a re-derivation.
+const RIDER_SHIFT = 0.30;
 
 const AIR_MIN_SHOW = 0.16;     // s airborne before the counter appears
 const AIR_HOLD = 1.05;         // s the final value is held after touchdown
@@ -633,6 +675,148 @@ const CSS = `
 }
 #dsc-hud .incl.steep + .grade-num, #dsc-hud .grade-num.steep { color: var(--hot); }
 
+/* ---- balance (R9) --------------------------------------------------------
+   A side elevation of the wheelbase, tilted by the same grade the inclinometer
+   shows, with the rider's measured centre of mass sliding along it. On a steep
+   the dot runs toward the front axle on its own; the only thing that pulls it
+   back is the player. Fades out when balance is not the story. */
+#dsc-hud .mod-bal {
+  position: relative;
+  opacity: 0.26;
+  transition: opacity 380ms var(--e-out);
+}
+#dsc-hud .mod-bal.live { opacity: 1; }
+#dsc-hud .bal {
+  /* One box width drives every horizontal position below, so the JS can work
+     in unitless 0..1 fractions of the wheelbase and never touch layout. */
+  --bw: calc(var(--u) * 6.1);
+  position: relative;
+  width: var(--bw);
+  height: calc(var(--u) * 3.6);
+  border-radius: calc(var(--u) * 0.5);
+  overflow: hidden;
+  background: rgba(5,9,14,0.50);
+  box-shadow: inset 0 0 0 1px var(--hair);
+}
+#dsc-hud .bal-rot {
+  position: absolute;
+  left: 0; top: 0; width: 100%; height: 100%;
+  transform: rotate(var(--a, 0deg));
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
+/* The rail runs rear (left) -> front (right); +grade rotates it nose-down to
+   the right, which is the direction of travel. */
+#dsc-hud .bal-rail {
+  position: absolute;
+  /* 17% inset, not 14%: at the ±46° clamp the rail end plus the dot radius
+     then still clears the box, so nothing is ever clipped by the overflow. */
+  left: 17%; right: 17%; top: 50%;
+  height: calc(var(--u) * 0.16);
+  margin-top: calc(var(--u) * -0.08);
+  border-radius: 999px;
+  background: rgba(214,228,242,0.24);
+}
+#dsc-hud .bal-axle {
+  position: absolute;
+  top: 50%;
+  width: calc(var(--u) * 0.34);
+  height: calc(var(--u) * 0.34);
+  margin: calc(var(--u) * -0.17) 0 0 calc(var(--u) * -0.17);
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1.5px rgba(214,228,242,0.42);
+}
+#dsc-hud .bal-axle.rear { left: 17%; }
+#dsc-hud .bal-axle.front { left: 83%; }
+/* Safe band: where the rear tyre still has enough load to steer. */
+#dsc-hud .bal-zone {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--z0, 0.29) * var(--bw));
+  width: calc(var(--zw, 0.38) * var(--bw));
+  height: calc(var(--u) * 0.86);
+  margin-top: calc(var(--u) * -0.43);
+  border-radius: calc(var(--u) * 0.2);
+  background: rgba(125,238,255,0.13);
+  box-shadow: inset 0 0 0 1px rgba(125,238,255,0.30);
+  transition: background-color 260ms var(--e-out), box-shadow 260ms var(--e-out);
+}
+#dsc-hud .mod-bal.warn .bal-zone {
+  background: rgba(255,106,43,0.15);
+  box-shadow: inset 0 0 0 1px rgba(255,106,43,0.46);
+}
+/* The commanded shift — a caret under the rail. This is the player's own
+   input, shown separately from its result so the control reads as connected. */
+#dsc-hud .bal-cmd {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: calc(var(--u) * 0.52);
+  height: calc(var(--u) * 0.30);
+  margin: calc(var(--u) * 0.52) 0 0 calc(var(--u) * -0.26);
+  transform: translate3d(calc(var(--x, 0.5) * var(--bw)), 0, 0);
+  will-change: transform;
+  background: var(--dim);
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+  opacity: 0.0;
+  transition: opacity 220ms var(--e-out), background-color 220ms var(--e-out);
+}
+#dsc-hud .mod-bal.cmd .bal-cmd { opacity: 0.95; }
+#dsc-hud .mod-bal.cmd.shifting .bal-cmd { background: var(--accent); }
+/* The result — where the mass actually is, from the measured wheel loads. */
+#dsc-hud .bal-dot {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: calc(var(--u) * 0.62);
+  height: calc(var(--u) * 0.62);
+  margin: calc(var(--u) * -0.31) 0 0 calc(var(--u) * -0.31);
+  border-radius: 999px;
+  background: var(--paper);
+  box-shadow: 0 0 0 calc(var(--u) * 0.12) rgba(4,7,11,0.62), 0 0 10px rgba(255,255,255,0.35);
+  transform: translate3d(calc(var(--x, 0.47) * var(--bw)), 0, 0);
+  will-change: transform;
+  transition: background-color 240ms var(--e-out);
+}
+#dsc-hud .mod-bal.warn .bal-dot { background: var(--hot); }
+#dsc-hud .mod-bal.air .bal { opacity: 0.34; }
+/* The cue. Sits above the strip on its own line so it can never reflow the
+   telemetry row, and it states the condition rather than scolding. */
+#dsc-hud .bal-cue {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: calc(var(--u) * 0.34);
+  display: flex;
+  align-items: center;
+  gap: calc(var(--u) * 0.34);
+  white-space: nowrap;
+  opacity: 0;
+  transform: translate3d(calc(var(--u) * 0.5), 0, 0);
+  transition: opacity 200ms var(--e-out), transform 320ms var(--e-out);
+  will-change: transform, opacity;
+}
+#dsc-hud .mod-bal.cue .bal-cue { opacity: 1; transform: translate3d(0,0,0); }
+#dsc-hud .bal-cue-txt {
+  font-size: var(--t-micro);
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--hot);
+  text-shadow: var(--shadow);
+}
+#dsc-hud .bal-key {
+  font-family: var(--f-num);
+  font-size: var(--t-micro);
+  font-weight: 700;
+  line-height: 1;
+  color: var(--paper);
+  padding: calc(var(--u) * 0.16) calc(var(--u) * 0.30);
+  border-radius: calc(var(--u) * 0.2);
+  background: rgba(4,7,11,0.55);
+  box-shadow: inset 0 0 0 1px rgba(255,106,43,0.55);
+}
+
 /* brakes */
 #dsc-hud .brk-set { display: flex; gap: calc(var(--u) * 0.42); align-items: flex-end; }
 #dsc-hud .brk { display: flex; flex-direction: column; align-items: center; gap: calc(var(--u) * 0.22); }
@@ -881,6 +1065,7 @@ export function createHud(ctx) {
     airborne: false, airTime: 0, lastAirTime: 0, crashed: false, crashTimer: 0,
     brakeFront: 0, brakeRear: 0, pedalling: 0, gForce: 1, surface: 0,
     trailT: 0, distance: 0, lean: 0, offTrail: false, whip: 0, skid: 0,
+    riderFore: 0, wheels: null,
   };
 
   // =========================================================================
@@ -962,6 +1147,28 @@ export function createHud(ctx) {
   h('div', 'incl-ground', inclRot);
   h('div', 'incl-hub', inclBox);
   const elGrade = h('div', 'grade-num num', gradeBody, '0%');
+
+  // ---- balance (R9) ------------------------------------------------------
+  const modBal = h('div', 'mod mod-bal', clTele);
+  h('div', 'lbl', modBal, 'Balance');
+  const balBody = h('div', 'mod-body', modBal);
+  const balBox = h('div', 'bal', balBody);
+  const balRot = h('div', 'bal-rot', balBox);
+  h('div', 'bal-rail', balRot);
+  h('div', 'bal-axle rear', balRot);
+  h('div', 'bal-axle front', balRot);
+  const balZone = h('div', 'bal-zone', balRot);
+  const balCmdEl = h('div', 'bal-cmd', balRot);
+  const balDot = h('div', 'bal-dot', balRot);
+  const balCue = h('div', 'bal-cue', modBal);
+  const elBalCue = h('div', 'bal-cue-txt', balCue, 'Rear Light');
+  const elBalKey = h('div', 'bal-key', balCue, 'S');
+  // The band is fixed in wheelbase terms — it is the dot that moves — so it is
+  // written once, here, from the same constants the warning states use.
+  balZone.style.setProperty('--z0',
+    (BAL_X0 + (BAL_X1 - BAL_X0) * BAL_FRONT_LO).toFixed(4));
+  balZone.style.setProperty('--zw',
+    ((BAL_X1 - BAL_X0) * (1 - BAL_HI - BAL_FRONT_LO)).toFixed(4));
 
   const modBrake = h('div', 'mod mod-brake', clTele);
   h('div', 'lbl', modBrake, 'Brakes');
@@ -1083,6 +1290,7 @@ export function createHud(ctx) {
     tMain: '', tFrac: '', best: -1,
     progress: -1, ghost: -2, pct: -1,
     grade: -999, gradeDeg: -999, gradeTxt: '', gear: -1,
+    balDot: -9, balCmd: -9,
     brakeF: -1, brakeR: -1,
     styleV: -1, mult: -1, score: -1,
     air: '', vig: -1, shakeOn: false,
@@ -1093,6 +1301,13 @@ export function createHud(ctx) {
   let peakSpeed = 0;
   let dispGrade = 0;        // damped, signed: + = descending
   let groundGrade = 0;      // last on-the-ground reading, held through flights
+
+  // R9 balance. `balRear` holds its last grounded value through a flight, where
+  // both wheel loads are zero and the fraction has no meaning.
+  let balRear = 1 - 0.45;   // bike.js FRONT_BIAS — the static split, as a seed
+  let balCueT = 0;
+  let balCueTxt = 'Rear Light';
+  let balCueKey = 'S';
 
   let airVisible = false;
   let airHold = 0;
@@ -1245,6 +1460,8 @@ export function createHud(ctx) {
     styleCharge = 0;
     peakSpeed = 0;
     damage = 0;
+    balRear = 1 - 0.45;
+    balCueT = 0;
     for (const p of progPips) setFlag(p, 'done', false);
     countBox.classList.remove('on');
     showBanner('Go', '', 'good', 1100);
@@ -1346,6 +1563,9 @@ export function createHud(ctx) {
   on('bike:respawn', () => {
     damage = Math.min(damage, 0.25);
     styleCharge = 0;
+    // A respawn must not inherit the balance state that caused the crash.
+    balRear = 1 - 0.45;
+    balCueT = 0;
   });
 
   // =========================================================================
@@ -1489,7 +1709,12 @@ export function createHud(ctx) {
     const deg = clamp(Math.atan(dispGrade) * 180 / Math.PI, -46, 46);
     if (Math.abs(deg - last.gradeDeg) > 0.12) {
       last.gradeDeg = deg;
-      inclRot.style.setProperty('--a', deg.toFixed(2) + 'deg');
+      const a = deg.toFixed(2) + 'deg';
+      inclRot.style.setProperty('--a', a);
+      // The balance rail is the same slope seen from the side, so it must use
+      // the same number — a descent tilts it nose-down to the right, which is
+      // the direction of travel.
+      balRot.style.setProperty('--a', a);
     }
     const gradePct = Math.round(dispGrade * 100);
     if (gradePct !== last.grade) {
@@ -1500,6 +1725,70 @@ export function createHud(ctx) {
       const steep = Math.abs(gradePct) > 24;
       setFlag(inclBox, 'steep', steep);
       setFlag(elGrade, 'steep', steep);
+    }
+
+    // ---- balance (R9) -----------------------------------------------------
+    // Weight shift decides whether the steep sections are rideable at all, and
+    // nothing else on screen says so. This teaches it the way a racing game
+    // teaches: by making the consequence visible while it is still avoidable.
+    const wheels = bs.wheels;
+    const wF = wheels && wheels[0], wR = wheels && wheels[1];
+    const loadF = wF && Number.isFinite(wF.load) ? Math.max(0, wF.load) : 0;
+    const loadR = wR && Number.isFinite(wR.load) ? Math.max(0, wR.load) : 0;
+    const loadSum = loadF + loadR;
+    // 40 N is well under the noise floor of a wheel that is genuinely carrying
+    // something; below it (or airborne, or crashed) the fraction is meaningless
+    // and the module holds its last reading rather than snapping to centre.
+    const grounded = loadSum > 40 && !bs.airborne && !bs.crashed;
+    if (grounded) balRear = damp(balRear, loadR / loadSum, 7, d);
+    const frontFrac = clamp01(1 - balRear);
+
+    const riderFore = Number.isFinite(bs.riderFore) ? bs.riderFore : 0;
+    const balCmd = clamp(riderFore / RIDER_SHIFT, -1, 1);
+
+    const balSteep = Math.abs(dispGrade) > BAL_CUE_GRADE;
+    const rearLight = balRear < BAL_HI;
+    const rearCrit = balRear < BAL_LO;
+    const frontLight = frontFrac < BAL_FRONT_LO;
+    const balWarn = grounded && (rearLight || frontLight);
+
+    // The cue names the state; it does not scold, and it goes quiet the moment
+    // the player is already doing everything the control can do.
+    let cueTxt = '';
+    if (grounded && balSteep && rearCrit && balCmd > -0.75) cueTxt = 'rear';
+    else if (grounded && frontLight && balCmd < 0.75) cueTxt = 'front';
+    if (cueTxt) {
+      const pad = !!(ctx && ctx.input && ctx.input.hasGamepad);
+      balCueTxt = cueTxt === 'rear' ? 'Rear Light' : 'Front Light';
+      balCueKey = cueTxt === 'rear' ? (pad ? '↓' : 'S') : (pad ? '↑' : 'W');
+      balCueT = BAL_CUE_HOLD;
+    } else if (balCueT > 0) {
+      balCueT = Math.max(0, balCueT - d);
+    }
+    const cueOn = balCueT > 0 && !bs.crashed;
+    if (cueOn) { setText(elBalCue, balCueTxt); setText(elBalKey, balCueKey); }
+
+    setFlag(modBal, 'live',
+      balSteep || balWarn || cueOn || Math.abs(balCmd) > 0.12);
+    setFlag(modBal, 'warn', balWarn);
+    setFlag(modBal, 'air', !grounded);
+    setFlag(modBal, 'cmd', Math.abs(balCmd) > 0.06);
+    setFlag(modBal, 'shifting', balCmd < -0.25);
+    setFlag(modBal, 'cue', cueOn);
+
+    // Front load fraction is the CG's position along the wheelbase from the
+    // rear axle, so it places the dot directly.
+    const dotF = BAL_X0 + (BAL_X1 - BAL_X0) * frontFrac;
+    if (Math.abs(dotF - last.balDot) > 0.0015) {
+      last.balDot = dotF;
+      balDot.style.setProperty('--x', dotF.toFixed(4));
+    }
+    // The caret is the raw command, on its own small scale about the centre of
+    // the rail — it is the input, not a second claim about where the mass is.
+    const cmdF = 0.5 + balCmd * 0.20;
+    if (Math.abs(cmdF - last.balCmd) > 0.0015) {
+      last.balCmd = cmdF;
+      balCmdEl.style.setProperty('--x', cmdF.toFixed(4));
     }
 
     // ---- brakes -----------------------------------------------------------
