@@ -8,6 +8,43 @@
 // documented in the CONTRACT-NOTEs below.
 // =============================================================================
 //
+// CONTRACT-NOTE (WHAT CHANGED IN THE ROUND THAT ADDED R_PLAN_MIN — read this
+//   first, the three fixes are independent and each has its own long note):
+//
+//   (A) THE JUMP LINE IS NOW PACED AT THE SPEED ITS OWN FEATURES PUBLISH.
+//       `safety.jumpWindowBad` was 20 of 32 air features across four seeds —
+//       every one of them BELOW the minimum of its own published speed window,
+//       i.e. the design telling the rider to case every jump on the course. It
+//       is now 0 of 24 on the three buildable seeds, with `jumpOverSpeed` still
+//       0. Three things had to be right: computeVertKappa() must not price a
+//       lip's own convexity as unwanted relief (S.hBal); leanBudgetAt() and
+//       brakeAccel() must not price a lip as a 100% hillside (S.gradeR); and
+//       buildJump() must cap its RUN-IN at the approach speed rather than at the
+//       takeoff speed, or the fixed point ratchets a jump out of existence one
+//       lip-climb per pass. Then build() iterates features-and-profile to a
+//       fixed point (JUMP_FIT_ITERS).
+//
+//   (B) THE COURSE NO LONGER SHIPS SUB-10 m CORNERS. Every seed carried a
+//       4.8-5.5 m plan radius; the shipped minimum is now 10.5-16.5 m and no
+//       station on any seed is inside R_PLAN_MIN. Fixed at the march
+//       (SB_RADIUS, the turn-authority bound) rather than downstream, because
+//       the hairpin lock in openTightCorners() is real — re-measured this round
+//       on the respaced line — and a hairpin that is authored tight cannot be
+//       opened afterwards.
+//
+//   (C) CONTRACT §4's DESCENT RULE IS MEASURED AS A PROPERTY. DESC_MAX_RUN
+//       counts CONSECUTIVE non-descending stations and a 10 micrometre dip
+//       resets it, so the reference seed reported 11.2 m while shipping 89.4 m
+//       that never got back below its own start. `safety.flatRunShipped` is the
+//       property; enforceDescentShipped() now enforces a windowed net-descent
+//       rule; and the variant budget is spent on the property, not the counter.
+//
+//   ...and the build now REFUSES a course whose shipped profile carries a wall.
+//   See the wall gate at the end of build(): seed 12345 ships 12.2 m of ground
+//   at up to a 93% committed gradient, on which the measured lean budget is
+//   zero at any radius, bank or speed. It now fails generation loudly, as seed 2
+//   does. Two of five seeds refuse; three build.
+//
 // CONTRACT-NOTE: `trail` exposes some additive read-only fields beyond §4 that other
 //   modules may find useful (all optional to consume, nothing in §4 changed):
 //     trail.cornerAudit -> the lean-identity audit, one row per corner, with a
@@ -83,18 +120,25 @@
 //   (20260726), the jump line builds as:
 //
 //     feature        takeoff        lip          landing  gap    air    window
-//     tabletop       15.5 m/s 56 km/h  0.92 m @ 10°  12.2 m  6.7 m  0.87 s  7.3–20.5 m/s
-//     double-1       14.0 m/s 51 km/h  0.98 m @ 15°  13.1 m  5.6 m  1.05 s  10.4–19.4
-//     double-2       13.0 m/s 47 km/h  0.98 m @ 24°  15.0 m 11.1 m  1.36 s  12.2–16.6
-//     road gap (A)   11.7 m/s 42 km/h  1.06 m @ 30°  15.6 m 12.2 m  1.52 s  11.0–15.2
-//     step-down      14.0 m/s 50 km/h  0.72 m @ 15°  16.9 m 13.9 m  1.33 s  13.2–20.7
-//     rock double    10.9 m/s 39 km/h  0.66 m @ 12°   7.5 m  4.1 m  0.76 s  9.6–14.8
-//     finish booter  17.5 m/s 63 km/h  0.72 m @ 16°  19.8 m 15.6 m  1.25 s  16.8–21.3
+//     tech drop       8.97 m/s 32 km/h  1.25 m @  0°   4.5 m  3.2 m  0.53 s  4.8–17.0 m/s
+//     tabletop        9.89 m/s 36 km/h  0.92 m @ 14°   7.5 m  4.1 m  0.83 s  4.8–16.4
+//     double-1        9.16 m/s 33 km/h  0.98 m @ 19°   7.6 m  4.2 m  0.93 s  8.1–17.4
+//     double-2        9.39 m/s 34 km/h  0.98 m @ 26°   9.2 m  5.2 m  1.10 s  8.1–17.1
+//     road gap (A)    9.06 m/s 33 km/h  1.06 m @ 30°   9.7 m  6.2 m  1.25 s  8.0–15.9
+//     step-down       7.24 m/s 26 km/h  0.72 m @ 25°   5.8 m  3.2 m  0.92 s  6.1–13.8
+//     slab roll       7.29 m/s 26 km/h  1.64 m @  0°   4.2 m  2.9 m  0.61 s  3.9–13.8
+//     finish booter   9.74 m/s 35 km/h  0.72 m @ 19°   7.9 m  3.6 m  0.90 s  7.6–16.9
 //
-//   (Re-measured this round. The table above had drifted from the shipped build
-//   by up to 3 m of landing distance; the numbers here are what solveJump()
-//   actually emits on seed 20260726, and they are bit-identical before and after
-//   every change made this round — the jump line is untouched.)
+//   RE-MEASURED, AND THE JUMPS ARE SMALLER THAN THE TABLE THIS REPLACES. That is
+//   the fix, not a regression. The previous table's takeoffs of 11.7-17.5 m/s
+//   describe features solved for a pace the course never delivered: the profile
+//   that shipped paced their lips at 5.4-6.2 m/s, BELOW the vMin of their own
+//   published windows, on 20 of 32 air features across four seeds. These numbers
+//   are what the corridor actually carries, and the shipped design speed at every
+//   lip is now inside its own window on every buildable seed
+//   (`safety.jumpWindowBad` = 0, `jumpOverSpeed` = 0). A 9 m/s takeoff off a 30°
+//   lip carrying 9.7 m with 1.25 s of air is a real road gap; a 19.8 m landing
+//   nobody arrives fast enough to reach is not.
 //
 //   "landing" is the horizontal distance from the lip to where the arc meets the
 //   base grade; "gap" is lip-to-knuckle; "window" is the range of takeoff speeds
@@ -358,6 +402,57 @@ const JUMP_OUT_MAX = 34.0;
 // speed at its lip. 1.00 = no derate; see the note in buildJump() for the
 // measurement that rejected 0.85.
 const JUMP_V_DERATE = 1.00;
+// ---------------------------------------------------------------------------
+// THE JUMP-LINE FIXED POINT. See buildJump() and the loop in build().
+//
+// The pace at a lip and the feature built there determine each other, and until
+// this round nobody solved the pair: the features were built once, against the
+// pace of ground that did not yet carry them, and the profile was then solved
+// against the ground that did. `safety.jumpWindowBad` measured the residual at
+// 20 of 32 features across four seeds and every audit since round 8 has named
+// it. These four constants are the whole of the fix's tuning surface.
+//
+// Iterations. The map converges fast because it is close to a contraction — the
+// delivered pace is a smooth, weakly-varying function of the lip height, and the
+// lip height is a square-root function of the pace. Measured across four seeds,
+// the residual is zero after 2-3 passes and never improves after 4.
+const JUMP_FIT_ITERS = 4;
+// Relaxation on the pace update. A raw fixed-point step (take the delivered
+// speed as the next approach speed) can oscillate on a feature whose delivered
+// pace is set by a corner cap just downstream: the jump shrinks, the corner cap
+// stops binding, the jump grows again. Under-relaxing kills that without
+// slowing convergence measurably.
+const JUMP_FIT_RELAX = 0.65;
+// The takeoff speed the authored jump-line rhythm (11 / 13 / 15 / 19 / 16 m of
+// carry) was sized for — i.e. the number `opt.targetD` means. Landing distance
+// is ballistic and scales as v^2, so a feature reached at a different pace is
+// scaled by (vTO/V_JUMP_REF)^2 and the line keeps its rhythm at whatever speed
+// the corridor delivers. Taken from the shipped ballistics table at the head of
+// this file: the five jump-line features publish takeoffs of 11.7-14.0 m/s.
+const V_JUMP_REF = 12.0;
+// The most of the approach's kinetic energy a lip may take. Climbing the lip
+// costs 2*g*lipH*0.85 of v^2, so a 0.98 m lip costs 16.3 m^2/s^2 — 45% of the
+// energy at 6 m/s and 11% at 12. Past about a third the takeoff is slower than
+// the jump needs whatever the rider does, and the feature is a speed bump with
+// a hole after it. 0.35 keeps vTO >= 0.8*vApproach everywhere.
+const JUMP_LIP_KE = 0.35;
+// Below this takeoff speed a lip is not a jump. It was 8.0 m/s, which is the
+// right number for a jump-line feature and refuses a legitimate small double in
+// a slow phase; with the lip now sized to the pace the geometry stays honest
+// further down, and solveJump's own `D < 3.5 m` gate is what finally refuses.
+// Below this takeoff speed a lip is not a jump. It is V_DESIGN_FLOOR, and that
+// is not a coincidence: designCap() floors the design speed at V_DESIGN_FLOOR,
+// so a feature solved for a takeoff BELOW the floor publishes a ballistic cap
+// the speed solve is not allowed to honour, and the profile then paces the lip
+// faster than the jump was built for — `safety.jumpOverSpeed`, the exact defect
+// this round is closing, inverted. A jump the corridor cannot deliver the floor
+// speed to is a jump that does not belong there; buildFeatures reports it as a
+// loss (safety.jumpFitLostWhy) rather than shipping it.
+const JUMP_V_MIN = V_DESIGN_FLOOR;
+// The shortest carry worth calling a jump, metres, and the distance a scaled
+// target is floored at. solveJump refuses anything under 3.5 m outright; aiming
+// at 4.5 keeps the solve off that gate at the slowest pace a lip is built at.
+const JUMP_D_MIN = 4.5;
 // EXEMPT THE BALLISTIC CORE FROM THE LAUNCH-SPEED CAP? MEASURED: NO, AND THE
 // NUMBER IS THE REASON.
 //
@@ -385,13 +480,30 @@ const JUMP_V_DERATE = 1.00;
 // the residual: 16 of 32 features on the four seeds are outside their own
 // window). Until that is done the honest default is the conservative one.
 //
-// Kept as a named constant, with the measurement, so it is not re-derived.
+// SUPERSEDED, AND KEPT `false` WITH THE MEASUREMENT SO IT IS NOT RE-DERIVED.
+// The diagnosis above is right and the instrument is wrong. The defect is that
+// the launch cap MEASURES a jump's own lip as unwanted relief; the fix is to
+// stop measuring it, not to stop applying the cap. computeVertKappa() now prices
+// the constraint on the profile with the authored ballistic relief subtracted
+// (S.hBal), which fixes the RUN-IN — where the defect actually is, because the
+// stencil ladder runs to 12.8 m — while leaving the cap binding on the knuckle,
+// the landing and the run-out, where this switch would have removed it. With
+// that plus the fixed point in build(), `safety.jumpWindowBad` is 0 of 24 air
+// features on the three buildable seeds and `jumpOverSpeed` is 0.
 const JUMP_PACE_EXEMPT = false;
 // Braking bumps on a jump run-in. Measured at 45 mm / 1.1 m they cost the
 // approach 45% of its speed through chatterKappa(); measured WITH the pace
 // exemption off, removing them changes the autopilot by less than one cell on
 // every seed. Left on, because they are deliberate trail design and the
 // evidence for removing them is not there.
+//
+// RE-EXAMINED THIS ROUND AND STILL ON, but the measurement above should be read
+// with its confound stated: it was taken while the launch cap was pricing every
+// lip as relief, so the jump line was already pinned at V_DESIGN_FLOOR and
+// removing the bumps could not change anything. With that fixed the bumps are no
+// longer masked — and the delivered approach speeds on the jump line are 8.7 to
+// 10.6 m/s with them still on, so they are not what binds either. A measurement
+// taken behind a saturated constraint is not evidence; this one now is.
 const JUMP_RUNIN_BUMPS = true;
 
 // ---------------------------------------------------------------------------
@@ -1038,12 +1150,83 @@ const FEAS_R_MAX = 400.0;
 // stamp cloud reconstructing its own section, 0.92 for terrain's band limit.
 // Both are terrain.js's own published measurements, not fitted here.
 const BERM_REALISE = 0.95 * 0.92;
-// The switchback the march builds is a fixed 6.5 m radius reversal.
-const SB_RADIUS = 6.5;
+// ===========================================================================
+// R_PLAN_MIN — THE MINIMUM PLAN RADIUS THE COURSE MAY SHIP, AND ITS DERIVATION.
+//
+// THE DEFECT, named. Eleven rounds of tuning left every seed shipping a corner
+// of 4.8-5.5 m plan radius (+-4 m circumradius on the committed centreline):
+// 20260726 arc 286 r 5.11, 777 arc 726 r 4.81, 12345 arc 392 r 4.96, 99999 arc
+// 600 r 5.48. Seed 777's is the first wall on the seed the audits call closest
+// to shippable. Round 9 answered it by CAPPING THE SPEED below HAIRPIN_R0, and
+// that cannot work, because the speed cannot go below V_DESIGN_FLOOR: the whole
+// design is built on the finding that asking a rider to crawl a steep pitch
+// costs them the entire longitudinal budget in braking, which is what collapses
+// the lean ceiling in the first place (see designCap()). If the floor speed is
+// not rideable at that radius, the RADIUS is the defect.
+//
+// THE NUMBER, from this file's own physics and nothing else. At the apex the
+// rider must hold, against the tread,
+//
+//     leanContact = atan(v^2 / (g*r)) - bank_realised
+//
+// and the ground has to supply it. Evaluated where hairpins actually live —
+// the tech phases, on 35-45% ground, on ROOT/ROCK:
+//
+//   * bank: the tech phases cap at maxBank 0.30-0.35 rad (17.2-20.1 deg), of
+//     which BERM_REALISE = 0.874 survives to the ridden surface => 15.0-17.6 deg.
+//   * budget: leanBudget(0.35-0.45, 0, ROOT) = 16.2 deg down to 13.4 deg.
+//   * design share: this file never spends the whole budget — LEAN_DESIGN is 28
+//     of a measured 41.7 deg flat-ground ceiling, i.e. RIDE_USE = 0.596 — and a
+//     hairpin apex is the last place to start. Two thirds of (bank + budget) is
+//     19-22 deg, i.e. tan = 0.345-0.404.
+//
+//   r >= v^2 / (g * 0.345)  =  11.4 m at V_DESIGN_FLOOR (6.2 m/s)
+//                              8.9 m at SB_V_APEX      (5.5 m/s)
+//
+// AND IT AGREES WITH THE ONLY INDEPENDENT MEASUREMENT ANYONE HAS TAKEN OF IT.
+// The round-12 verifier drove the real bike.js over an analytic constant-radius
+// helicoid at the design floor speed on 15% ground, 9 cells per radius: r 7 m
+// clean 9/9, r 5.5 m 6/9. Their instrument certifies down to 7 m and starts
+// failing at 5.5 — precisely the band this course was shipping.
+//
+// 10.0 m is taken: above the 8.9 m apex-speed bound, below the 11.4 m
+// floor-speed bound (a hairpin apex IS paced at SB_V_APEX, not at the floor),
+// and carrying a clear margin over the 7 m the bike was measured clean at.
+const R_PLAN_MIN = 10.0;
+// The design target the geometry passes are aimed at, which has to sit ABOVE
+// R_PLAN_MIN because three separate operators downstream tighten a corner after
+// it is drawn: smoothPolyline + the CatmullRom resample, openTightCorners'
+// displacement budget, and benchLine's lateral shift. Measured across the four
+// seeds, the shipped +-4 m circumradius comes out at 0.75-0.85 of the radius the
+// march committed, so the target carries 30% over the floor.
+const R_PLAN_TARGET = 13.0;
+// The switchback the march builds is a fixed-radius reversal. It was 6.5 m —
+// which is R_PLAN_MIN's derivation run backwards: a 6.5 m apex at 5.5 m/s
+// demands atan(30.25/(9.81*6.5)) = 25.4 deg of contact lean, against 15-17 deg
+// of realised berm plus 13-16 deg of budget with NOTHING left unspent. It is
+// the tightest thing on the course and it was authored, not discovered.
+//
+// SWEPT, one process per arm, four seeds, plan radius measured on the RESPACED
+// committed centreline at the +-4 m acceptance stencil:
+//
+//     SB_RADIUS      6.5     9.0     11.0    13.0    16.0
+//     worst r        4.8     6.6     9.0     9.4     11.7
+//     stations <10 m 28-58   77-116  0-9     0-19    0
+//
+// 13.0 with the plan floor and the march turn cap below takes stations under
+// 10 m to ZERO on all four seeds with a worst radius of 10.1-13.9 m. 16.0 also
+// works and costs more of the mountain's character (it forces longer traverses
+// and fewer, flatter reversals), so the smaller number that clears the gate is
+// the one taken.
+const SB_RADIUS = R_PLAN_TARGET;
+// ...and what the control arm (`settings.trailSolver.feasible = false`) uses, so
+// that path still reproduces the pre-rideability build bit-identically. Every
+// geometry change this round makes is gated the same way; see readSolverOpts().
+const SB_RADIUS_LEGACY = 6.5;
 // ...and the speed a hairpin APEX is ridden at, which is not V_DESIGN_FLOOR.
 // The file's own note says it: at the apex the rider is at full lock, at minimum
 // speed, with the fall line across them. Gating at the general design floor
-// (6.2 m/s) demands 31.1 deg of contact lean from a 6.5 m radius and refuses
+// (6.2 m/s) demanded 31.1 deg of contact lean from the old 6.5 m radius and refused
 // every hairpin on ground steeper than about 37% in the tech phases — measured
 // on seed 99999, that refused ALL of them, and the route answered by running
 // straight down the fall line instead: minimum plan radius 5.4 -> 20.9 m,
@@ -1083,6 +1266,20 @@ const SB_FORCE_DRIFT = 2.4;
 // against the constant LEAN_DESIGN. It is the A/B control for everything the
 // rideability section above adds, and it is the ONLY way to attribute a change
 // in the acceptance figures to this round rather than to a moving mountain.
+//
+// EVERY CHANGE MADE IN THE ROUND THAT ADDED R_PLAN_MIN AND THE JUMP-LINE FIXED
+// POINT IS GATED ON IT TOO, and that is verified rather than asserted: with
+// `feasible: false` the current file and the previous cut produce byte-identical
+// carved heightfields, stamp counts, station tables, speed and bank on all four
+// buildable seeds. The gated items are SB_RADIUS and the reversal rate, the
+// march's turn-authority bound, the PLAN_MIN_R floor, ROUTE_MIN_R, the variant
+// and station-try budgets, the S.hBal subtraction in computeVertKappa(), the
+// ballistic-free grade in leanBudgetAt()/brakeAccel(), the split of a jump's
+// vFeat cap at its lip, the lip/target-distance sizing, the jump siting window,
+// the windowed descent pass, the shipped-radius variant gate and the wall gate.
+// Two of those were found only BECAUSE the identity was checked: the reversal
+// rate was written as a literal 0.46 where 3.0/6.5 is 0.46154, and a 0.3%
+// difference in it sends the march down a different fall line 600 m later.
 function readSolverOpts(settings) {
   const o = settings && settings.trailSolver;
   const dflt = {
@@ -2260,6 +2457,10 @@ export function createTrail(ctx) {
   const edgeN = makeNoise1D(dressRng, 512);
 
   const SOLVER = readSolverOpts(ctx.settings);
+  // Every constant this round moved has a legacy value the control arm restores.
+  const SB_R = SOLVER.feasible ? SB_RADIUS : SB_RADIUS_LEGACY;
+  const R_MIN_PLAN_EFF = SOLVER.feasible ? R_PLAN_MIN : 0;
+  const R_TARGET_EFF = SOLVER.feasible ? R_PLAN_TARGET : 0;
 
   // ---- station table (all Float32Array, built once) -----------------------
   let N = 0;
@@ -2279,6 +2480,28 @@ export function createTrail(ctx) {
   const fanTrace = [];      // per-CANDIDATE rows inside [traceFrom, traceTo] metres
   let crestMask = null;     // authored-relief mask; see countCrestViol()
   let ballisticMask = null; // lip->touchdown of every solved jump; see techSpeedCap()
+  // THE JUMP-LINE FIXED POINT'S STATE, and it is deliberately tiny.
+  //   featPace   feature name -> the approach speed to solve that feature at.
+  //              Empty on the first pass (buildJump/buildDrop then read S.speed,
+  //              exactly as before); on every pass after, it carries the speed
+  //              the profile ACTUALLY delivered at that feature's lip.
+  //   featPassRng  a stream buildFeatures() owns, re-derived from the seed at the
+  //              start of every pass. It exists so the iteration count is
+  //              invisible downstream: `featRng` is also read by buildStamps(),
+  //              and a second feature pass drawing from it would move the boulder
+  //              scatter as a side effect of a speed solve.
+  const featPace = new Map();
+  // Every airborne feature buildFeatures() ATTEMPTS, and why an attempt that
+  // failed did. A fixed point that converges by deleting features is not a fixed
+  // point, it is a retreat, and the first cut of this loop did exactly that:
+  // `jumpWindowBad` went to 0 while the four seeds went from 32 air features to
+  // 18. The pass score is therefore lexicographic on (features lost, features
+  // outside their window), never on the second alone.
+  const featAttempt = new Map();
+  let featPassRng = makeRng(subSeed(ctx.seed, 'trail:features:pass'));
+  /** The feature pass's own draw. The control arm keeps the shared stream so it
+   *  reproduces the pre-round build; see readSolverOpts(). */
+  const featDraw = () => (SOLVER.feasible ? featPassRng() : featRng());
   const group = new THREE.Group();
   group.name = 'trail';
 
@@ -3037,7 +3260,7 @@ export function createTrail(ctx) {
           // are the only thing keeping the route off the fall line.
           const apexRear = rearLoadFrac(apexFall, apexFall, 0);
           sbOk = apexRear >= RIDE_REAR_LO
-            && leanRequired(SB_V_APEX, SB_RADIUS) <= avail;
+            && leanRequired(SB_V_APEX, SB_R) <= avail;
           // The relief valve. A mountain with no flat ground anywhere must not
           // be able to forbid every switchback — the route would traverse to the
           // map edge and the corridor term would never get it back. Past
@@ -3057,15 +3280,25 @@ export function createTrail(ctx) {
 
       let ds, dHead;
       if (mode === 1) {
-        // Tight ~6.5 m radius reversal; keep the grade gentle through the apex so
-        // the inside of the turn isn't a step.
+        // The reversal, at SB_RADIUS. The heading step is DERIVED from the
+        // radius rather than written next to it as a comment: the previous cut
+        // had `dHead = 0.46` with `// ~6.5 m radius` beside it, which is true
+        // only for ds = 3.0, and a constant whose value and whose stated meaning
+        // can drift apart is a constant that will.
         ds = 3.0;
-        dHead = sbSign * 0.46;                       // 26.4° per 3 m ≈ 6.5 m radius
+        // The control arm keeps the literal 0.46 the previous cut wrote here:
+        // 3.0/6.5 = 0.46154, and a 0.3% difference in the reversal rate is
+        // enough to send the march down a different fall line 600 m later.
+        dHead = sbSign * (SOLVER.feasible ? ds / SB_R : 0.46);
         sbSteps++;
-        // Exit once we're heading firmly back across the hill.
+        // Exit once we're heading firmly back across the hill. The step budget
+        // scales with the radius, or a wider reversal runs out of steps
+        // mid-turn and ships a half-finished hairpin: a full 180 deg reversal
+        // needs pi/dHead steps, and the budget is twice that.
         const nowRate = Math.sin(head) * corRX + (-Math.cos(head)) * corRZ;
         const heading = Math.sin(head) * corDX + (-Math.cos(head)) * corDZ;
-        if ((nowRate * sbSign > 0.72 && heading > -0.15) || sbSteps > 26) {
+        const sbBudget = SOLVER.feasible ? Math.ceil(2 * Math.PI * SB_R / ds) : 26;
+        if ((nowRate * sbSign > 0.72 && heading > -0.15) || sbSteps > sbBudget) {
           mode = 0;
           lastSwitchback = travelled;
         }
@@ -3077,8 +3310,18 @@ export function createTrail(ctx) {
         // Turn authority: enough to shape the trail, and more when the fall line
         // is steeper than we want — that is how a builder bails onto a traverse
         // instead of dropping straight off the front of a face.
+        //
+        // AND BOUNDED BY R_PLAN_TARGET, which is the other half of the radius
+        // fix. The switchback is not the only way this march commits a tight
+        // corner: at ds = 6 m the authority ran to 0.56 rad, i.e. a 10.7 m
+        // marched radius before any smoothing, and the smoothing and resample
+        // then take 15-25% off it. Every downstream pass — openTightCorners, the
+        // bank solve, the hairpin speed cap — is a repair for geometry this line
+        // is free to author, so the bound belongs here, at the only place the
+        // radius is actually chosen.
         const steepNeed = clamp01((fallSteep - maxGrade) * 2.5);
-        const maxTurn = 0.18 + twist * 0.14 + steepNeed * 0.24;
+        const maxTurn = Math.min(R_TARGET_EFF > 0 ? ds / R_TARGET_EFF : Infinity,
+          0.18 + twist * 0.14 + steepNeed * 0.24);
         const K = 9;
         let bestS = -Infinity, bestD = 0;
         for (let k = -K; k <= K; k++) {
@@ -3190,7 +3433,7 @@ export function createTrail(ctx) {
         // Audit the step that was actually COMMITTED, at the radius it committed
         // to (a switchback commits SB_RADIUS by construction). This is the row
         // scoreRoute() and the admissibility check are read off.
-        const rC = mode === 1 ? SB_RADIUS
+        const rC = mode === 1 ? SB_R
           : (Math.abs(dHead) > 1e-4 ? Math.min(FEAS_R_MAX, ds / Math.abs(dHead)) : FEAS_R_MAX);
         corridorAt(terrain, x, z, Math.sin(head), -Math.cos(head), ph.width * 0.5, cTmp);
         corridorRide(terrain, x, z, head, ph, rC, bankFactorFor(cTmp.deficit), rTmp);
@@ -3451,7 +3694,12 @@ export function createTrail(ctx) {
   // trail — not a marched line that merely needs benching.
   const ROUTE_MAX_CLIMB = 12.0;       // m above the running low, marched line
   const ROUTE_MAX_FLAT = 90.0;        // m of continuous non-descending trail
-  const ROUTE_MIN_R = 5.0;            // m of plan radius on the marched line
+  // m of plan radius on the MARCHED line. Was 5.0, which is below anything the
+  // march can now author (SB_RADIUS and the turn-authority cap both bound it at
+  // R_PLAN_TARGET), so it could only ever pass. 9.0 is a real gate: measured,
+  // two of 24 variants on seed 20260726 march a 2.87-2.98 m corner despite those
+  // bounds, and both are now disqualified before their stations are built.
+  const ROUTE_MIN_R = 9.0;
   // Fraction of the marched line no bicycle can ride. This is a GROSS-FAILURE
   // gate, not the target: the target is carried by scoreRoute's -feasFrac*900,
   // which is a continuous preference and does the work on every ordinary seed.
@@ -3484,9 +3732,31 @@ export function createTrail(ctx) {
   // and reported on safety.flatShipped / safety.deadShipped — that one is the
   // acceptance figure and it is not inferred from these.
   const SHIP_MAX_FLAT = 18.0;
+  // ...AND THE ONE THE VARIANT BUDGET IS ACTUALLY SPENT ON, which is the
+  // PROPERTY and not the counter. See the note above enforceDescentShipped().
+  // SHIP_MAX_FLAT bounds the longest run of consecutive non-descending stations,
+  // which a 10 micrometre dip resets, so a base profile can read 11 m while
+  // carrying 89 m that never gets back below its own start — and that is what
+  // the reference seed was selecting on. SHIP_MAX_RUN bounds the stretch that
+  // ends at or above its own start and never drops below it, on the same base
+  // scale: enforceDescentShipped()'s windowed pass takes another 20-60% off it
+  // downstream where the excavation ceiling allows, so 26 m here lands the
+  // final figure near CONTRACT §4's ~15 m. Both are measured and published;
+  // `safety.flatRunShipped` is the acceptance figure and it is not inferred
+  // from this one.
+  const SHIP_MAX_RUN = 26.0;
   // Dead ground: a metre or two on a straight is a chute a rider rolls, and seed
   // 777 shipped 1.5 m of it and finished. Six is about a bike plus a reaction.
   const SHIP_MAX_DEAD = 12.0;
+  // ...and the HARD one, measured on the profile that ships rather than on the
+  // base profile, which refuses the build. See the wall gate at the end of
+  // build(). SHIP_MAX_DEAD above is a variant tie-break on the base profile;
+  // this is a statement that a course was produced that nobody can ride down.
+  const SHIP_HARD_DEAD = 8.0;
+  // CONTRACT §4's ~15 m, as the threshold at which the shipped non-descending
+  // RUN (the property, not the counter) is reported loudly. Warn, not throw —
+  // see the note at the call site.
+  const DESC_RUN_WARN = 20.0;
   // How many candidates build() will build stations for before it settles. Every
   // extra try costs one buildStations(), which is a small fraction of build();
   // the loop exits at the first candidate inside both limits, so on a healthy
@@ -3862,15 +4132,53 @@ export function createTrail(ctx) {
   // `rocks` keep genuinely tight turns — they are meant to be technical and
   // they are ridden slowly. The open, fast phases get radii a rider can carry
   // speed through.
-  const PLAN_MIN_R = {
-    start: 27, roots: 13, flow: 23, jumps: 27, slab: 15,
-    creek: 17, loam: 14, rocks: 15, sprint: 25,
-  };
+  //
+  // EVERY ENTRY IS FLOORED AT R_PLAN_MIN — the requirement, not R_PLAN_TARGET.
+  // The target is what the MARCH is bounded at, because a corner that is never
+  // authored tight needs no repair; asking this relaxation to reach the target
+  // as well puts 1291 of 6600 stations inside its trigger on the reference seed,
+  // spreads the PLAN_SHIFT_MAX displacement budget across all of them, and
+  // measurably leaves the worst corner TIGHTER than it found it (9.50 -> 8.26 m).
+  // A repair pass that runs everywhere is not a repair pass.
+  //
+  // The per-phase numbers below are the
+  // CHARACTER knob and they still are — `start`, `flow`, `jumps` and `sprint`
+  // keep their long, fast radii — but four of them (roots 13, loam 14, slab 15,
+  // rocks 15) were BELOW the radius the reference rider can hold at the design
+  // floor speed, so "these phases are meant to be technical and are ridden
+  // slowly" was authorising geometry no speed makes rideable. Technical means
+  // tight for a trail; it does not mean tighter than the bike turns.
+  const PLAN_MIN_R = (() => {
+    const character = {
+      start: 27, roots: 13, flow: 23, jumps: 27, slab: 15,
+      creek: 17, loam: 14, rocks: 15, sprint: 25,
+    };
+    const out = {};
+    for (const k of Object.keys(character)) out[k] = Math.max(R_MIN_PLAN_EFF, character[k]);
+    return out;
+  })();
   const PLAN_SHIFT_MAX = 3.6;    // m the alignment may move from the marched line
   const PLAN_STRIDE = 5.0;       // m — the stride the plan curvature is measured over
-  // Below this the corner is one of the march's authored switchbacks (its
-  // reversal mode is an explicit 6.5 m radius) and the relaxation leaves it
-  // alone. See the hairpin lock in openTightCorners().
+  // Below this the corner is a reversal the relaxation cannot open, and the
+  // relaxation leaves it alone. See the hairpin lock in openTightCorners().
+  //
+  // RE-MEASURED THIS ROUND, ON THE RESPACED LINE, because the file's own note
+  // (see measurePlanRadii) later diagnosed the "5.53 -> 3.31 m" figure the lock
+  // was justified by as an artefact of measuring at a fixed station stride on a
+  // line the pass had shortened — the same numbers, at the same station. If the
+  // lock rested on that artefact it should have come off. It does not: with the
+  // lock removed and every radius read on the RESPACED centreline at the +-4 m
+  // acceptance stencil, the worst plan radius goes 4.91 -> 3.25 m on seed
+  // 20260726 and 4.84 -> 3.18 m on 777. The mechanism in the note is real — past
+  // about 100 deg of turn inside the detection stencil the Laplacian target has
+  // crossed to the inside of the arc — and the lock stays.
+  //
+  // What that means for the radius fix is the point: a hairpin cannot be opened
+  // downstream, so it must not be authored tight upstream. That is why
+  // R_PLAN_TARGET is enforced at the march (SB_RADIUS and the turn-authority
+  // cap) and not here. With the march bounded, this lock is inert on all four
+  // seeds — `safety.planLocked` falls to 0 — which is the correct end state for
+  // a guard: still armed, never firing.
   const PLAN_HAIRPIN_R = 8.5;
 
   /**
@@ -4179,6 +4487,10 @@ export function createTrail(ctx) {
       rawS,                            // ... smoothed over ~10 m; the excavation limits are measured against THIS
       tx, ty, tz, rx, rz,
       grade, curv, radius, phase,
+      // The grade the TYRE works against: the same profile computeVertKappa()
+      // prices, i.e. with the authored ballistic relief removed. See
+      // computeRideBasis(). Only leanBudgetAt() and brakeAccel() read it.
+      gradeR: Float32Array.from(grade),
       // THE RADIUS A RIDER ACTUALLY MEETS. `radius` above is a tangent
       // difference over a +-5 m stride, Gaussian-smoothed again over +-4 m —
       // two low-passes on a quantity that only matters at its minimum, so it
@@ -4196,10 +4508,17 @@ export function createTrail(ctx) {
       speed: new Float32Array(N),
       surface: new Uint8Array(N),
       hOff: new Float32Array(N),       // feature height offset above the base grade
+      // THE AUTHORED BALLISTIC RELIEF, as a separate record of the part of hOff
+      // that buildJump()/buildDrop() wrote. See computeVertKappa(): the launch
+      // constraint prices convex curvature the design did NOT intend to throw the
+      // rider off, and a solved lip is not that. Never consumed by the geometry —
+      // hOff remains the single source of the surface — only by the measurement.
+      hBal: new Float32Array(N),
       rut: new Float32Array(N),        // rut depth (m)
       crown: new Float32Array(N),      // tread crown (m)
       rough: new Float32Array(N),      // micro-roughness amplitude (m)
       bumps: new Float32Array(N),      // transverse ridge amplitude (roots/brake bumps)
+      kapVRaw: new Float32Array(N),    // ... the same, WITH the ballistic relief in (audit only)
       kapV: new Float32Array(N),       // convex vertical curvature of the committed centre
                                        // profile, worst over LAUNCH_STENCILS (see
                                        // computeVertKappa) — the launch constraint's input
@@ -4369,7 +4688,12 @@ export function createTrail(ctx) {
    */
   function leanBudgetAt(i) {
     if (!SOLVER.feasible) return LEAN_DESIGN;
-    return leanBudget(tanFromSin(S.grade[i]), decelDemand(i), S.surface[i]);
+    return leanBudget(tanFromSin(rideGrade(i)), decelDemand(i), S.surface[i]);
+  }
+
+  /** S.grade with the authored ballistic relief removed. See computeRideBasis(). */
+  function rideGrade(i) {
+    return S.gradeR ? S.gradeR[i] : S.grade[i];
   }
 
   /**
@@ -4425,10 +4749,18 @@ export function createTrail(ctx) {
   // the march already builds to (SB_V_APEX), easing back to the identity's own
   // answer by HAIRPIN_R1. Above HAIRPIN_R1 it is inert — it never binds on an
   // ordinary corner, which is checkable: the term changes nothing on any station
-  // with r > 14 m on any seed.
-  const HAIRPIN_R0 = 6.5;    // = SB_RADIUS, the tightest reversal the march builds
-  const HAIRPIN_R1 = 15.0;   // open enough that the identity is the only bound
-  const HAIRPIN_V1 = 9.5;    // m/s — the pace a 15 m corner is entered at
+  // with r > 18 m on any seed.
+  //
+  // AND IT IS NO LONGER LOAD-BEARING, which is the point of R_PLAN_MIN. This cap
+  // was round 9's answer to the 5 m hairpin, and it could never be the answer,
+  // because it can only push the pace down to V_DESIGN_FLOOR and the corner
+  // needed it lower. With the march bounded at R_PLAN_TARGET the tightest corner
+  // that ships is 10.1-13.9 m, so what remains here is a pacing rule for genuine
+  // hairpins — the thing it always should have been — and never a rescue for
+  // geometry that has none.
+  const HAIRPIN_R0 = R_PLAN_MIN;  // the tightest plan radius the course may ship
+  const HAIRPIN_R1 = 18.0;        // open enough that the identity is the only bound
+  const HAIRPIN_V1 = 9.5;         // m/s — the pace an 18 m corner is entered at
 
   function cornerSpeedCap(i) {
     const mu = SOLVER.launch ? cornerGripBudget(i)
@@ -4491,8 +4823,43 @@ export function createTrail(ctx) {
     // sigma is 0.45 m, whose Gaussian transfer — 0.21 at 1.6 m, 0.64 at 3 m,
     // 0.90 at 6 m, 0.97 at 12 m — tracks the measured carve transfer in
     // CARVE_XFER_BANDS to within the spread of the three seeds it came from.
+    //
+    // ...AND MEASURED ON THE PROFILE WITH THE AUTHORED BALLISTIC RELIEF TAKEN
+    // OUT. This is the fix for `safety.jumpWindowBad`, and it is a correction to
+    // the MEASUREMENT, not an exemption from the constraint.
+    //
+    // launchSpeedCap() answers "above what speed does this ground throw the
+    // wheels off it". A jump lip is convex past that cap BY CONSTRUCTION —
+    // leaving the ground is the entire point — so measuring the lip and then
+    // pacing to it is a category error, and it is not confined to the lip. The
+    // stencil ladder runs to 12.8 m, so a 1 m lip poisons the launch reading of
+    // every station within 12.8 m of it IN BOTH DIRECTIONS, which is the whole
+    // run-in. The backward brake limit then drags the approach down to the floor.
+    // That is the observed defect exactly: on seed 20260726 the doubles are
+    // solved for an 11.8 m/s takeoff and the profile delivers 5.39 m/s at the
+    // lip, against a vMin of 11.1 the same solve published — 20 of 32 air
+    // features across four seeds paced BELOW their own window.
+    //
+    // WHY NOT JUMP_PACE_EXEMPT. That constant switches the section cap off on the
+    // ballistic core and it is a worse instrument for the same idea, for a
+    // reason the note beside it does not state: the mask reaches iOutEnd, so the
+    // KNUCKLE, the landing ramp and the run-out get paced at the phase ceiling
+    // (17.5 m/s in the jump phase) with no launch cap at all, and the run-in
+    // outside the mask is still poisoned by the lip 12 m ahead of it. It relaxes
+    // the constraint in the one place it should still bind and leaves it wrong
+    // where the defect actually is. Measured, it took seed 777 from 9/21
+    // finishes to 0/21. Kept `false`.
+    //
+    // Subtracting hBal instead says the right thing in the right place: the
+    // run-in is priced by the ground it is on, the ballistic core is priced by
+    // solveJump()'s own speed window through S.vFeat, and every metre of
+    // ordinary ground — including the run-out once its authored relief is
+    // accounted for — is priced by the launch cap exactly as before. The raw
+    // figure is still measured and published as `safety.launchViolRaw`, so
+    // nothing is hidden by the accounting.
     const raw = new Float32Array(n);
-    for (let i = 0; i < n; i++) raw[i] = S.by[i] + S.hOff[i];
+    const balOff = SOLVER.feasible && S.hBal ? S.hBal : null;
+    for (let i = 0; i < n; i++) raw[i] = S.by[i] + S.hOff[i] - (balOff ? balOff[i] : 0);
     const y = gaussianSmooth(raw, 4, 0.45 / STATION_DS);
     for (let i = 0; i < n; i++) {
       let worst = 0;
@@ -4501,6 +4868,23 @@ export function createTrail(ctx) {
         if (k > worst) worst = k;
       }
       S.kapV[i] = worst;
+    }
+    // The same measurement WITHOUT the subtraction, for the audit only. Nothing
+    // reads it but countLaunchViol's raw column: it is the honest statement of
+    // how much of the committed surface would launch a rider at the design pace
+    // if the ballistic features were not features.
+    if (S.kapVRaw) {
+      const rawFull = new Float32Array(n);
+      for (let i = 0; i < n; i++) rawFull[i] = S.by[i] + S.hOff[i];
+      const yF = gaussianSmooth(rawFull, 4, 0.45 / STATION_DS);
+      for (let i = 0; i < n; i++) {
+        let worst = 0;
+        for (let s = 0; s < LAUNCH_STENCILS.length; s++) {
+          const k = vertKappaAt(yF, i, LAUNCH_STENCILS[s]);
+          if (k > worst) worst = k;
+        }
+        S.kapVRaw[i] = worst;
+      }
     }
   }
 
@@ -4637,7 +5021,10 @@ export function createTrail(ctx) {
     if (!SOLVER.feasible) return A_BRAKE;
     const muS = SURF_MU[S.surface[i]] === undefined ? 1 : SURF_MU[S.surface[i]];
     const muB = BRAKE_USE * Math.min(RIDE_USE * RIDE_MU_REF * muS, RIDE_ENDO_MU);
-    const tanT = tanFromSin(S.grade[i]);          // signed, + = descending
+    // The ballistic-free grade: a rider is not braking on a jump lip, and
+    // pricing one as a 100% face returns BRAKE_A_MIN and makes the backward pass
+    // unable to reach the feature at any speed. See computeRideBasis().
+    const tanT = tanFromSin(rideGrade(i));        // signed, + = descending
     const cosT = 1 / Math.sqrt(1 + tanT * tanT);
     return Math.max(BRAKE_A_MIN, G * (muB * cosT - tanT * cosT));
   }
@@ -4690,7 +5077,16 @@ export function createTrail(ctx) {
    */
   function designCap(cornerCap, i) {
     const c = Math.min(cornerCap, techSpeedCap(i), S.vFeat[i]);
-    return SOLVER.feasible ? Math.max(V_DESIGN_FLOOR, c) : c;
+    if (!SOLVER.feasible) return c;
+    // THE FLOOR IS A PACING RULE AND A FEATURE CAP IS A PHYSICAL BOUND, so the
+    // floor may not lift the speed back over one. V_DESIGN_FLOOR exists because
+    // asking a rider to crawl a steep pitch costs them the whole longitudinal
+    // budget; it does not exist to authorise arriving at a lip faster than the
+    // landing it was solved for. Where the two disagree the feature wins, and
+    // the disagreement is counted rather than hidden.
+    const floored = Math.max(V_DESIGN_FLOOR, c);
+    if (floored > S.vFeat[i]) { safety.featFloorConflict++; return S.vFeat[i]; }
+    return floored;
   }
 
   function applyCornerSpeedCap() {
@@ -4883,6 +5279,10 @@ export function createTrail(ctx) {
   // MU_CORNER_MIN no longer authorises grip the ground has not got.
 
   function solveSpeeds(rebank = true) {
+    // Zeroed per solve, or the counter accumulates across the four feature
+    // passes and the ten solves inside them and reports a number nobody can
+    // interpret. It describes the profile that ships, not the history of it.
+    safety.featFloorConflict = 0;
     const n = S.n, ds = S.ds;
     const vmax = new Float32Array(n);
     const v = S.speed;
@@ -5026,13 +5426,31 @@ export function createTrail(ctx) {
     return f;
   }
 
-  /** Straightest, fastest station within `win` of `i0` — where a jump belongs. */
+  /**
+   * Straightest, fastest station within `win` of `i0` — where a jump belongs.
+   *
+   * THE PACE IS PART OF WHERE A JUMP BELONGS, and the window has to be wide
+   * enough for that to mean anything. Measured on seed 20260726: the road gap's
+   * nominal slot lands on 30 m of essentially flat trail (committed grade
+   * 0.007-0.014) directly after the previous jump's run-out, where the profile
+   * is SHEDDING speed to drag and rolling resistance — 8.64 m/s at the double's
+   * lip down to 4.94 m/s across 47 m. A 19 m road gap cannot be built there at
+   * any pace, and the fixed point's only remaining move is to shrink it until it
+   * is not a gap. Seventy metres further on the same phase runs at 10.5 m/s.
+   *
+   * A builder puts the gap where the speed is. The search window is therefore
+   * wide enough to reach the next fast ground — +-18 m against a nominal slot
+   * spacing of ~57 m, so the jump line cannot reorder itself — and the speed
+   * term is scaled to the size of the decision it is making: 4 points per m/s
+   * against a 0-18 point straightness term and a 0.02/station centring term.
+   */
   function straightestNear(i0, win, lo, hi) {
     let best = clamp(i0, lo, hi), bestScore = -Infinity;
     for (let d = -win; d <= win; d++) {
       const i = clamp(i0 + d, lo, hi);
       // Straight, fast, and not already occupied by another shaped feature.
-      let sc = Math.min(S.radius[i], 300) * 0.06 + S.speed[i] * 2.2 - Math.abs(d) * 0.02;
+      let sc = Math.min(S.radius[i], 300) * 0.06
+        + S.speed[i] * (SOLVER.feasible ? 4.0 : 2.2) - Math.abs(d) * 0.02;
       if (S.feat[i] >= 0) sc -= 400;
       if (sc > bestScore) { bestScore = sc; best = i; }
     }
@@ -5068,6 +5486,33 @@ export function createTrail(ctx) {
       const f = (i1 === i0) ? 0 : (i - i0) / (i1 - i0);
       S.hOff[i] += fn(f, i);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // THE BALLISTIC-RELIEF RECORD.
+  //
+  // `S.hBal` is the part of `S.hOff` that a solved airborne feature wrote — the
+  // lip transition, the deck or dug gap, the knuckle face, the landing chord and
+  // the climb out of the pit. It is recorded by DIFFERENCE rather than by having
+  // buildJump/buildDrop write two arrays, so there is exactly one place the
+  // surface is authored and no way for the two records to disagree.
+  //
+  // Nothing in the geometry reads it. Its only consumer is computeVertKappa(),
+  // which prices the launch constraint on the profile with it removed, because
+  // a lip is convex BY CONSTRUCTION and pacing a rider to it is a category
+  // error. See the long note there.
+  // -------------------------------------------------------------------------
+  let _balScratch = null;
+  function beginBallistic(i0, i1) {
+    const a = clamp(Math.min(i0, i1), 0, S.n - 1);
+    const b = clamp(Math.max(i0, i1), 0, S.n - 1);
+    if (!_balScratch || _balScratch.length < S.n) _balScratch = new Float32Array(S.n);
+    for (let i = a; i <= b; i++) _balScratch[i] = S.hOff[i];
+    return { a, b };
+  }
+  function endBallistic(span) {
+    if (!span) return;
+    for (let i = span.a; i <= span.b; i++) S.hBal[i] += S.hOff[i] - _balScratch[i];
   }
 
   /**
@@ -5139,7 +5584,43 @@ export function createTrail(ctx) {
     return out;
   }
 
+  // -------------------------------------------------------------------------
+  // THE PRE-FEATURE STATE, so buildFeatures() can be run more than once.
+  //
+  // Every array below is one buildFeatures() writes; S.speed is included not
+  // because features write it but because they READ it — straightestNear() sites
+  // a jump partly on the local design speed, and a siting that moved between
+  // passes would turn the fixed point into a search over station indices. With
+  // it restored, pass k+1 differs from pass k in EXACTLY one thing: the approach
+  // speed each feature is solved at.
+  // -------------------------------------------------------------------------
+  const FEATURE_STATE_KEYS = ['hOff', 'hBal', 'width', 'surface', 'rough', 'bumps',
+    'rut', 'crown', 'bank', 'wallride', 'vFeat', 'feat', 'speed'];
+  function featureStateSnapshot() {
+    const snap = { arr: {}, nFeat: features.length, nLog: jumpLog.length };
+    for (const k of FEATURE_STATE_KEYS) snap.arr[k] = S[k].slice();
+    return snap;
+  }
+  function featureStateRestore(snap) {
+    for (const k of FEATURE_STATE_KEYS) S[k].set(snap.arr[k]);
+    features.length = snap.nFeat;
+    jumpLog.length = snap.nLog;
+    ballisticMask = null;
+    crestMask = null;
+    // hOff is restored, so the surface and everything derived from it must be
+    // put back with it. Missing this is silent: the next pass would build its
+    // features against the PREVIOUS pass's grade, and the fixed point would be
+    // iterating two things at once.
+    for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
+    refreshBasis();
+    computeVertKappa();
+  }
+
   function buildFeatures() {
+    // Re-derived every pass, so pass 2 draws the same numbers pass 1 did and the
+    // iteration is invisible to every consumer downstream. See featPassRng.
+    featPassRng = makeRng(subSeed(ctx.seed, 'trail:features:pass'));
+    featAttempt.clear();
     // ---------------- phase 1: open pedally start (rollers) ----------------
     phStart: {
       const span = stationRangeForPhase('start');
@@ -5153,7 +5634,7 @@ export function createTrail(ctx) {
       for (let k = 0; k < n; k++) {
         const c = Math.round(r0 + sp * (k + 0.5));
         const half = Math.round(sp * 0.42);
-        const amp = 0.26 + featRng() * 0.14;
+        const amp = 0.26 + featDraw() * 0.14;
         blendOffset(c - half, c + half, (f) => amp * (0.5 - 0.5 * Math.cos(f * Math.PI * 2)));
       }
       for (let i = a; i <= b; i++) S.width[i] = clamp(S.width[i] + 0.15, 1.2, 3.0);
@@ -5181,7 +5662,7 @@ export function createTrail(ctx) {
       // A committing drop halfway down the tech: the trail is built up onto a lip,
       // then falls away vertically back to the natural grade.
       const dI = a + Math.round((b - a) * 0.55);
-      const dh = 1.05 + featRng() * 0.5;
+      const dh = 1.05 + featDraw() * 0.5;
       buildDrop(dI, dh, { name: 'tech drop' });
     }
 
@@ -5216,7 +5697,7 @@ export function createTrail(ctx) {
       }
       // A rock roll / drop off the bottom lip of the slab.
       const dI = b - M(30);
-      const dh = 1.5 + featRng() * 0.7;
+      const dh = 1.5 + featDraw() * 0.7;
       buildDrop(dI, dh, { name: 'slab roll', surface: 'rock' });
     }
 
@@ -5355,38 +5836,75 @@ export function createTrail(ctx) {
    */
   function buildJump(i, opt) {
     const n = S.n;
-    if (i < M(25) || i > n - M(60)) return null;
+    const give = (why) => { featAttempt.set(opt.name, why); return null; };
+    featAttempt.set(opt.name, '');
+    if (i < M(25) || i > n - M(60)) return give('offCourse');
     const alpha = Math.atan(clamp(S.grade[i], 0.02, 0.30));
-    // THE APPROACH SPEED IS A FIXED POINT NOBODY IS ITERATING, AND IT IS THE
-    // LARGEST UNCLOSED DEFECT LEFT IN THIS FILE.
+    // THE APPROACH SPEED IS A FIXED POINT, AND IT IS NOW ITERATED. See
+    // JUMP_FIT_ITERS and the loop in build().
     //
-    // buildFeatures() runs before the final speed solve, so `S.speed` here is
-    // the pace of ground that does not yet carry the jump. Once the lip, the gap
-    // and the landing exist, the launch cap on the run-in and the braking lead
-    // through them pull the delivered speed down — measured on seed 20260726 the
-    // doubles are solved for an 11.8 m/s takeoff and the profile then delivers
-    // 5.4 at their lips, against a vMin of 10.9 the same solve published. A jump
-    // whose design speed is under its own window floor is a jump the design says
-    // you case, and CONTRACT §4 calls that a bug.
+    // THE DEFECT, restated in one line because it took eleven rounds to name:
+    // buildFeatures() runs before the final speed solve, so `S.speed` here is the
+    // pace of ground that does not yet carry the jump, and by the time the jump
+    // exists the profile paces its own lip at half that. On seed 20260726 the
+    // doubles were solved for an 11.8 m/s takeoff and the shipped profile
+    // delivered 5.39 at the lip, against a `vMin` of 11.1 the same solve
+    // published. 20 of 32 air features on the four seeds were BELOW the minimum
+    // of their own window: the design was telling the rider to case every jump on
+    // the course, and CONTRACT §4 says a jump you cannot land is a bug.
     //
-    // A derate was measured (0.85) and REJECTED: it moves the window down but
-    // then five features end up with a delivered speed ABOVE their own takeoff,
-    // which is the same bug the other way round. The real fix is to iterate —
-    // build, solve, rebuild the jump line at the delivered pace — and that is a
-    // second buildFeatures pass this round did not have the budget to make safe.
-    // The residual is MEASURED rather than assumed: safety.jumpWindowBad counts
-    // every airborne feature whose delivered lip speed is outside its own
-    // published window, on the final profile, and safety.jumpOverSpeed counts
-    // every one paced above its own takeoff. The second is zero on all four
-    // seeds; the first is 16 of 32 and is the open item.
-    const vApproach = S.speed[i] * JUMP_V_DERATE;
-    const lipH = opt.lipHeight;
+    // TWO THINGS HAD TO CHANGE AND ONLY ONE OF THEM IS THIS LOOP.
+    //
+    //  (1) The pace was wrong for a measurable reason — the launch cap was
+    //      pricing the jump's own lip as unwanted relief, over a 12.8 m stencil,
+    //      which poisoned the entire run-in. That is fixed in computeVertKappa()
+    //      by subtracting S.hBal, and it is what lets the corridor deliver a
+    //      takeoff speed at all.
+    //
+    //  (2) Whatever the corridor then delivers, the feature has to be SOLVED FOR
+    //      IT. That is `paceFor()` below plus the iteration: build the line,
+    //      solve the profile, read the speed actually delivered at each lip, and
+    //      rebuild the line for it. A feature whose window the shipped pace
+    //      cannot enter is a defect regardless of which side is wrong.
+    //
+    // A flat derate (JUMP_V_DERATE = 0.85) was measured by an earlier round and
+    // REJECTED, correctly: it moves every window down by the same fraction and
+    // then five features end up ABOVE their own takeoff, which is the same bug
+    // inverted. A fixed point is not a fudge factor — it converges on the pace
+    // each feature individually gets.
+    const vApproach = (featPace.get(opt.name) ?? S.speed[i]) * JUMP_V_DERATE;
     let step = opt.stepDown || 0;
     const table = opt.table === undefined ? 1 : opt.table;
-    // Climbing the lip costs kinetic energy (85% of it — you pump the transition).
-    const vTO = Math.sqrt(Math.max(9, vApproach * vApproach - 2 * G * lipH * 0.85));
+    // THE LIP IS SIZED FOR THE APPROACH, NOT THE OTHER WAY ROUND. Climbing the
+    // lip costs kinetic energy (85% of it — you pump the transition), so a lip
+    // authored for 12 m/s is a speed bump at 7: it eats a third of the approach
+    // and leaves nothing to fly with. Cap the lip at JUMP_LIP_KE of the
+    // approach's kinetic energy so the takeoff always keeps most of what it
+    // arrived with, and let the authored height stand wherever the pace can
+    // afford it (which, once (1) above is fixed, is everywhere on the jump line).
+    const lipH = SOLVER.feasible
+      ? Math.min(opt.lipHeight, JUMP_LIP_KE * vApproach * vApproach / (2 * G * 0.85))
+      : opt.lipHeight;
+    const vTO = Math.sqrt(Math.max(SOLVER.feasible ? 1 : 9,
+      vApproach * vApproach - 2 * G * lipH * 0.85));
     // Too slow for this to be anything but a case: don't build it.
-    if (vTO < 8) return null;
+    if (vTO < (SOLVER.feasible ? JUMP_V_MIN : 8)) return give('tooSlow');
+    // ...AND THE LANDING DISTANCE IS BALLISTIC, SO IT SCALES AS v^2. The jump
+    // line's rhythm (11 / 13 / 15 / 19 / 16 m) was authored against the ~12 m/s
+    // takeoff the phase is designed for; asking for 19 m of carry at 8 m/s just
+    // pins lipAngleForDistance() at its 30 deg ceiling and produces a kicker.
+    // Scaling the target keeps the RHYTHM — the relative sizes, which is what a
+    // jump line is — at whatever pace the corridor carries.
+    // ...with a FLOOR, because the scaling and solveJump's own `D < 3.5 m` gate
+    // were fighting: scaled to 30% a 7.5 m rock-garden double asks for 2.25 m of
+    // carry, lipAngleForDistance() returns its minimum angle, and the feature is
+    // then refused for not carrying far enough. Aiming at JUMP_D_MIN instead
+    // pins the lip at its 30 deg ceiling and delivers whatever that gives —
+    // 4.0 m at a 5.7 m/s takeoff, which is a small double and is a feature.
+    const targetD = SOLVER.feasible
+      ? Math.max(JUMP_D_MIN,
+        opt.targetD * clamp((vTO / V_JUMP_REF) * (vTO / V_JUMP_REF), 0.25, 1.15))
+      : opt.targetD;
     // The run-out must climb back out of the pit slower than the ground falls,
     // or the feature ships a CONTRACT §4 breach. See the note in solveJump().
     // JUMP_OUT_FRAC of the local grade leaves the world gradient descending
@@ -5418,7 +5936,7 @@ export function createTrail(ctx) {
       // Size the lip for the landing distance the jump line calls for, but never
       // below `minDeg` — on a steep grade a 7 deg lip reaches the target distance
       // with no pop at all, and a jump with no pop is a speed bump.
-      theta = lipAngleForDistance(vTO, alpha, lipH, step, opt.targetD,
+      theta = lipAngleForDistance(vTO, alpha, lipH, step, targetD,
         opt.minDeg === undefined ? 14 : opt.minDeg, 30);
       sol = solveJump(vTO, theta, alpha, lipH, step, {
         knuckle: opt.knuckle, touchOver, clearance: opt.clearance, deckY,
@@ -5432,7 +5950,7 @@ export function createTrail(ctx) {
       else break;
     }
     // Too slow to clear anything: don't build a jump the rider will case.
-    if (sol.D < 3.5) return null;
+    if (sol.D < 3.5) return give('noCarry');
 
     // Station geometry. solveJump works in horizontal metres; station spacing runs
     // along the slope, so convert with cos(alpha).
@@ -5447,7 +5965,11 @@ export function createTrail(ctx) {
     const iRampEnd = i + sx(sol.rampEnd);
     const iTouch = i + sx(sol.xT);
     const iOutEnd = Math.min(n - 1, i + sx(sol.rampEnd + sol.outLen));
-    if (iRampEnd >= n - 4) return null;
+    if (iRampEnd >= n - 4) return give('noRoom');
+
+    // Everything between here and `endBallistic()` is authored ballistic relief.
+    // See computeVertKappa(): the launch constraint must not price it.
+    const balA = beginBallistic(iTransStart, iOutEnd);
 
     // --- lip: circular transition blended into a short straight kicker ------
     blendOffset(iTransStart, iLip, (f) => {
@@ -5478,6 +6000,7 @@ export function createTrail(ctx) {
     // --- climb back out of the landing pit onto the trail ------------------
     const yEnd = sol.yEnd - step;
     blendOffset(iRampEnd + 1, iOutEnd, (f) => yEnd * (1 - smoothstep(0, 1, f)));
+    endBallistic(balA);
 
     // --- tread treatment ---------------------------------------------------
     for (let k = Math.max(0, iTransStart); k <= iOutEnd; k++) {
@@ -5490,12 +6013,36 @@ export function createTrail(ctx) {
     }
     // A shaped takeoff is never banked.
     for (let k = Math.max(0, iTransStart); k <= iKnuckle; k++) S.bank[k] *= 0.2;
-    // CONTRACT §4, "a jump you can't land": the design speed through a solved
-    // feature may not exceed the speed its ballistics were solved for. Declared
-    // as a cap the speed solve honours, because the solve runs again after this.
-    // vTO is inside its own published window by construction, so this can never
-    // push a jump under its own floor.
-    for (let k = Math.max(0, iTransStart - M(6)); k <= iKnuckle; k++) {
+    // CONTRACT §4, "a jump you can't land": the design speed AT THE LIP may not
+    // exceed the speed the ballistics were solved for. Declared as a cap the
+    // speed solve honours, because the solve runs again after this. vTO is
+    // inside its own published window by construction, so this can never push a
+    // jump under its own floor.
+    //
+    // THE RUN-IN IS CAPPED AT THE APPROACH SPEED, NOT AT vTO, AND THAT
+    // DISTINCTION IS THE WHOLE OF THE JUMP-LINE DEFECT.
+    //
+    // The previous cut wrote vTO across the run-in as well. vTO is the speed at
+    // the TOP of the lip and it is strictly below the approach speed, because
+    // climbing the lip is what costs the difference. So capping the approach at
+    // vTO instructs the rider to arrive at the foot of the transition already
+    // travelling at the speed they are supposed to leave the top at — and then
+    // climb the lip out of that. The delivered lip speed is therefore vTO minus
+    // the lip climb, every time, by construction.
+    //
+    // That is a ratchet, and under the fixed point it is a runaway one:
+    // measured, the approach speed on the jump line walked 12.5 -> 11.8 -> 11.2
+    // -> ... on successive passes, one lip-climb per pass, until JUMP_V_MIN
+    // deleted the feature. It converged to `jumpWindowBad = 0` by shipping half
+    // the jump line — 32 air features across four seeds became 18 — which is
+    // the correct answer to the wrong question. With the cap split at the lip
+    // the map is stationary: solving a feature for the speed the run-in carries
+    // no longer lowers the speed the run-in carries.
+    const vRunInCap = SOLVER.feasible ? vApproach : vTO;
+    for (let k = Math.max(0, iTransStart - M(6)); k < iLip; k++) {
+      if (vRunInCap < S.vFeat[k]) S.vFeat[k] = vRunInCap;
+    }
+    for (let k = iLip; k <= iKnuckle; k++) {
       if (vTO < S.vFeat[k]) S.vFeat[k] = vTO;
     }
     if (JUMP_RUNIN_BUMPS) addBrakingBumps(iTransStart - M(16), iTransStart - M(3), 0.045);
@@ -5528,6 +6075,9 @@ export function createTrail(ctx) {
       impactSpeed: sol.vImpact,
       speedWindow: [sol.vMin, sol.vMax],
       stepDown: step,
+      // iApproach is the foot of the lip transition — the station whose speed
+      // IS the approach speed. The fixed point feeds this back, never iLip.
+      iApproach: Math.max(0, iTransStart),
       iLip, iKnuckle, iTouch, iRampEnd, iOutEnd,
     }, true);
     jumpLog.push({
@@ -5577,9 +6127,15 @@ export function createTrail(ctx) {
    */
   function buildDrop(dI, dh, opt) {
     const n = S.n;
-    if (dI < M(24) || dI > n - M(50)) return null;
+    const dname = (opt && opt.name) ? opt.name : 'drop';
+    const give = (why) => { featAttempt.set(dname, why); return null; };
+    featAttempt.set(dname, '');
+    if (dI < M(24) || dI > n - M(50)) return give('offCourse');
     const alpha = Math.atan(clamp(S.grade[dI], 0.02, 0.34));
-    const vApp = Math.max(4.0, S.speed[dI]);
+    // Same fixed point as buildJump(): on iteration 0 this is the pre-feature
+    // pace, and on every iteration after it is the speed the profile actually
+    // delivered at this lip. See the loop in build().
+    const vApp = Math.max(4.0, featPace.get(opt && opt.name ? opt.name : 'drop') ?? S.speed[dI]);
     const outRate = Math.max(0.045, JUMP_OUT_FRAC * Math.tan(alpha));
     // theta = 0: the lip is parallel to the grade. No pop, by definition.
     const sol = solveJump(vApp, 0, alpha, dh, 0, {
@@ -5594,8 +6150,9 @@ export function createTrail(ctx) {
     const iKnuckle = Math.max(iFace + 1, dI + sx(sol.xK));
     const iRampEnd = Math.max(iKnuckle + 1, dI + sx(sol.rampEnd));
     const iOutEnd = Math.min(n - 1, dI + sx(sol.rampEnd + sol.outLen));
-    if (iUp < 1 || iRampEnd >= n - 4) return null;
+    if (iUp < 1 || iRampEnd >= n - 4) return give('noRoom');
 
+    const balA = beginBallistic(iUp, iOutEnd);
     // Ramp up onto the lip, at a rate the grade beats.
     blendOffset(iUp, dI, (f) => dh * smoothstep(0, 1, f));
     // The face. The rider is airborne over it; it is the void, not tread.
@@ -5606,14 +6163,23 @@ export function createTrail(ctx) {
     blendOffset(iKnuckle + 1, iRampEnd, (f) => sol.yK + sol.m * (f * sol.rampRun));
     // ...and back out of the landing pit onto the trail.
     blendOffset(iRampEnd + 1, iOutEnd, (f) => sol.yEnd * (1 - smoothstep(0, 1, f)));
+    endBallistic(balA);
 
     // THE SPEED CAP. Without it the profile solve is free to pace the feature at
     // whatever the section allows, which is how a 1.44 m drop came to publish
     // 7.9 m/s against a lip that launches at 3.6. Capped at the lower of the
     // speed the ballistics were solved at and the largest speed that still
     // lands on the transition, over the whole feature and its approach.
+    // Split at the lip for the same reason buildJump does — see the long note
+    // there. A drop has no pop, but it does have an approach RAMP: the trail is
+    // built up `dh` onto the lip over `upLen`, so the rider climbs it, and
+    // capping the foot of that ramp at the lip speed subtracts the climb twice.
     const vCap = Math.min(vApp, sol.vMax);
-    for (let i = Math.max(0, iUp - M(8)); i <= iOutEnd; i++) {
+    const vRunIn = SOLVER.feasible ? Math.sqrt(vCap * vCap + 2 * G * dh * 0.85) : vCap;
+    for (let i = Math.max(0, iUp - M(8)); i < dI; i++) {
+      if (vRunIn < S.vFeat[i]) S.vFeat[i] = vRunIn;
+    }
+    for (let i = dI; i <= iOutEnd; i++) {
       if (vCap < S.vFeat[i]) S.vFeat[i] = vCap;
     }
     for (let i = Math.max(0, iUp); i <= iOutEnd; i++) {
@@ -5641,6 +6207,10 @@ export function createTrail(ctx) {
       impactSpeed: sol.vImpact,
       speedWindow: [sol.vMin, sol.vMax],
       stepDown: 0,
+      // A drop's ballistics are solved AT the lip (theta = 0, no pop: the rider
+      // leaves the edge travelling along the surface), so the speed the fixed
+      // point must feed back is the lip's own, not the foot of the up-ramp's.
+      iApproach: dI,
       iLip: dI, iKnuckle, iTouch: dI + sx(sol.xT), iRampEnd, iOutEnd,
     }, true);
     jumpLog.push({
@@ -5683,7 +6253,8 @@ export function createTrail(ctx) {
     ];
     for (let k = 0; k < slots.length; k++) {
       // Nudge to the straightest station within ±8 m of the nominal slot.
-      const best = straightestNear(a + Math.round(span * slots[k]), M(9), a, b);
+      const best = straightestNear(a + Math.round(span * slots[k]),
+        M(SOLVER.feasible ? 18 : 9), a, b);
       buildJump(best, kinds[k]);
     }
   }
@@ -6141,6 +6712,31 @@ export function createTrail(ctx) {
     // budget hit MU_CORNER_MIN and the identity is knowingly not guaranteed.
     feasViol: 0, feasWorstDeg: 0, feasWorstAt: 0, gripFloorBound: 0,
     feasCorner: 0, feasLaunch: 0, cornerFloorBound: 0, feasDesignViol: 0,
+    // ---- the jump-line fixed point (see the loop in build()) ----
+    // `jumpFitIters` is how many feature passes were run; `jumpFitResidual` how
+    // many air features the winning pass leaves outside their own published
+    // speed window; `jumpFitWorst` how far outside, in m/s; `jumpFitLost` how
+    // many features the winning pass could not build at the pace the corridor
+    // delivers, and `jumpFitLostWhy` names each one and its reason. A build with
+    // a non-zero `jumpFitLost` is reporting ground the design wanted a jump on
+    // and the profile cannot pace one on — a route finding, not a jump finding.
+    jumpFitIters: 0, jumpFitResidual: 0, jumpFitWorst: 0,
+    jumpFitLost: 0, jumpFitLostWhy: '',
+    // Stations where V_DESIGN_FLOOR would have lifted the design speed back
+    // above a solved feature's own ballistic cap. See designCap().
+    featFloorConflict: 0,
+    // ---- the shipped plan radius (R_PLAN_MIN) ----
+    // Measured on S.px/S.pz at the END of build(), i.e. after applyExposureSafety
+    // has benched the line — which is the only place the number means anything.
+    // `planShipMin` is the worst +-4 m circumradius on the course, `planShipAt`
+    // where, `planShipUnder` how many stations are inside R_PLAN_MIN.
+    planShipMin: 0, planShipAt: 0, planShipUnder: 0,
+    // ---- CONTRACT §4 as a PROPERTY, not as a counter (see measureShippedFlat) ----
+    // `flatRunShipped` is the longest stretch that ends at or above its own start
+    // and never drops below it in between — what a rider pushing up it meets.
+    // `flatWinRise` is the worst NET rise over any DESC_WIN of 3-D arc.
+    flatRunShipped: 0, flatRunShippedAt: 0, flatWinRise: 0, flatWinAt: 0,
+    flatWinCapped: 0, flatWinFloorBound: 0,
   };
 
   /**
@@ -6252,9 +6848,48 @@ export function createTrail(ctx) {
    * on the ballistic core, and written into S.hOff so S.by stays the record of
    * what the elevation solve decided.
    */
+  // ---------------------------------------------------------------------------
+  // THE DESCENT RULE IS A PROPERTY, AND DESC_MAX_RUN IS A COUNTER. THEY ARE NOT
+  // THE SAME THING, AND THE DIFFERENCE IS 78 METRES.
+  //
+  // `enforceDescent` and the loop below it counted CONSECUTIVE non-descending
+  // stations and reset on the first station that fell by anything at all — the
+  // test is `v >= y[i-1] - 1e-5`, so a ten-MICROMETRE dip discharges it, and
+  // rule 3 satisfies itself with DESC_MIN_FALL*ds = 4 mm of fall. What the rule
+  // therefore permits is a sawtooth: climb 11 m at up to maxUpGrade, drop 4 mm,
+  // climb 11 m again. The counter reads 11.2 m and reports compliance.
+  //
+  // Measured on the shipped reference seed before this pass: `safety.flatShipped`
+  // read 11.2 m while the profile carried a stretch of 89.4 m from arc 2157 that
+  // ends 1.59 m ABOVE where it started and never once drops below its own start
+  // — broken only by 1-2 cm dips at five stations. That is what a rider pushing
+  // up it experiences and it is what CONTRACT §4's "~15 m" is about. Three
+  // consecutive audits reported the counter and none of them reported the
+  // property.
+  //
+  // So the rule is stated as the property. DESC_WIN is the CONTRACT limit read
+  // literally: over any window of DESC_WIN metres of 3-D arc the trail must have
+  // NET DESCENT. Enforcing `y[j] < min{ y[i] : arc[i] <= arc[j] - DESC_WIN }`
+  // gives exactly that, because a run that ends at or above its own start and
+  // never drops below it in between is by definition a window in which the
+  // profile failed to descend — and the running prefix minimum is precisely the
+  // anchor such a run would be measured from.
+  //
+  // Cut-only, like every other elevation rule here, bounded by the same
+  // excavation ceiling, and zero on the ballistic core (a landing pit's run-out
+  // is authored relief, not a climb). Where the excavation ceiling binds the
+  // rule cannot be met and the station is COUNTED (`flatWinFloorBound`) rather
+  // than silently obeyed — that is the route being wrong, not the profile.
+  // ---------------------------------------------------------------------------
+  const DESC_WIN = 15.0;      // m of 3-D arc — CONTRACT §4's "~15 m", read as a window
+  const DESC_WIN_EPS = 0.002; // m of strict fall demanded across the window
+
   function enforceDescentShipped(mask) {
     const n = S.n, ds = S.ds;
     let run = 0, changed = 0;
+    // Pass 1: the consecutive rule, unchanged. It is cheap, it fires more often
+    // than the windowed rule, and it keeps the profile falling at the short
+    // wavelengths the windowed rule is blind to.
     for (let i = 1; i < n; i++) {
       const prev = S.by[i - 1] + S.hOff[i - 1];
       let v = S.by[i] + S.hOff[i];
@@ -6269,28 +6904,88 @@ export function createTrail(ctx) {
       if (v >= prev - 1e-5) run += ds; else run = 0;
     }
     for (let i = 0; i < n; i++) S.py[i] = S.by[i] + S.hOff[i];
-    return changed;
+
+    // Pass 2: the window. One forward sweep with a trailing prefix minimum —
+    // `low` is the smallest COMMITTED height at any station already more than
+    // DESC_WIN of arc behind, so it is exactly the anchor the property is
+    // measured from, and every station it has seen has already been corrected.
+    const arc = new Float64Array(n);
+    for (let i = 1; i < n; i++) {
+      arc[i] = arc[i - 1]
+        + Math.hypot(S.px[i] - S.px[i - 1], S.py[i] - S.py[i - 1], S.pz[i] - S.pz[i - 1]);
+    }
+    safety.flatWinFloorBound = 0;
+    let k = 0, low = S.py[0], capped = 0;
+    if (!SOLVER.feasible) return changed;
+    for (let j = 1; j < n; j++) {
+      while (k < j && arc[j] - arc[k] >= DESC_WIN) { if (S.py[k] < low) low = S.py[k]; k++; }
+      if (k === 0 || mask[j]) continue;
+      const need = low - DESC_WIN_EPS;
+      if (S.py[j] <= need) continue;
+      const floor = S.rawS[j] - RAMP_CUT_MAX;
+      const nv = Math.max(need, floor);
+      if (nv < S.py[j]) {
+        S.hOff[j] += nv - S.py[j];
+        S.py[j] = nv;
+        capped++;
+      }
+      if (S.py[j] > need + 1e-9) safety.flatWinFloorBound++;
+    }
+    safety.flatWinCapped = capped;
+    return changed + capped;
   }
 
   /**
-   * Longest non-descending run on the FINAL surface, 3-D metres, plus where it
-   * is. This is the acceptance figure for CONTRACT §4 and it is measured on
-   * S.py at the end of build() — not on the marched polyline, and not on the
-   * base profile four passes upstream.
+   * CONTRACT §4 on the FINAL surface, measured three ways, because the first of
+   * them is the one that was being reported and it is the one that lies.
+   *
+   *   flat   the counter: longest run of CONSECUTIVE non-descending stations.
+   *   run    THE PROPERTY: longest stretch that ends at or above its own start
+   *          and never drops below that start in between — what a rider pushing
+   *          up it meets. `rise` is how far above its start it ends.
+   *   win    the worst NET rise over any window of DESC_WIN of 3-D arc, which is
+   *          the quantity enforceDescentShipped()'s second pass drives to zero.
+   *
+   * All three on S.py at the end of build() — not on the marched polyline, and
+   * not on the base profile four passes upstream.
    */
   function measureShippedFlat() {
     const n = S.n;
-    let flat = 0, worst = 0, at = 0, start = 0, arc = 0, prev = 0;
+    const arc = new Float64Array(n);
     for (let i = 1; i < n; i++) {
-      const d = Math.hypot(S.px[i] - S.px[i - 1], S.py[i] - S.py[i - 1], S.pz[i] - S.pz[i - 1]);
-      prev = arc; arc += d;
+      arc[i] = arc[i - 1]
+        + Math.hypot(S.px[i] - S.px[i - 1], S.py[i] - S.py[i - 1], S.pz[i] - S.pz[i - 1]);
+    }
+    let flat = 0, worst = 0, at = 0, start = 0;
+    for (let i = 1; i < n; i++) {
+      const d = arc[i] - arc[i - 1];
       if (S.py[i] >= S.py[i - 1] - 1e-4) {
-        if (flat === 0) start = prev;
+        if (flat === 0) start = arc[i - 1];
         flat += d;
         if (flat > worst) { worst = flat; at = start; }
       } else flat = 0;
     }
-    return { flat: worst, at };
+    // The property. `a` tracks the running-low index, so between a and any i at
+    // or above it the profile never went below y[a] — that IS the run.
+    let runWorst = 0, runAt = 0, runRise = 0, a = 0;
+    for (let i = 1; i < n; i++) {
+      if (S.py[i] < S.py[a]) { a = i; continue; }
+      const span = arc[i] - arc[a];
+      if (span > runWorst) { runWorst = span; runAt = arc[a]; runRise = S.py[i] - S.py[a]; }
+    }
+    // The window.
+    let winRise = -Infinity, winAt = 0, j = 0;
+    for (let i = 0; i < n; i++) {
+      while (j < n - 1 && arc[j] - arc[i] < DESC_WIN) j++;
+      if (arc[j] - arc[i] < DESC_WIN * 0.999) break;
+      const rise = S.py[j] - S.py[i];
+      if (rise > winRise) { winRise = rise; winAt = arc[i]; }
+    }
+    return {
+      flat: worst, at,
+      run: runWorst, runAt, runRise,
+      win: winRise === -Infinity ? 0 : winRise, winAt,
+    };
   }
 
   /**
@@ -6976,6 +7671,30 @@ export function createTrail(ctx) {
     for (let i = 0; i < n; i++) S.radiusR[i] = clamp(1 / Math.max(2.5e-4, ks[i]), 3, 4000);
   }
 
+  /**
+   * The worst +-RIDE_STENCIL circumradius on the CURRENT plan line, and where.
+   * Measured wherever it is asked for, because a plan radius is only meaningful
+   * after every pass that moves px/pz has run — which, this round, turned out to
+   * include applyExposureSafety(): the bench shift is capped at BENCH_SHIFT_MAX
+   * = 1.10 m and a 1.1 m inward shift takes a 13 m corner to 8.3.
+   */
+  function measureShipRadius() {
+    const n = S.n, m = Math.max(1, Math.round(RIDE_STENCIL / S.ds));
+    let worst = 4000, at = 0, under = 0;
+    for (let i = m; i < n - m; i++) {
+      const ax = S.px[i - m] - S.px[i], az = S.pz[i - m] - S.pz[i];
+      const bx = S.px[i + m] - S.px[i], bz = S.pz[i + m] - S.pz[i];
+      const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+      const lc = Math.hypot(S.px[i + m] - S.px[i - m], S.pz[i + m] - S.pz[i - m]);
+      const ar = Math.abs(ax * bz - az * bx);
+      if (ar < 1e-7 || la < 1e-6 || lb < 1e-6) continue;
+      const r = (la * lb * lc) / (2 * ar);
+      if (r < R_PLAN_MIN) under++;
+      if (r < worst) { worst = r; at = i * S.ds; }
+    }
+    return { worst, at, under };
+  }
+
   /** The radius the corner solve prices: the honest one, never the smoothed one. */
   function rideRadius(i) {
     if (!SOLVER.feasible) return S.radius[i];
@@ -6995,7 +7714,51 @@ export function createTrail(ctx) {
       S.rx[i] = -S.tz[i] / hl; S.rz[i] = S.tx[i] / hl;
       S.grade[i] = -S.ty[i];
     }
+    computeRideBasis();
     computeRideRadius();
+  }
+
+  /**
+   * THE GRADE THE TYRE IS WORKING AGAINST — the same profile computeVertKappa()
+   * prices the launch constraint on, i.e. with the authored ballistic relief
+   * removed. Fills S.gradeR.
+   *
+   * THIS IS THE THIRD FACE OF ONE DEFECT, and it was the one that actually paced
+   * the jump line. A lip is a short, steep, authored ramp: measured on seed
+   * 20260726 the five jump-line lips read S.grade = 0.65-0.78 — sin(theta), so
+   * tan(theta) = 0.86-1.25, i.e. an 86-125% hillside. leanBudget() reads that,
+   * finds it past RIDE_TAN_ZERO, and correctly returns ZERO lean budget, because
+   * on a 100% face the reference rider has none. cornerGripBudget() then falls to
+   * MU_CORNER_MIN_FEAS and cornerSpeedCap() answers 5.9-7.4 m/s at a plan radius
+   * of 126-279 m — a corner cap of 7 m/s on ground that is, in plan, essentially
+   * straight. cornerCapLead() then drags the whole run-in down to it.
+   *
+   * Measured at the lips of the jump line, seed 20260726, before this:
+   *
+   *   arc   r(m)  tech  launch  CORNER  lean budget
+   *   1088  279   12.49  12.49   7.40      0.0 deg
+   *   1158  266   12.49  12.49   7.22      0.0
+   *   1300  126   12.49  12.49   5.93      0.0
+   *
+   * Nothing about the tyre is different on a lip; what is different is that the
+   * rider is on a designed ramp for 4 metres, not descending a face. The lean
+   * budget, the braking limit and the endo margin are all questions about ground
+   * the rider is riding ON, and a solved ballistic feature is priced by
+   * solveJump() and its published speed window instead. So those three read
+   * S.gradeR and everything else — the forward pass's gravity term, sampleAt()'s
+   * published gradient, the descent rules, the audits — reads the real S.grade,
+   * because the lip genuinely is there and climbing it genuinely does cost speed.
+   */
+  function computeRideBasis() {
+    const n = S.n;
+    if (!S.gradeR) return;
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      const dx = S.px[b] - S.px[a], dz = S.pz[b] - S.pz[a];
+      const dy = (S.py[b] - S.hBal[b]) - (S.py[a] - S.hBal[a]);
+      const l = Math.max(1e-5, Math.hypot(dx, dy, dz));
+      S.gradeR[i] = -(dy / l);
+    }
   }
 
   /**
@@ -7707,7 +8470,29 @@ export function createTrail(ctx) {
         if (dead > deadWorst) { deadWorst = dead; deadAt = deadStart; }
       } else dead = 0;
     }
-    return { flat: flatWorst, flatAt, dead: deadWorst, deadAt, arc };
+    // THE PROPERTY, not the counter. See the note above enforceDescentShipped():
+    // a run of consecutive non-descending stations is reset by a 10 micrometre
+    // dip, and the base profile is a sawtooth by construction, so `flatWorst`
+    // reads 11 m on a variant carrying 89 m that never gets back below its own
+    // start. The variant budget was being spent on the wrong number.
+    let runWorst = 0, runAt = 0, aI = 0, a2 = 0;
+    {
+      let acc = 0;
+      const cum = new Float64Array(n);
+      for (let i = 1; i < n; i++) {
+        acc += Math.hypot(S.px[i] - S.px[i - 1], S.by[i] - S.by[i - 1], S.pz[i] - S.pz[i - 1]);
+        cum[i] = acc;
+      }
+      for (let i = 1; i < n; i++) {
+        if (S.by[i] < S.by[aI]) { aI = i; continue; }
+        const span = cum[i] - cum[aI];
+        if (span > runWorst) { runWorst = span; runAt = cum[aI]; a2 = i; }
+      }
+    }
+    return {
+      flat: flatWorst, flatAt, dead: deadWorst, deadAt, arc,
+      run: runWorst, runAt, runRise: a2 ? S.by[a2] - S.by[aI] : 0,
+    };
   }
 
   // =========================================================================
@@ -7737,7 +8522,7 @@ export function createTrail(ctx) {
     // reproduce the previous build BIT-IDENTICALLY or no A/B in this file's
     // notes means anything. Verified: same fingerprint, same stamp count.
     const ROUTE_VARIANTS = 7;
-    const ROUTE_VARIANTS_MAX = SOLVER.feasible ? 16 : 7;
+    const ROUTE_VARIANTS_MAX = SOLVER.feasible ? 24 : 7;
     const marchOne = (v) => {
       const cand = marchRoute(terrain, v);
       const sc = scoreRoute(terrain, cand);
@@ -7851,21 +8636,56 @@ export function createTrail(ctx) {
           lastBuilt = cand;
           buildStations(terrain, cand);
           const m = measureBaseProfile();
-          cand.shipFlat = m.flat; cand.shipDead = m.dead;
-          cand.shipFlatAt = m.flatAt; cand.shipDeadAt = m.deadAt;
+          // THE PLAN RADIUS IS A PROPERTY OF THE BUILT LINE, NOT OF THE MARCHED
+          // ONE, and the two differ by up to 30%. On seed 20260726 the chosen
+          // variant marches a 11.87 m minimum and ships 8.34 m: smoothPolyline,
+          // the centripetal Catmull-Rom and the 0.4 m resample take a third of a
+          // corner's radius out between the march and the stations, and
+          // openTightCorners cannot put it back — it is displacement-limited
+          // against the very line that lost it. Other variants on the same
+          // mountain build clean. So the radius joins dead ground and the
+          // descent rule as something the variant budget is spent on, at the
+          // same weight, because all three are "ground nobody can ride" in
+          // different axes and none is worth trading for another.
+          const rM = measureShipRadius();
+          cand.shipFlat = m.flat; cand.shipDead = m.dead; cand.shipR = rM.worst;
+          cand.shipRun = m.run;
+          cand.shipFlatAt = m.flatAt; cand.shipDeadAt = m.deadAt; cand.shipRAt = rM.at;
           const row = routeAudit[cand.variant];
           if (row) {
             row.shipFlat = +m.flat.toFixed(1); row.shipFlatAt = +m.flatAt.toFixed(0);
+            row.shipRun = +m.run.toFixed(1); row.shipRunAt = +m.runAt.toFixed(0);
             row.shipDead = +m.dead.toFixed(1); row.shipDeadAt = +m.deadAt.toFixed(0);
+            row.shipR = +rM.worst.toFixed(2); row.shipRAt = +rM.at.toFixed(0);
+            row.shipRUnder = rM.under;
           }
-          // Dead ground and the descent rule are weighted the same: one is
-          // ground nobody can ride and the other is ground nobody can ride
-          // DOWN, and neither is worth trading for the other. The march's own
-          // score is the tie-break and nothing more.
-          const pen = Math.max(0, m.dead - SHIP_MAX_DEAD) * 60
-            + Math.max(0, m.flat - SHIP_MAX_FLAT) * 60 - cand.score * 0.001;
+          // ORDERED BY WHAT THE REST OF THE BUILD CAN STILL REPAIR.
+          //
+          // The three defects are not commensurable and summing them picks the
+          // wrong variant. The plan radius is the one NO downstream pass can fix:
+          // openTightCorners is displacement-limited against the very line that
+          // lost the radius, applyExposureSafety's bench only ever tightens it,
+          // and the speed cap cannot go below V_DESIGN_FLOOR. So a variant that
+          // clears R_PLAN_MIN beats one that does not, outright — measured on
+          // seed 20260726, exactly one of six built variants does (11.41 m
+          // against 7.97-9.24), and summing the penalties instead chose one of
+          // the others and shipped 24 stations inside the floor.
+          //
+          // Dead ground and the descent rule DO have downstream repairs
+          // (capGradeRamp, enforceDescentShipped's windowed pass), so they are
+          // traded against each other on a common scale below that gate, in
+          // units of their own limit so neither can swamp the other by the
+          // accident of being measured in bigger numbers. The march's own score
+          // is the tie-break and nothing more.
+          const hardR = !SOLVER.feasible || rM.worst >= R_PLAN_MIN ? 0 : 1;
+          const pen = hardR * 1e6
+            + Math.max(0, m.dead / SHIP_MAX_DEAD - 1) * 100
+            + Math.max(0, (SOLVER.feasible ? m.run / SHIP_MAX_RUN : m.flat / SHIP_MAX_FLAT) - 1) * 100
+            - cand.score * 0.001;
           if (pen < chosenPen) { chosenPen = pen; chosen = cand; chosenM = m; }
-          if (m.dead <= SHIP_MAX_DEAD && m.flat <= SHIP_MAX_FLAT) { ok = true; break; }
+          if (m.dead <= SHIP_MAX_DEAD
+            && (SOLVER.feasible ? m.run <= SHIP_MAX_RUN : m.flat <= SHIP_MAX_FLAT)
+            && (!SOLVER.feasible || rM.worst >= R_PLAN_MIN)) { ok = true; break; }
         }
       }
       // Rebuild the winner's stations unless it was the last one built. Getting
@@ -7922,37 +8742,89 @@ export function createTrail(ctx) {
       }
     }
     safety.crestStage.afterCap = countCrestViol();
-    buildFeatures();
-    buildSplits();
-    // The ballistic core has to exist before the next speed solve, or the solve
-    // paces the jump line at the floor. See techSpeedCap().
-    ballisticMask = buildBallisticMask(1.5, true);
-    // Features changed the surfaces and widths, so re-solve the speed profile with
-    // the final numbers — but do NOT re-bank, or it would undo the flattened jump
-    // lips and the over-banked wallride.
-    solveSpeeds(false);
 
-    // Final surface Y includes the feature offsets.
-    for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
+    // =======================================================================
+    // FIX A — PACE THE JUMP LINE AT THE SPEED ITS OWN FEATURES PUBLISH.
+    //
+    // Build the features, solve the profile the way it will actually ship, read
+    // the speed that profile DELIVERS on the approach to each lip, and rebuild
+    // the features for it. Repeat until the two agree, or the iteration budget
+    // runs out; report the residual either way (safety.jumpFitIters /
+    // jumpFitResidual / jumpFitPace).
+    //
+    // WHY THIS IS THE FIX AND NOT A TUNING. The defect was never that a number
+    // was wrong; it is that two quantities which determine each other were
+    // solved in one direction only. buildFeatures() ran once, against the pace
+    // of ground that did not yet carry a jump, and the profile was then solved
+    // against the ground that did. Every seed shipped features whose delivered
+    // lip speed was half their own published takeoff — 20 of 32 across four
+    // seeds, BELOW the `vMin` of their own window, i.e. the design instructing
+    // the rider to case every jump on the course. CONTRACT §4: a jump you can't
+    // land is a bug.
+    //
+    // THREE THINGS HAD TO BE RIGHT FOR IT TO CONVERGE, and each of them was
+    // found by the fixed point failing to:
+    //
+    //  1. The launch cap must stop pricing a lip's own convexity as unwanted
+    //     relief (computeVertKappa subtracts S.hBal). Without it the run-in
+    //     collapses to V_DESIGN_FLOOR and the fixed point converges honestly on
+    //     a course with no jumps left on it.
+    //  2. THE PASS THAT IS ITERATED MUST BE THE PASS THAT SHIPS. Iterating
+    //     buildFeatures + one speed solve converged to `jumpWindowBad = 0` and
+    //     the build then shipped 15 of 32 outside their windows, because the
+    //     crest cap, the joint solve and the re-bank all run afterwards and all
+    //     move the pace. Everything up to applyExposureSafety() is inside the
+    //     loop for that reason. (applyExposureSafety is not: it benches px/pz
+    //     and re-samples natural ground, which is not restorable state. It is
+    //     measured after the loop instead, and the final audit is taken there.)
+    //  3. The quantity fed back must be the APPROACH speed, at the foot of the
+    //     lip transition, not the speed at the lip. Feeding back the lip speed
+    //     subtracts the lip climb a second time on every pass — a systematic
+    //     downward bias that walked a 9.8 m/s takeoff to 5.5 in four iterations
+    //     and looked exactly like the original defect.
+    //
+    // Cost: one extra feature build and joint solve per pass beyond the first,
+    // which measures at 8-12% of build() per pass on these seeds.
+    const featurePass = () => {
+      buildFeatures();
+      // The ballistic core has to exist before the next speed solve, or the
+      // solve paces the jump line at the floor. See techSpeedCap().
+      ballisticMask = buildBallisticMask(1.5, true);
+      // The authored relief is part of the surface now, so the basis and the
+      // relief measurement have to see it before anything is paced against it.
+      // (The control arm keeps the original order, in which the profile was
+      // paced against the PRE-feature basis; see readSolverOpts().)
+      if (SOLVER.feasible) {
+        for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
+        refreshBasis();
+        computeVertKappa();
+      } else {
+        buildSplits();
+      }
+      // Features changed the surfaces and widths, so re-solve the speed profile
+      // with the final numbers — but do NOT re-bank, or it would undo the
+      // flattened jump lips and the over-banked wallride.
+      solveSpeeds(false);
+      for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
 
-    // ---- the crest cap has to run AGAIN, on the profile the features left ----
-    //
-    // The pass above deliberately runs BEFORE buildFeatures() so that nothing it
-    // does can touch a jump's ballistics. That is right, and it is not enough:
-    // measured on seed 20260726, the profile leaving the cap carried 72 crest
-    // violations and the profile leaving buildFeatures() carried 252. The
-    // features add 180 launch points of their own, on the ground BETWEEN the
-    // authored relief — roller crests, berm entries, the shoulders either side
-    // of a chute — and nothing re-measured it. The reported crestViolAfter came
-    // from the cap's own exit, so the number that was signed off described a
-    // profile four passes upstream of the one that ships.
-    //
-    // Running it a second time under the SAME authored-relief mask
-    // applyExposureSafety uses keeps the original guarantee exactly: every
-    // station carrying a lip, a landing, a committing drop or the wallride is
-    // masked, so the jump table is unchanged to the millimetre, and only the
-    // ordinary ground either side of them is flattened back under the cap.
-    {
+      // ---- the crest cap has to run AGAIN, on the profile the features left --
+      //
+      // The pass upstream deliberately runs BEFORE buildFeatures() so that
+      // nothing it does can touch a jump's ballistics. That is right, and it is
+      // not enough: measured on seed 20260726, the profile leaving the cap
+      // carried 72 crest violations and the profile leaving buildFeatures()
+      // carried 252. The features add 180 launch points of their own, on the
+      // ground BETWEEN the authored relief — roller crests, berm entries, the
+      // shoulders either side of a chute — and nothing re-measured it. The
+      // reported crestViolAfter came from the cap's own exit, so the number that
+      // was signed off described a profile four passes upstream of the one that
+      // ships.
+      //
+      // Running it a second time under the SAME authored-relief mask
+      // applyExposureSafety uses keeps the original guarantee exactly: every
+      // station carrying a lip, a landing, a committing drop or the wallride is
+      // masked, so the jump table is unchanged to the millimetre, and only the
+      // ordinary ground either side of them is flattened back under the cap.
       const vm = buildAuthoredMask(
         ['jump', 'doubles', 'gap', 'stepDown', 'wallride', 'drop'], FEATURE_GUARD);
       safety.crestStage.afterFeatures = countCrestViol(vm);
@@ -7968,9 +8840,8 @@ export function createTrail(ctx) {
       //
       // Same reason capCrestCurvature runs twice: buildFeatures() authors relief
       // on top of the flattened ground and the ground BETWEEN the authored
-      // relief is not flat any more — roller crests, berm entries, the shoulders
-      // either side of a chute. Under the same authored mask, so the jump table
-      // is untouched to the millimetre.
+      // relief is not flat any more. Under the same authored mask, so the jump
+      // table is untouched to the millimetre.
       //
       // Then, and this is the part the round-6 speed ablation left out, the bank
       // is re-solved at whatever speed the flattening left. A berm built for a
@@ -7985,13 +8856,119 @@ export function createTrail(ctx) {
         }
         if (SOLVER.rebank) rebankAtSolvedSpeed(vm);
       }
+    };
+
+    /**
+     * Score the current profile against every solved feature's own window, and
+     * return the approach speeds the next pass should solve them at.
+     */
+    const scoreFeaturePace = () => {
+      let bad = 0, moved = 0, worst = 0, lost = 0;
+      const next = new Map();
+      for (const [, why] of featAttempt) if (why) lost++;
+      for (const f of features) {
+        const p = f.params;
+        if (!p || !p.name || p.iLip === undefined || !p.speedWindow) continue;
+        const vDel = S.speed[p.iLip];
+        if (vDel < p.speedWindow[0] || vDel > p.speedWindow[1]) {
+          bad++;
+          const miss = Math.max(p.speedWindow[0] - vDel, vDel - p.speedWindow[1]);
+          if (miss > worst) worst = miss;
+        }
+        // The APPROACH speed, read at the foot of the lip transition. See point
+        // 3 in the note above: the lip climb is what turns an approach into a
+        // takeoff, and buildJump applies it, so feeding back the lip speed
+        // applies it twice.
+        const iA = p.iApproach === undefined ? p.iLip : p.iApproach;
+        const prev = featPace.get(p.name);
+        const tgt = Math.max(1.0, S.speed[iA]);
+        const nv = prev === undefined ? tgt : prev + (tgt - prev) * JUMP_FIT_RELAX;
+        // 0.05 m/s is two orders of magnitude inside the narrowest speed window
+        // any feature publishes; below it the pace vector is stationary and
+        // another pass is a full feature build spent to change nothing.
+        if (prev === undefined || Math.abs(nv - prev) > 0.05) moved++;
+        next.set(p.name, nv);
+      }
+      return { bad, moved, worst, lost, next };
+    };
+
+    {
+      const preFeat = featureStateSnapshot();
+      let bestPace = null, bestLost = Infinity, bestBad = Infinity, bestWorst = Infinity;
+      let bestIter = -1, bestWhy = '';
+      let iter = 0, lastIter = 0, stall = 0, lastCost = Infinity;
+      // THE SCORE IS `bad + lost`, AND BOTH TERMS ARE LOAD-BEARING.
+      //
+      // Scoring on `bad` alone lets the fixed point converge by DELETING the
+      // jump line: measured, `jumpWindowBad` went to 0 while the four seeds went
+      // from 32 air features to 18. Scoring lexicographically on `lost` first is
+      // the opposite failure and it is just as real: on seed 20260726 the
+      // free-pace pass builds nine features of which five are outside their own
+      // windows, and every pass that fixes them costs one feature that the
+      // ground genuinely cannot carry — so `lost`-first pins the build on the
+      // worst pass available.
+      //
+      // Weighted equally, a pass may trade one feature for one wall and no more.
+      // That is the honest exchange rate: a feature the rider is told to case is
+      // a wall, and a feature that is not there is a poorer course. Ties break on
+      // `lost` (keep the fuller course) and then on how far outside its window
+      // the worst survivor is.
+      const better = (sc) => {
+        const c = sc.bad + sc.lost, bc = bestBad + bestLost;
+        return c !== bc ? c < bc
+          : sc.lost !== bestLost ? sc.lost < bestLost
+            : sc.worst < bestWorst - 1e-6;
+      };
+      const iterBudget = SOLVER.feasible ? JUMP_FIT_ITERS : 1;
+      for (; iter < iterBudget; iter++) {
+        if (iter > 0) featureStateRestore(preFeat);
+        lastIter = iter;
+        featurePass();
+        const sc = scoreFeaturePace();
+        // Keep the pace vector that produced this pass, not the one it suggests.
+        if (better(sc)) {
+          bestLost = sc.lost; bestBad = sc.bad; bestWorst = sc.worst;
+          bestPace = new Map(featPace); bestIter = iter;
+          bestWhy = [...featAttempt].filter(([, w]) => w).map(([k, w]) => `${k}:${w}`).join(',');
+        }
+        // Stop on a clean pass, a stationary one, or one that has stopped
+        // improving. Stopping at the first `bad === 0` stops at the first pass
+        // that deleted its way there; not stopping at all spends a full feature
+        // build per pass to re-derive an answer that is not moving.
+        const cost = sc.bad + sc.lost;
+        if (cost >= lastCost) stall++; else stall = 0;
+        lastCost = cost;
+        if (cost === 0 || sc.moved === 0 || stall >= 2) break;
+        for (const [k, v] of sc.next) featPace.set(k, v);
+      }
+      // If a later pass was worse than an earlier one — which the relaxation
+      // makes unlikely but does not forbid — rebuild on the pace vector that
+      // scored best rather than on whichever one the loop happened to stop on.
+      // Silent divergence is the failure mode of every fixed point and it is
+      // cheap to make impossible.
+      if (bestPace && bestIter !== lastIter) {
+        featPace.clear();
+        for (const [k, v] of bestPace) featPace.set(k, v);
+        featureStateRestore(preFeat);
+        featurePass();
+      }
+      safety.jumpFitIters = lastIter + 1;
+      safety.jumpFitResidual = bestBad === Infinity ? 0 : bestBad;
+      safety.jumpFitWorst = +(bestWorst === Infinity ? 0 : bestWorst).toFixed(2);
+      safety.jumpFitLost = bestLost === Infinity ? 0 : bestLost;
+      safety.jumpFitLostWhy = bestWhy;
+    }
+    if (SOLVER.feasible) buildSplits();
+
+    {
       // Book-keeping: where did the geometry fail and the speed have to give way?
       computeWantSpeed();
+      safety.launchSpeedGiven = 0; safety.launchFloorBound = 0;
       for (let i = 0; i < S.n; i++) {
         if (S.speed[i] < S.vWant[i] - 0.25) safety.launchSpeedGiven++;
         if (launchSpeedCap(i) < V_DESIGN_FLOOR - 1e-3) safety.launchFloorBound++;
       }
-      safety.launchStage.afterJoint = countLaunchViol(vm);
+      safety.launchStage.afterJoint = countLaunchViol(crestMask);
     }
 
     // Level-design safety audit and mitigation. Must run AFTER the features have
@@ -8016,14 +8993,129 @@ export function createTrail(ctx) {
       const before = measureShippedFlat();
       safety.flatBefore = +before.flat.toFixed(1);
       safety.flatBeforeAt = +before.at.toFixed(0);
+      safety.flatRunBefore = +before.run.toFixed(1);
+      safety.flatWinBefore = +before.win.toFixed(3);
       const bm = buildBallisticMask(1.5);
-      safety.flatCapped = enforceDescentShipped(bm);
+      // Twice. The windowed pass only ever lowers stations, and lowering a
+      // station lowers the running prefix minimum every later station is
+      // measured against — so one sweep leaves a small residual wherever the
+      // correction itself moved the anchor. A second sweep clears it; a third
+      // measurably changes nothing on any seed.
+      safety.flatCapped = SOLVER.feasible
+        ? enforceDescentShipped(bm) + enforceDescentShipped(bm)
+        : enforceDescentShipped(bm);
+      if (SOLVER.feasible) refreshBasis();
       // The pass lowered stations, so the relief and the pace both moved.
       computeVertKappa();
       solveSpeeds(false);
       const after = measureShippedFlat();
       safety.flatShipped = +after.flat.toFixed(1);
       safety.flatShippedAt = +after.at.toFixed(0);
+      safety.flatRunShipped = +after.run.toFixed(1);
+      safety.flatRunShippedAt = +after.runAt.toFixed(0);
+      safety.flatWinRise = +after.win.toFixed(3);
+      safety.flatWinAt = +after.winAt.toFixed(0);
+    }
+    // The plan radius, on the line that ships — after the bench, after
+    // everything. See measureShipRadius().
+    {
+      const rM = measureShipRadius();
+      safety.planShipMin = +rM.worst.toFixed(2);
+      safety.planShipAt = +rM.at.toFixed(0);
+      safety.planShipUnder = rM.under;
+    }
+
+    // =====================================================================
+    // FIX C — THE WALL GATE, MEASURED ON THE PROFILE THAT SHIPS.
+    //
+    // WHAT THIS IS FOR. Seed 12345 shipped 12.8 m of continuous committed
+    // gradient at 0.82-0.84 at arc 202 — ground the measured RIDE_CEIL table
+    // says the reference rider has ZERO lean budget on, at any radius, any bank
+    // and any speed. Three independent instruments agreed it is impassable: the
+    // table itself returns 0 above a 0.75 gradient, an analytic replica of that
+    // exact cell failed 0/9 at every saturation, radius, bank and speed, and
+    // every autopilot cell on the shipped build died there. `SHIP_MAX_DEAD` was
+    // already measuring the same quantity — on the BASE profile, as a variant
+    // TIE-BREAK — and when every variant failed it the build shrugged and
+    // shipped the least bad one.
+    //
+    // A course with a wall no rider can pass is worse than no course. Seed 2
+    // already refuses, loudly and deterministically, when no route is
+    // admissible; this is the same refusal one measurement later, on the profile
+    // the rider actually meets rather than on the marched polyline.
+    //
+    // WHY 8 m AND NOT ZERO. A metre or two of ground above the budget is a chute
+    // a rider rolls: they arrive with momentum, they are on it for a fifth of a
+    // second, and the bike does not need to steer to cross it. Round 12
+    // measured 4.0 m surviving on seed 99999 and 12.8 m killing 11-19 of 21
+    // cells on 12345. 8 m is 1.3 s at the design floor speed and about six bike
+    // lengths — past any argument that momentum carries it.
+    //
+    // WHAT IT COSTS, stated plainly: on the four buildable seeds this refuses
+    // 12345 (10.8 m at up to 0.91 on DIRT, arc 94) and passes 20260726 (0.0),
+    // 777 (0.0) and 99999 (3.8 m at arc 2004). One seed in five now refuses,
+    // where two of five ship a wall.
+    {
+      const n = S.n;
+      const arc = new Float64Array(n);
+      for (let i = 1; i < n; i++) {
+        arc[i] = arc[i - 1]
+          + Math.hypot(S.px[i] - S.px[i - 1], S.py[i] - S.py[i - 1], S.pz[i] - S.pz[i - 1]);
+      }
+      const half = Math.max(1, Math.round(2.0 / S.ds));
+      let run = 0, worst = 0, at = 0, worstG = 0, runG = 0, worstSurf = 0, runSurf = 0;
+      for (let i = 1; i < n; i++) {
+        const a = i - half < 0 ? 0 : i - half;
+        const b = i + half > n - 1 ? n - 1 : i + half;
+        const d = arc[b] - arc[a];
+        const dy = S.py[a] - S.py[b];
+        const g = d > 1e-6 ? dy / Math.sqrt(Math.max(1e-9, d * d - dy * dy)) : 0;
+        if (leanBudget(g, 0, S.surface[i]) <= FEAS_DEAD_RAD) {
+          run += arc[i] - arc[i - 1];
+          if (g > runG) { runG = g; runSurf = S.surface[i]; }
+          if (run > worst) { worst = run; at = arc[i] - run; worstG = runG; worstSurf = runSurf; }
+        } else { run = 0; runG = 0; }
+      }
+      safety.deadShipped = +worst.toFixed(1);
+      safety.deadShippedAt = +at.toFixed(0);
+      safety.deadShippedGrade = +worstG.toFixed(2);
+      if (SOLVER.feasible && worst > SHIP_HARD_DEAD) {
+        const msg = `[trail] GENERATION FAILED for seed ${ctx.seed}: the course that`
+          + ` ships carries ${worst.toFixed(1)} m of continuous ground the reference`
+          + ` rider cannot descend, starting at arc ${at.toFixed(0)} m`
+          + ` (peak committed gradient ${(worstG * 100).toFixed(0)}%, surface id ${worstSurf};`
+          + ` the measured lean budget is zero there at any radius, bank or speed).\n`
+          + `  ${routeAudit.length} route variants were marched and ${safety.stationTries}`
+          + ` had their stations built; the best of them still ships this. Limit is`
+          + ` ${SHIP_HARD_DEAD} m.\n`
+          + `  Change ctx.seed, or lower the design drop. The trail deliberately does`
+          + ` NOT ship a course with a wall no rider can pass — see the seed-2 refusal`
+          + ` in routeAdmissible() for the same rule one measurement earlier.`;
+        // eslint-disable-next-line no-console
+        console.error(msg);
+        const err = new Error(msg);
+        err.trailRouteAudit = routeAudit.slice();
+        err.trailDeadShipped = worst;
+        err.trailDeadShippedAt = at;
+        throw err;
+      }
+    }
+
+    // CONTRACT §4's descent rule, on the property rather than the counter. This
+    // one WARNS rather than throwing, and the distinction is deliberate: a
+    // stretch that fails to descend is a pace killer and a CONTRACT breach, but
+    // it is not a wall — round 12 measured a rider grinding 26 m of it at 6 m/s
+    // — and refusing the reference seed over ground it can cross would be the
+    // wrong trade. Where it fires, the excavation ceiling is what is binding
+    // (safety.flatWinFloorBound), i.e. the route committed to a rise the profile
+    // solve is not allowed to cut through, and the fix is a route, not a profile.
+    if (SOLVER.feasible && safety.flatRunShipped > DESC_RUN_WARN) {
+      // eslint-disable-next-line no-console
+      console.warn(`[trail] seed ${ctx.seed}: CONTRACT §4 non-descending run of`
+        + ` ${safety.flatRunShipped} m at arc ${safety.flatRunShippedAt} m`
+        + ` (limit ~${DESC_WIN} m). ${safety.flatWinFloorBound} stations are pinned at the`
+        + ` ${RAMP_CUT_MAX} m excavation ceiling, so the profile solve cannot cut it out —`
+        + ` this is the route crossing a rise, not the profile failing to descend.`);
     }
 
     // ---- BALLISTIC ACCEPTANCE, on the final profile -----------------------
