@@ -23,6 +23,27 @@
 //                          contest the same ground. `legBefore` is measured on
 //                          the final stations before the pinch, `legAfter` after
 //                          it. See auditLegConflicts() and legClearanceCost().
+//     trail.safety.routeAdmissible / routeFail / routeReseeded / routeVariants
+//                       -> whether ANY marched variant produced a course a
+//                          bicycle can ride and descend, which test the chosen
+//                          one failed if not, and whether the extended variant
+//                          budget was used. See routeAdmissible().
+//     trail.safety.feasViol / feasFrac / feasCorner / feasLaunch / feasWorstDeg
+//                       -> the joint (v, phi) feasibility of the SHIPPED
+//                          stations: how many have NO speed in
+//                          [V_DESIGN_FLOOR, design] and no bank inside the phase
+//                          ceiling at which the lean identity, the launch cap and
+//                          the longitudinal demand all hold at once, split by
+//                          which constraint fails. See auditJointFeasibility().
+//     trail.safety.cornerFloorBound
+//                       -> stations where the honest corner cap fell below
+//                          V_DESIGN_FLOOR and the floor was applied anyway. This
+//                          is a GEOMETRY failure being reported rather than
+//                          obeyed — see designCap().
+//     trail.routeAudit[].feasFrac / feasMean / climb / flat / minR / conflict /
+//                       admissible / fail
+//                       -> per-variant rideability and admissibility, so the
+//                          choice between variants can be read rather than assumed.
 //     trail.safety.crestStage
 //                       -> crest violations on the FINAL profile after each pass
 //                          that touches it, with authored relief masked. This is
@@ -515,29 +536,294 @@ function launchKappaPerAmp(lambda) {
 const LEAN_HOLD = THREE.MathUtils.degToRad(34);
 const SLOW_FRAC = 0.55;
 
+// ===========================================================================
+// THE RIDEABILITY ENVELOPE — why LEAN_DESIGN could never have been a constant,
+// and the model that replaces it.
+//
+// WHAT SEVEN ROUNDS OF DOWNSTREAM WORK COULD NOT REACH. Measured on a
+// known-good SYNTHETIC course with no roughness, no exposure, zero vertical
+// curvature and berms at 60% of the required lean — i.e. with this module's
+// entire output removed from the experiment — driving the real bike:
+//
+//     dead straight, 15-45% grade : 6/6 finishes at every speed v6..v14
+//     r_min 64 m, 15% grade       : 6/6 at every speed
+//     r_min 64 m, 25% grade       : 6/6 to v12, 0/6 at v14
+//     r_min 64 m, 30% grade       : 2/6 at v12, 0/6 at v14
+//     r_min 64 m, 36% grade       : 0/6 at v12, 6/6 at v10
+//     r_min 64 m, 45% grade       : 0/6 at EVERY speed from 6 to 14 m/s
+//
+// A 64 m-radius corner needs 5.2 deg of contact lean at 6 m/s. It cannot be
+// taken on a 45% grade. The same 45% grade, straight, is fine at 14 m/s.
+//
+// THE NAIVE FRICTION CIRCLE DOES NOT EXPLAIN THIS and cornerGripBudget() used
+// to be exactly that circle. At 45%: sin 0.410, cos 0.912, holding speed costs
+// g*sin = 4.02 m/s^2 against mu*g*cos = 8.05, leaving sqrt(8.05^2 - 4.02^2) =
+// 6.97 m/s^2 of lateral — which at r = 64 would allow 21 m/s. It fails at 6.
+//
+// THE MECHANISM IS LOAD TRANSFER, and it is in bike.js in plain sight.
+// leanCeiling() (bike.js:1738) does not return atan(mu). It returns
+//
+//     atan( min(capF*L/b, capR*L/a) / N_total * LEAN_GRIP_MARGIN )
+//
+// where capX = lateralCapacity(wheel) = mu*N_x*LAT_GRIP*sqrt(1 - (fx/(mu*N_x))^2).
+// So the ceiling is set by whichever END saturates first under the moment
+// balance — and braking hard enough to hold a steep grade moves load off the
+// rear until there is nothing left there to corner with. The rear load fraction
+// under a longitudinal demand of mu_long = a_long/(g cos theta) is
+//
+//     N_r/N = (a_cg - mu_long * h_cg) / L        a_cg = 0.640, h_cg = 1.05, L = 1.25
+//
+// which is 0.302 at a 25% grade, 0.260 at 30%, 0.210 at 36%, 0.134 at 45% and
+// ZERO at 61% — the endo point, where the trail's own p99 grades live. A wheel
+// carrying 13% of static load on real ground is not a wheel that holds a corner:
+// it skips, `bothDown` goes false several times a second, and leanCeiling's
+// asymmetric fall filter (LEAN_LIMIT_FALL = 2.5x) latches the low value.
+//
+// THE MODEL BELOW IS THAT ARITHMETIC, MIRRORED, plus ONE calibrated term for the
+// skipping — `rel`, a smoothstep on the rear load fraction between REAR_LO and
+// REAR_HI. It is calibrated against the 30 synthetic cells above and nothing
+// else. Usable lean (deg) predicted vs the envelope the cells bracket:
+//
+//     grade   N_r/N   model   cells bracket the truth at
+//      25%    0.302   16.9    between 12.9 (v12 passes) and 17.3 (v14 fails)
+//      30%    0.260   14.5    ~12.9 (v12 marginal, 2/6)
+//      36%    0.210   11.3    between  9.1 (v10 passes) and 12.9 (v12 fails)
+//      45%    0.134    2.4    below 3.3 (v6 fails)
+//
+// All four bracket correctly, including the factor-of-five collapse between 36%
+// and 45% that no friction circle produces. That collapse is the whole finding.
+//
+// TWO DELIBERATE CONSERVATISMS, both stated so nobody re-derives them as bugs.
+//  1. Aerodynamic drag and rolling resistance are NOT credited against the
+//     longitudinal demand. Physically they do reduce the braking required; but
+//     crediting them puts 36% + r64 + v12 back inside the envelope, where the
+//     measurement says it is outside. A rider who arrives fast has to brake
+//     harder than the design profile, and drag is a bonus, not an entitlement.
+//  2. The demand is evaluated at the SLOWEST speed the design permits, because
+//     lower speed is always easier for the corner and harder for nothing.
+//
+// WHAT IT REDUCES TO ON FLAT GROUND. With mu_long = 0 the rear fraction is
+// a/L = 0.512, `rel` = 1, and min(muF, muR)/N = mu*LAT_GRIP, so the budget is
+// atan(mu*LAT_GRIP*LEAN_GRIP_MARGIN*LEAN_USE) = 28 deg on dirt, EXACTLY
+// LEAN_DESIGN. That is the point of LEAN_USE: on the ground where the old
+// constant was right, the model returns the old constant to the last digit, so
+// nothing outside the steeps moves at all. What changes is only that on a 45%
+// grade it now says 2.4 deg instead of 28.
+// ===========================================================================
+const RIDE_WB = 1.25;             // bike.js T.WHEELBASE
+const RIDE_CG_FWD = -0.015;       // bike.js T.CG_FWD
+const RIDE_CG_H = 1.05;           // bike.js T.ROLL_H — cg above the contact line
+const RIDE_A = RIDE_WB * 0.5 - RIDE_CG_FWD;   // 0.640 m, cg -> front axle
+const RIDE_B = RIDE_WB * 0.5 + RIDE_CG_FWD;   // 0.610 m, cg -> rear axle
+const RIDE_LAT_GRIP = 0.94;       // bike.js T.LAT_GRIP
+const RIDE_GRIP_MARGIN = 0.92;    // bike.js T.LEAN_GRIP_MARGIN
+const RIDE_MU0 = 1.00;            // bike-side peak mu on DIRT; SURF_MU scales it
+// The calibrated skipping band. Below REAR_LO the rear is not a cornering wheel
+// at all; above REAR_HI it is fully trusted. See the table above.
+const RIDE_REAR_LO = 0.08;
+const RIDE_REAR_HI = 0.22;
+// Grade at which the rear leaves the ground under speed-holding braking:
+// mu_long = a/h = 0.610. Nothing above this is admissible at any radius, even
+// dead straight — it is an endo, not a gradient.
+const RIDE_ENDO_MU = RIDE_A / RIDE_CG_H;
+// The design's share of the bike's own ceiling. Chosen — not tuned — so that
+// leanBudget() on flat dirt returns exactly LEAN_DESIGN, i.e. this is the
+// number that makes the change a no-op everywhere the old constant was right.
+const LEAN_USE = Math.tan(LEAN_DESIGN) / (RIDE_MU0 * RIDE_LAT_GRIP * RIDE_GRIP_MARGIN);
+// Floor on the longitudinal demand fed to the model, as a fraction of what
+// holding the grade costs. A rider is never perfectly neutral.
+const RIDE_DEC_CAP = 5.0;         // m/s^2 of design deceleration worth pricing
+
+/**
+ * sin(theta) -> tan(theta), SIGN PRESERVED. S.grade is the y-component of a
+ * 3-D unit tangent, i.e. sin(theta) — while every consumer in this file treats
+ * it as rise/run. The two differ by 5% at a 30% grade and 12% at 50%, which is
+ * inside nobody's error bar until it is multiplied by a load-transfer arm.
+ */
+function tanFromSin(s) {
+  const a = clamp(Math.abs(s), 0, 0.985);
+  const t = a / Math.sqrt(1 - a * a);
+  return s < 0 ? -t : t;
+}
+
+/**
+ * Rear load fraction under a longitudinal demand of `muLong` (tyre force /
+ * normal force, SIGNED: + = braking). Negative means the rear is off the
+ * ground — an endo. Under drive it is the FRONT that goes light instead, which
+ * is why leanBudget() takes the smaller of the two ends rather than the rear.
+ */
+function rearLoadFrac(muLong) {
+  return (RIDE_A - muLong * RIDE_CG_H) / RIDE_WB;
+}
+
+/**
+ * THE LEAN A RIDER CAN ACTUALLY HOLD AGAINST THE TREAD, in radians, on ground
+ * of gradient `tanTheta` while shedding `decel` m/s^2 on top of holding the
+ * grade, on a surface whose grip scale is `muSurf` (SURF_MU).
+ *
+ * Returns 0 when no lean at all is available — which is a statement that the
+ * ground is unrideable at any radius, not a small number.
+ */
+function leanBudget(tanTheta, decel, muSurf) {
+  const mu = clamp(RIDE_MU0 * muSurf, 0.30, 1.10);
+  const cosT = 1 / Math.sqrt(1 + tanTheta * tanTheta);
+  const sinT = tanTheta * cosT;                    // SIGNED: + = descending
+  const gN = G * cosT;
+  // What the TYRES must supply: gravity along the slope, plus whatever the
+  // speed profile is asking to be shed. Signed, so a station that is climbing
+  // is not charged for braking gravity is doing for it. Drag and rolling
+  // resistance are deliberately not credited — see conservatism (1) above.
+  // Clamped at zero from below. A station the design profile happens to be
+  // ACCELERATING through is not a station where the rider is guaranteed to be:
+  // they may arrive at the design speed and merely hold it, which is the demand
+  // the calibration cells were governed to. Crediting the acceleration measured
+  // 26 deg of budget on a 40% grade at seed 20260726 arc 177-183 m, authorised
+  // 22 m/s of corner cap on a 150 m radius, and put the run into the corner at
+  // 190 m carrying 10.2 m/s. The grade itself stays SIGNED, so a climb is still
+  // not charged for braking gravity is doing for it.
+  const muLong = (G * sinT + clamp(decel, 0, RIDE_DEC_CAP)) / gN;
+  const muAbs = Math.abs(muLong);
+  if (muAbs >= mu * 0.995) return 0;               // nothing left, at any radius
+  const nR = rearLoadFrac(muLong);
+  const nF = 1 - nR;
+  if (nR <= 0 || nF <= 0) return 0;                // endo, or the front is gone
+  const u = muAbs / mu;
+  const shed = Math.sqrt(Math.max(0, 1 - u * u));  // friction ellipse, per wheel
+  // The light END is the one that skips, and under drive that is the front.
+  const rel = smoothstep(RIDE_REAR_LO, RIDE_REAR_HI, Math.min(nR, nF));
+  // capX * L / arm, normalised by N_total — exactly leanCeiling()'s two-end form.
+  const muR = nR * (RIDE_WB / RIDE_A) * mu * RIDE_LAT_GRIP * shed;
+  const muF = nF * (RIDE_WB / RIDE_B) * mu * RIDE_LAT_GRIP * shed;
+  const muEff = Math.min(muF, muR) * RIDE_GRIP_MARGIN * rel;
+  return Math.atan(muEff * LEAN_USE);
+}
+
+/** Contact lean a corner of plan radius r demands at speed v, radians. */
+function leanRequired(v, r) {
+  return Math.atan((v * v) / (G * Math.max(0.5, r)));
+}
+
 // ---------------------------------------------------------------------------
-// QA OVERRIDE. `ctx.settings.trailSolver` is a diagnostic switch with exactly
+// FEASIBILITY AS A COST ON THE MARCH — the weights, and what class each is in.
+//
+// The march's existing terms fall into three classes, and a term that does not
+// know which class it is in will either do nothing or take over the route:
+//
+//   tie-break   |dth|*42, wander*95, cross-slope 120, CORR_CAP 110, LEG_CAP 115
+//   steering    grade holding 220, aim up to 220, over-grade 320
+//   refusal     climb 900/1100/1600 (but these are per UNIT of grade deficit,
+//               so a heading climbing at 5% actually costs about 230), and the
+//               leg-conflict gate LEG_W_HARD (capped at 1500)
+//
+// The feasibility term is split to match. `soft` says "the phase cannot be
+// ridden at its design speed here" and sits in the tie-break class, so it
+// shapes a choice between comparable headings and never buys a climb. `hard`
+// says "there is no speed at all at which a bicycle holds this" and sits at the
+// top of the steering class — able to outbid grade holding and `aim`, and
+// deliberately NOT able to outbid the climb gates, because a route that climbs
+// to avoid steep ground is a different defect, not a fix.
+//
+// It does not need to outbid them. The escape from an infeasible heading is
+// almost never uphill: turning LESS takes the radius to infinity and the
+// shortfall to zero, and where the ground is too steep for that to help, the
+// escape is a TRAVERSE — which is a descending heading with a smaller grade.
+// That is (a) in the trail builder's list: turn where it is flatter, point it
+// straighter where it is steep.
+//
+// AND THE HALF THAT WAS MISSING FROM THE FIRST CUT OF THIS TERM, stated because
+// it is the most instructive measurement of the round. Scored on the corner
+// alone — shortfall and headroom, both functions of the RADIUS — the term did
+// exactly what it was told and made the course WORSE: seed 20260726's p99 grade
+// went 47% -> 75%, its max 79% -> 101%, and the worst 25 m friction bin 43% ->
+// 75%. Penalising a turn on steep ground, and nothing else, does not send the
+// route somewhere flatter; it sends it STRAIGHT DOWN THE FALL LINE, which is
+// the one heading where the radius is infinite and the corner term is free.
+//
+// "Turn where it is flatter and point it straighter where it is steep" is two
+// instructions, and only the second one is about radius. The first is about the
+// GROUND, and it needs its own term: `budgetLoss` — how much cornering capacity
+// the gradient has already taken away from a rider, whatever they do with the
+// bars. It is priced on every candidate, including dead-straight ones, so steep
+// ground is expensive per se and a heading that merely avoids turning on it
+// cannot escape the bill.
+const FEAS_W_BUDGET = 300.0;      // per radian of lean budget the grade has eaten
+const FEAS_CAP_BUDGET = 110.0;    // same scale as the cross-slope penalty (120)
+const FEAS_W_SOFT = 220.0;        // per radian of lost design-speed headroom
+const FEAS_CAP_SOFT = 80.0;
+const FEAS_W_HARD = 3000.0;       // per radian of lean the ground cannot supply
+const FEAS_CAP_HARD = 300.0;
+const FEAS_W_SPEED = 60.0;        // per m/s the launch cap falls below the floor
+const FEAS_CAP_SPEED = 120.0;
+const FEAS_W_ENDO = 900.0;        // per unit of rear-load fraction past the endo
+const FEAS_CAP_ENDO = 260.0;
+// The plan radius a candidate heading commits to is estimated from the turn it
+// asks for, blended with the turn the march is already carrying — a corner is a
+// SUSTAINED turn, and pricing one 6 m step in isolation lets the route spiral
+// into a hairpin one admissible step at a time.
+const FEAS_TURN_MEMORY = 0.45;
+// Radius beyond which a heading is simply not a corner and the term is off.
+const FEAS_R_MAX = 400.0;
+// Fraction of a declared bank that survives to the ridden surface: 0.95 for the
+// stamp cloud reconstructing its own section, 0.92 for terrain's band limit.
+// Both are terrain.js's own published measurements, not fitted here.
+const BERM_REALISE = 0.95 * 0.92;
+// The switchback the march builds is a fixed 6.5 m radius reversal.
+const SB_RADIUS = 6.5;
+// ...and the speed a hairpin APEX is ridden at, which is not V_DESIGN_FLOOR.
+// The file's own note says it: at the apex the rider is at full lock, at minimum
+// speed, with the fall line across them. Gating at the general design floor
+// (6.2 m/s) demands 31.1 deg of contact lean from a 6.5 m radius and refuses
+// every hairpin on ground steeper than about 37% in the tech phases — measured
+// on seed 99999, that refused ALL of them, and the route answered by running
+// straight down the fall line instead: minimum plan radius 5.4 -> 20.9 m,
+// stations over 35% grade 6.1% -> 16.9%, feature count 40 -> 21. Refusing to
+// turn on steep ground is not the same as not being on steep ground, and the
+// straight-and-steeper course it produced is the worse of the two.
+const SB_V_APEX = 5.5;
+// Slack allowed at the switchback gate: a hairpin apex is the one place a
+// builder deliberately spends the whole budget.
+const SB_FEAS_TOL = THREE.MathUtils.degToRad(3);
+// ...and the relief valve. If the drift has run this far past the phase's own
+// allowance, the feasibility gate stands down and the old fall-angle gate is
+// the only test — otherwise a mountain with no flat ground anywhere would
+// forbid every switchback and the route would traverse to the map edge. This is
+// the guard against "must not switchback endlessly" read in the other
+// direction: it must also never become unable to switchback at all.
+const SB_FORCE_DRIFT = 2.4;
+
+
 // the same contract as terrain's `settings.treadFilter`: explicit, logged,
 // identical on every boot of the same settings, and never consulted by anything
 // else. It exists so a harness can A/B the joint solve against ONE cached
 // mountain in ONE process — which is the only way any number in this file's
 // notes can be trusted, and doubly so while terrain.js is itself changing.
 //
-//   { launch: boolean, rebank: boolean }   both default true
+//   { launch: boolean, rebank: boolean, feasible: boolean }   all default true
 //
 // `launch: false` restores the round-6 behaviour exactly: the fixed-wavelength
 // chatter ceiling below, and no relief flattening. `rebank: false` keeps the
 // launch cap but leaves the bank where the pre-feature solve put it — i.e. it
 // reproduces the round-6 speed-clamp ablation, which is the experiment that
 // dropped seed 777 to 34 m with 17 lowsides.
+//
+// `feasible: false` restores the round-7 behaviour exactly: marchRoute scored
+// without the rideability term, the switchback gate on fall angle alone, the
+// corner grip budget as the naive friction circle, and the bank identity floor
+// against the constant LEAN_DESIGN. It is the A/B control for everything the
+// rideability section above adds, and it is the ONLY way to attribute a change
+// in the acceptance figures to this round rather than to a moving mountain.
 function readSolverOpts(settings) {
   const o = settings && settings.trailSolver;
-  const dflt = { launch: true, rebank: true, safety: LAUNCH_SAFETY, carveFloor: KAPPA_CARVE_FLOOR };
+  const dflt = {
+    launch: true, rebank: true, feasible: true,
+    safety: LAUNCH_SAFETY, carveFloor: KAPPA_CARVE_FLOOR,
+  };
   if (!o || typeof o !== 'object') return dflt;
   const num = (v, d) => (typeof v === 'number' && isFinite(v) && v > 0 ? v : d);
   const spec = {
     launch: o.launch !== false,
     rebank: o.rebank !== false,
+    feasible: o.feasible !== false,
     safety: num(o.safety, LAUNCH_SAFETY),
     carveFloor: num(o.carveFloor, KAPPA_CARVE_FLOOR),
   };
@@ -1866,6 +2152,128 @@ export function createTrail(ctx) {
     return c > CORR_CAP_KAPPA ? CORR_CAP_KAPPA : c;
   }
 
+  // -------------------------------------------------------------------------
+  // RIDEABILITY OF A CANDIDATE HEADING — the same ladder corridorProfile walks,
+  // read for the OTHER question: can a bicycle corner on the ground this heading
+  // commits to?
+  //
+  // It answers with a (v, phi) existence test, exactly as the brief states it:
+  //   1. the longitudinal demand — holding the grade plus the deceleration the
+  //      launch cap itself forces — leaves enough LEAN CEILING (leanBudget());
+  //   2. atan(v^2/(g r)) <= phi + lean_available;
+  //   3. v <= sqrt(g / kappa_vertical) with the CREST_SAFETY margin.
+  // The lowest admissible speed is the friendliest for (2) and costs nothing in
+  // (1) or (3), so if the corner is not holdable at V_DESIGN_FLOOR it is not
+  // holdable at any speed and the heading is INADMISSIBLE rather than expensive.
+  //
+  // `phi` is what a berm could be built to here, which is the phase's own
+  // maxBank derated by whether the corridor can physically carry the fill — that
+  // is option (b) in the builder's list, and the derate is what stops it being
+  // claimed on a rib where nothing can be built.
+  //
+  // The three ways out are all reachable from inside the heading fan: turning
+  // less takes `radius` up and the requirement down (c, and (a) in its
+  // "point it straighter" form); a shallower heading across the fall line takes
+  // `tanT` down (a, in its "turn where it is flatter" form); and `phi` is the
+  // bank the corridor will hold (b). Nothing here rejects without also telling
+  // the search which direction is cheaper.
+  const rTmp = { cost: 0, shortfall: 0, headroom: 0, vHi: 0, grade: 0, rearFrac: 1 };
+
+  function corridorRide(terrain, x, z, hd, ph, radius, bankFac, out) {
+    const sx = Math.sin(hd), sz = -Math.cos(hd);
+    const vPhase = Math.max(4, V_PHASE[ph.id] === undefined ? 17 : V_PHASE[ph.id]);
+    const y0 = terrainH(terrain, x, z);
+    let yPrev = y0;
+    let prevG = 0, worstK = 0, gNear = 0;
+    for (let k = 1; k < CORR_KS.length; k++) {
+      const s = CORR_KS[k];
+      const y = terrainH(terrain, x + sx * s, z + sz * s);
+      const seg = s - CORR_KS[k - 1];
+      const g = (yPrev - y) / seg;                    // + = descending, rise/run
+      if (k > 1) {
+        const span = 0.5 * (s - CORR_KS[k - 2]);
+        const kap = (g - prevG) / span;
+        if (kap > worstK) worstK = kap;
+      }
+      // THE STEEPEST SUSTAINED PITCH THE STEP COMMITS TO. Cumulative means over
+      // 9, 18 and 27 m, worst of the three — not the worst single 9 m SEGMENT
+      // anywhere in the 64 m probe, and not the 27 m mean alone.
+      //
+      // Both of the obvious choices were measured and both are wrong. The worst
+      // segment over the whole ladder runs past 50% at 15% of candidates on real
+      // mountainside, so it condemned every route on every seed for ground the
+      // profile solver flattens or the trail never occupies. The 27 m mean
+      // alone missed the defect it was written for: at seed 20260726 arc
+      // 175-195 m the shipped profile carries a 20 m pitch at 41-47% with a
+      // 60 m corner in the middle of it — the exact grade x radius cell the
+      // synthetic sweep scores 0/6 at every speed — and its 27 m mean reads 30%.
+      // Cumulative means are the compromise: 9 m is short enough to see a pitch
+      // a corner fits inside, and averaging from the step rather than differencing
+      // one segment keeps it out of the mountain's own metre-scale noise.
+      if (k <= 3) { const gc = (y0 - y) / s; if (gc > gNear) gNear = gc; }
+      prevG = g; yPrev = y;
+    }
+    // (3) the speed the natural relief permits, before any excavation.
+    const kUse = Math.max(worstK, CREST_KAPPA_MIN);
+    const vLaunch = Math.sqrt(G / (CREST_SAFETY * kUse));
+    const vHi = Math.min(vPhase, vLaunch);
+    // (1) the deceleration that cap itself demands over the probe span. This is
+    // the term the friction-circle audit found dominant: on the shipped course
+    // mu_long from braking exceeded mu_long from grade by 3x.
+    const span = CORR_KS[CORR_KS.length - 1];
+    const dec = vLaunch < vPhase
+      ? (vPhase * vPhase - vLaunch * vLaunch) / (2 * span) : 0;
+    const tanT = gNear;                               // rise/run, signed
+    const muSurf = SURF_MU[ph.surface] === undefined ? 1 : SURF_MU[ph.surface];
+    const budget = leanBudget(tanT, dec, muSurf);
+    const st = BERM_STYLE[ph.id] || BERM_STYLE_DEFAULT;
+    // What a berm here would ACTUALLY realise, not what the phase ceiling says:
+    // the emitted design realises ~0.95 of its declared cross-slope on the
+    // acceptance secant and terrain's band limit commits ~0.92 of that (both
+    // measured, both documented in terrain.js's own CONTRACT-NOTE).
+    const phi = st.maxBank * clamp01(bankFac) * BERM_REALISE;
+    const avail = budget + phi;
+    const needLo = leanRequired(V_DESIGN_FLOOR, radius);
+    const needHi = leanRequired(Math.max(V_DESIGN_FLOOR, vHi), radius);
+    out.shortfall = needLo - avail;
+    out.headroom = avail - needHi;
+    out.vHi = vHi;
+    out.grade = tanT;
+    const cosT = 1 / Math.sqrt(1 + tanT * tanT);
+    const muLong = (G * tanT * cosT + clamp(dec, 0, RIDE_DEC_CAP)) / (G * cosT);
+    const nR = rearLoadFrac(muLong);
+    out.rearFrac = nR;
+    let c = 0;
+    // (a) TURN WHERE IT IS FLATTER. Priced on the ground, not on the turn, so a
+    // heading cannot dodge it by pointing straight down the face.
+    const loss = LEAN_DESIGN - budget;
+    if (loss > 0) c += Math.min(FEAS_CAP_BUDGET, loss * FEAS_W_BUDGET);
+    if (out.shortfall > 0) {
+      c += Math.min(FEAS_CAP_HARD, out.shortfall * FEAS_W_HARD);
+    } else if (out.headroom < 0) {
+      c += Math.min(FEAS_CAP_SOFT, -out.headroom * FEAS_W_SOFT);
+    }
+    if (vHi < V_DESIGN_FLOOR) {
+      c += Math.min(FEAS_CAP_SPEED, (V_DESIGN_FLOOR - vHi) * FEAS_W_SPEED);
+    }
+    if (nR < RIDE_REAR_LO) {
+      const over = (RIDE_REAR_LO - nR) / Math.max(0.02, RIDE_REAR_LO);
+      c += Math.min(FEAS_CAP_ENDO, over * FEAS_W_ENDO);
+    }
+    out.cost = c;
+    return out;
+  }
+
+  /**
+   * How much of the phase's berm ceiling this corridor could actually stand up,
+   * 0..1. `deficit` is designCatch()'s own shortfall in metres of fill at the
+   * friendliest reach — it is exactly zero wherever a retaining edge can be
+   * built, so on ordinary sidehill this returns 1 and the term is inert.
+   */
+  function bankFactorFor(deficit) {
+    return 1 - 0.75 * clamp01(deficit / CORR_BUDGET);
+  }
+
   // ---------------------------------------------------------------------------
   // LEG CLEARANCE — the route must not lay a second leg on ground an earlier leg
   // has already claimed.
@@ -2113,6 +2521,13 @@ export function createTrail(ctx) {
     let mode = 0;                              // 0 = ride, 1 = switchback
     let sbSign = 1, sbSteps = 0, lastSwitchback = -999;
     const g = { gx: 0, gz: 0, mag: 0 };
+    // Turn the march is already carrying, rad per step. A corner is a SUSTAINED
+    // turn: pricing one 6 m step in isolation lets the route spiral into a
+    // hairpin one individually-admissible step at a time. See FEAS_TURN_MEMORY.
+    let turnMem = 0;
+    // Rideability book-keeping for this variant — reported on routeAudit so the
+    // choice between variants can be read rather than assumed.
+    let feasSteps = 0, feasBadSteps = 0, feasCostSum = 0, sbForced = 0;
 
     const MAX_STEPS = 3000;
     for (let step = 0; step < MAX_STEPS; step++) {
@@ -2166,8 +2581,46 @@ export function createTrail(ctx) {
         // down a 55 deg face is not.
         gradAt(terrain, x + dirX * SB_APEX_PROBE, z + dirZ * SB_APEX_PROBE, 9, gTmp);
         const apexFall = Math.max(fallSteep, gTmp.mag);
+        // THE GATE THE FALL ANGLE ALONE COULD NOT BE. SB_MAX_FALL is tan(38 deg)
+        // — and a 6.5 m reversal on a 38% face needs
+        //     atan(V_DESIGN_FLOOR^2/(g*6.5)) = 31.1 deg
+        // of contact lean, against a lean budget that has already collapsed to
+        // about 10 deg by 38% and a berm ceiling of 17-20 deg in the tech
+        // phases. That is the "5 m radius corners on 69% grades" the audit
+        // found, and no downstream pass can rescue it: the apex is committed
+        // 600 m before any speed profile exists.
+        //
+        // So the entry now asks the same existence question the heading search
+        // asks — can a bicycle hold SB_RADIUS at the slowest speed the design
+        // permits, on the ground the APEX will land on, with the biggest berm
+        // this phase and this corridor can carry? If not, the drift simply keeps
+        // growing and the march keeps traversing, which is what a builder does.
+        let sbOk = apexFall < SB_MAX_FALL;
+        if (SOLVER.feasible && sbOk) {
+          const ax = x + dirX * SB_APEX_PROBE, az = z + dirZ * SB_APEX_PROBE;
+          corridorAt(terrain, ax, az, dirX, dirZ, ph.width * 0.5, cTmp);
+          const st = BERM_STYLE[ph.id] || BERM_STYLE_DEFAULT;
+          const phi = st.maxBank * clamp01(bankFactorFor(cTmp.deficit));
+          const muSurf = SURF_MU[ph.surface] === undefined ? 1 : SURF_MU[ph.surface];
+          const avail = phi + leanBudget(apexFall, 0, muSurf) + SB_FEAS_TOL;
+          // The hard half: past the endo grade the rear wheel is not on the
+          // ground under the braking a hairpin entry needs, and no berm makes
+          // that rideable. This is the "5 m radius corners on 69% grades" case.
+          // Holding speed on a grade costs mu_long = tan(theta) exactly, and
+          // apexFall IS rise/run, so it is the longitudinal demand directly.
+          const apexRear = rearLoadFrac(apexFall);
+          sbOk = apexRear >= RIDE_REAR_LO
+            && leanRequired(SB_V_APEX, SB_RADIUS) <= avail;
+          // The relief valve. A mountain with no flat ground anywhere must not
+          // be able to forbid every switchback — the route would traverse to the
+          // map edge and the corridor term would never get it back. Past
+          // SB_FORCE_DRIFT times the phase's own allowance the gate stands down
+          // and the fall-angle test is once again the only one. Counted, so a
+          // course that relies on it says so.
+          if (!sbOk && Math.abs(drift) > limit * SB_FORCE_DRIFT) { sbOk = true; sbForced++; }
+        }
         if (Math.abs(drift) > limit && outbound && fallSteep > 0.26 &&
-            apexFall < SB_MAX_FALL &&
+            sbOk &&
             travelled - lastSwitchback > 110 && z > zFinish + 220) {
           mode = 1;
           sbSign = -Math.sign(drift) || 1;
@@ -2251,9 +2704,29 @@ export function createTrail(ctx) {
           // 24 m at the phase's own design width, capped at CORR_CAP so it can
           // bias a choice between comparable headings and nothing more — see the
           // long note at CORR_S.
+          // RIDEABILITY. Read the deficit at the candidate itself first — it is
+          // both the berm-buildability factor and, via corridorCost below, the
+          // protectability term, and corridorAt writes into shared scratch.
+          let bankFac = 1;
+          if (SOLVER.feasible) {
+            corridorAt(terrain, nx, nz, s2, c2, ph.width * 0.5, cTmp);
+            bankFac = bankFactorFor(cTmp.deficit);
+          }
           sc -= corridorCost(terrain, nx, nz, h2, ph.width * 0.5, CORR_S, CORR_CAP);
           sc -= corridorGate(terrain, nx, nz, h2, ph.width * 0.5);
           sc -= corridorProfile(terrain, nx, nz, h2, V_PHASE[ph.id]);
+          if (SOLVER.feasible) {
+            // The radius this heading commits to. `dth` alone under-reads a
+            // sustained turn, so it is blended with the turn already carried.
+            const dthEff = Math.abs(dth) * (1 - FEAS_TURN_MEMORY)
+              + Math.abs(dth + turnMem) * FEAS_TURN_MEMORY;
+            const rCand = dthEff > 1e-4 ? Math.min(FEAS_R_MAX, ds / dthEff) : FEAS_R_MAX;
+            // Evaluated on EVERY candidate, straight ones included — see the
+            // note at FEAS_W_BUDGET for the measurement that made that
+            // non-negotiable.
+            corridorRide(terrain, nx, nz, h2, ph, rCand, bankFac, rTmp);
+            sc -= rTmp.cost;
+          }
           // LEG CLEARANCE. Exactly zero unless this heading would lay tread on
           // ground an earlier leg has already claimed — see legClearanceCost().
           sc -= legClearanceCost(hist, nx, nz, travelled + ds, ph.width * 0.5);
@@ -2263,6 +2736,9 @@ export function createTrail(ctx) {
       }
 
       head += dHead;
+      // Carried turn, decayed per METRE so the estimate does not depend on
+      // whether the march is taking 6 m ride steps or 3 m switchback steps.
+      turnMem = turnMem * Math.pow(0.72, ds / 6) + dHead;
       x += Math.sin(head) * ds;
       z -= Math.cos(head) * ds;
       x = clamp(x, B.minX + 40, B.maxX - 40);
@@ -2271,6 +2747,18 @@ export function createTrail(ctx) {
       travelled += ds;
       px.push(x); pz.push(z); pph.push(phIdx);
       histPush(x, z, travelled, ph.width * 0.5);
+      if (SOLVER.feasible) {
+        // Audit the step that was actually COMMITTED, at the radius it committed
+        // to (a switchback commits SB_RADIUS by construction). This is the row
+        // scoreRoute() and the admissibility check are read off.
+        const rC = mode === 1 ? SB_RADIUS
+          : (Math.abs(dHead) > 1e-4 ? Math.min(FEAS_R_MAX, ds / Math.abs(dHead)) : FEAS_R_MAX);
+        corridorAt(terrain, x, z, Math.sin(head), -Math.cos(head), ph.width * 0.5, cTmp);
+        corridorRide(terrain, x, z, head, ph, rC, bankFactorFor(cTmp.deficit), rTmp);
+        feasSteps++;
+        feasCostSum += rTmp.cost;
+        if (rTmp.shortfall > 0 || rTmp.rearFrac < RIDE_REAR_LO) feasBadSteps++;
+      }
 
       // The run is a designed length. Stop there, or if we run out of mountain.
       if (travelled >= targetLength) break;
@@ -2292,6 +2780,11 @@ export function createTrail(ctx) {
     return {
       px, pz, pph, startX, zStart, finishX, zFinish, drop, targetLength, variant,
       startY: yStart,
+      // Rideability of the line as it was MARCHED — the committed heading and
+      // the committed radius at every step, not a re-derivation afterwards.
+      marchFeasFrac: feasSteps ? feasBadSteps / feasSteps : 0,
+      marchFeasCost: feasSteps ? feasCostSum / feasSteps : 0,
+      sbForced,
     };
   }
 
@@ -2304,15 +2797,20 @@ export function createTrail(ctx) {
     const n = route.px.length;
     if (n < 40) return -1e9;
     let travelled = 0, climb = 0, low = Infinity;
-    let y0 = 0, yLast = 0;
+    let y0 = 0, yLast = 0, flat = 0, flatWorst = 0;
     for (let k = 0; k < n; k++) {
       const y = terrainH(terrain, route.px[k], route.pz[k]);
       if (k === 0) { y0 = y; low = y; }
-      if (k > 0) travelled += Math.hypot(route.px[k] - route.px[k - 1], route.pz[k] - route.pz[k - 1]);
+      if (k > 0) {
+        const step = Math.hypot(route.px[k] - route.px[k - 1], route.pz[k] - route.pz[k - 1]);
+        travelled += step;
+        if (y >= yLast - 1e-4) { flat += step; if (flat > flatWorst) flatWorst = flat; } else flat = 0;
+      }
       if (y - low > climb) climb = y - low;
       if (y < low) low = y;
       yLast = y;
     }
+    route.flatWorst = flatWorst;
     const dropGot = y0 - yLast;
     const lenErr = Math.abs(travelled - route.targetLength) / Math.max(1, route.targetLength);
     const dropErr = Math.abs(dropGot - route.drop) / Math.max(1, route.drop);
@@ -2345,6 +2843,52 @@ export function createTrail(ctx) {
     route.corrBad = corrBad;
     route.marchedLength = travelled;
     route.marchedDrop = dropGot;
+    // ---- rideability, on the FINISHED candidate ----------------------------
+    // The same argument as the corridor block above, for the other constraint.
+    // The heading search is local and can be walked into a corridor where every
+    // exit is unrideable several hundred metres earlier; this is the only place
+    // that shows up, and marchRoute() already runs several variants precisely so
+    // one of them can be thrown away.
+    //
+    // The radius here is the polyline's OWN circumradius over a +-2 point (12 m)
+    // stencil, not the march's step-by-step estimate — a deliberately
+    // independent second opinion on the same line.
+    let feasBad = 0, feasN = 0, feasCost = 0, feasWorst = 0;
+    if (SOLVER.feasible) {
+      // MEASURED ON THE LINE THAT WILL BE BUILT, not on the raw marched
+      // polyline. buildStations() smooths with exactly these parameters before
+      // it lays a single station, and the difference is not cosmetic: a 6 m-step
+      // polyline carrying the wander noise reads a circumradius of 20-40 m on
+      // ground a rider would call dead straight, so the raw line scores 13% of
+      // itself unrideable and every variant fails admissibility for a corner
+      // that is never built. Same smoothing, same answer as the stations.
+      const sm = smoothPolyline(route.px, route.pz, 4, 0.30);
+      const m = 3;                     // +-18 m circumradius stencil
+      for (let k = m; k < n - m; k += 2) {
+        const ph = PHASES[route.pph ? route.pph[k] : 0];
+        const ax = sm.x[k - m] - sm.x[k], az = sm.z[k - m] - sm.z[k];
+        const bx = sm.x[k + m] - sm.x[k], bz = sm.z[k + m] - sm.z[k];
+        const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+        const lc = Math.hypot(sm.x[k + m] - sm.x[k - m], sm.z[k + m] - sm.z[k - m]);
+        const area2 = Math.abs(ax * bz - az * bx);
+        if (area2 < 1e-6 || la < 1e-6 || lb < 1e-6) continue;
+        const r = Math.min(FEAS_R_MAX, (la * lb * lc) / (2 * area2));
+        const dx = sm.x[k + 1] - sm.x[k - 1], dz = sm.z[k + 1] - sm.z[k - 1];
+        const l = Math.max(1e-4, Math.hypot(dx, dz));
+        const hd = Math.atan2(dx / l, -dz / l);
+        corridorAt(terrain, sm.x[k], sm.z[k], dx / l, dz / l, ph.width * 0.5, cTmp);
+        corridorRide(terrain, sm.x[k], sm.z[k], hd, ph, r,
+          bankFactorFor(cTmp.deficit), rTmp);
+        feasN++;
+        feasCost += rTmp.cost;
+        if (rTmp.shortfall > 0 || rTmp.rearFrac < RIDE_REAR_LO) feasBad++;
+        if (rTmp.shortfall > feasWorst) feasWorst = rTmp.shortfall;
+      }
+    }
+    route.feasFrac = feasN ? feasBad / feasN : 0;
+    route.feasMean = feasN ? feasCost / feasN : 0;
+    route.feasWorst = feasWorst;
+    route.feasN = feasN;
     // Gradient of the first 90 m of the marched line — the Start Chute's own
     // fall line, and the number that showed the launch scan had traded exposure
     // for a face the opening phase cannot use. See the launch scan in marchRoute.
@@ -2360,7 +2904,149 @@ export function createTrail(ctx) {
     // gives up about as much as a 25% length error — a big number, because a
     // route that is unprotectable along its length is not a course, and a small
     // enough one that it cannot win against a route that climbs.
-    return -climb * 9 - lenErr * 90 - dropErr * 70 - route.corrMean * 0.20;
+    //
+    // Rideability enters at the same scale and one step above it. `feasMean` is
+    // in the same units as `corrMean` and carries the same weight; `feasFrac` is
+    // a FRACTION OF THE COURSE that no bicycle can ride, and 10% of that is
+    // worth more than any length error, because a route with a hundred metres of
+    // unrideable trail in it is not a shorter course, it is not a course.
+    // `corrMean` is a mean over a course that is protectable nearly everywhere,
+    // so at 0.20 it could never decide anything: OFF and ON routes measuring 5
+    // and 41 unprotectable stations differ by about 0.5 points of it. The COUNT
+    // of samples carrying a catch-berm deficit is the quantity that separates
+    // them, and it is weighted so that a route with thirty of them gives up
+    // about as much as a route with 3% of itself unrideable. Neither can outbid
+    // a climb, which is still the disqualifier.
+    //
+    // The non-descending term is here for the same reason: a marched line that
+    // traverses 70 m without losing height is not a fault the profile solver can
+    // fix — enforceDescent() can only CUT, and cutting 70 m of traverse is not a
+    // trail, it is a trench.
+    const flatPen = Math.max(0, (route.flatWorst || 0) - 40) * 2.0;
+    return -climb * 9 - lenErr * 90 - dropErr * 70 - route.corrMean * 0.20
+      - (route.corrBad || 0) * 6 - flatPen
+      - route.feasMean * 0.20 - route.feasFrac * 900;
+  }
+
+  // -------------------------------------------------------------------------
+  // ROUTE ADMISSIBILITY — the gate that stops a broken course shipping.
+  //
+  // WHY IT EXISTS AND WHY IT IS NOT A REPAIR PASS. On seed 2 the shipped route
+  // carries a 2.0 m minimum plan radius (a 1.25 m-wheelbase bike cannot turn
+  // that), 10.59 m of climb, 106.8 m of non-descending trail, 129 unresolved
+  // leg-conflict stations and a worst height gap of 7.85 m across a 4.75 m plan
+  // gap at arc 789 — the signature of the route folding back across its own
+  // line and terrain then being asked to serve two surfaces from one
+  // heightfield. Every one of those is a property of the MARCHED POLYLINE, i.e.
+  // it is decided before a single station exists, and none of them is
+  // repairable downstream: openTightCorners() explicitly locks hairpins,
+  // enforceDescent() can only cut, and auditLegConflicts() can only pinch.
+  //
+  // So the failure is DETECTED and the route is RE-DRAWN, deterministically.
+  // build() marches its usual variants, and if the best of them is inadmissible
+  // it marches further variants — each with its own subSeed'd stream, so the
+  // extra attempts are as reproducible as the first seven — until one is
+  // admissible or the budget runs out. Nothing about the mountain changes: the
+  // terrain heightfield is already built and the carve has not run, so this
+  // reseeds only the ROUTE. That is the choice made here over reseeding the
+  // world, and the reason is that ctx.seed is a contract with terrain, sky,
+  // vegetation and every screenshot ever taken of a given seed; a trail that
+  // cannot find a line is a trail problem and must be paid for by the trail.
+  //
+  // If no variant is admissible the best-scoring one still ships — a course is
+  // better than an exception — and `safety.routeAdmissible` says so in terms,
+  // with the first failing test named in `safety.routeFail`.
+  // The two thresholds below are on the MARCHED line, before enforceDescent()
+  // has cut anything, so they are deliberately looser than the shipped limits
+  // they protect: enforceDescent holds the shipped climb to 7 m and can do it
+  // wherever the cut budget allows. What they are here to catch is the gross
+  // failure — seed 2's 10.6 m of shipped climb and 106.8 m of non-descending
+  // trail — not a marched line that merely needs benching.
+  const ROUTE_MAX_CLIMB = 12.0;       // m above the running low, marched line
+  const ROUTE_MAX_FLAT = 90.0;        // m of continuous non-descending trail
+  const ROUTE_MIN_R = 5.0;            // m of plan radius on the marched line
+  // Fraction of the marched line no bicycle can ride. This is a GROSS-FAILURE
+  // gate, not the target: the target is carried by scoreRoute's -feasFrac*900,
+  // which is a continuous preference and does the work on every ordinary seed.
+  // Set at 2% it was unreachable on every seed and every variant — so the
+  // extended budget ran 16 marches on courses that had nothing wrong with them,
+  // and `routeAdmissible` reported false on a course that ships fine. 6% is
+  // where the shipped routes actually sit once the term is doing its job.
+  const ROUTE_MAX_FEAS = 0.06;
+  const ROUTE_CONFLICT_TOL = 0.75;    // m, = LEG_HARD_TOL
+
+  /**
+   * Metres of missing leg clearance summed over every pair of polyline points
+   * more than LEG_ARC_MIN of travel apart. Independent of the march's own
+   * incremental term — this one sees the finished line, including the legs that
+   * were laid before the ones they conflict with.
+   */
+  function routeSelfConflict(route) {
+    const n = route.px.length;
+    const s = new Float64Array(n);
+    for (let k = 1; k < n; k++) {
+      s[k] = s[k - 1] + Math.hypot(route.px[k] - route.px[k - 1], route.pz[k] - route.pz[k - 1]);
+    }
+    let worst = 0, total = 0, count = 0;
+    for (let i = 0; i < n; i++) {
+      const hi = (PHASES[route.pph ? route.pph[i] : 0]).width * 0.5;
+      for (let j = i + 1; j < n; j++) {
+        if (s[j] - s[i] < LEG_ARC_MIN) continue;
+        const dx = route.px[j] - route.px[i], dz = route.pz[j] - route.pz[i];
+        const d = Math.hypot(dx, dz);
+        if (d >= LEG_SEARCH) continue;
+        const hj = (PHASES[route.pph ? route.pph[j] : 0]).width * 0.5;
+        const need = legReach(hi) + legReach(hj);
+        if (d >= need) continue;
+        const def = need - d;
+        total += def; count++;
+        if (def > worst) worst = def;
+      }
+    }
+    return { worst, total, count };
+  }
+
+  /**
+   * Walk the marched polyline the way a builder would and say whether it is a
+   * course at all. Returns null when admissible, else the name of the first
+   * test it fails. Fills route.adm* for the audit either way.
+   */
+  function routeAdmissible(terrain, route) {
+    const n = route.px.length;
+    let low = Infinity, climb = 0, flat = 0, flatWorst = 0;
+    let yPrev = 0;
+    for (let k = 0; k < n; k++) {
+      const y = terrainH(terrain, route.px[k], route.pz[k]);
+      if (k === 0) { low = y; yPrev = y; continue; }
+      const step = Math.hypot(route.px[k] - route.px[k - 1], route.pz[k] - route.pz[k - 1]);
+      if (y >= yPrev - 1e-4) { flat += step; if (flat > flatWorst) flatWorst = flat; } else flat = 0;
+      if (y - low > climb) climb = y - low;
+      if (y < low) low = y;
+      yPrev = y;
+    }
+    let rMin = 1e9;
+    for (let k = 2; k < n - 2; k++) {
+      const ax = route.px[k - 2] - route.px[k], az = route.pz[k - 2] - route.pz[k];
+      const bx = route.px[k + 2] - route.px[k], bz = route.pz[k + 2] - route.pz[k];
+      const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+      const lc = Math.hypot(route.px[k + 2] - route.px[k - 2], route.pz[k + 2] - route.pz[k - 2]);
+      const area2 = Math.abs(ax * bz - az * bx);
+      if (area2 < 1e-6 || la < 1e-6 || lb < 1e-6) continue;
+      const r = (la * lb * lc) / (2 * area2);
+      if (r < rMin) rMin = r;
+    }
+    const conf = routeSelfConflict(route);
+    route.admClimb = climb;
+    route.admFlat = flatWorst;
+    route.admMinR = rMin;
+    route.admConflict = conf.worst;
+    route.admConflictN = conf.count;
+    if (climb > ROUTE_MAX_CLIMB) return 'climb';
+    if (flatWorst > ROUTE_MAX_FLAT) return 'nonDescending';
+    if (rMin < ROUTE_MIN_R) return 'planRadius';
+    if (conf.worst > ROUTE_CONFLICT_TOL) return 'legConflict';
+    if (SOLVER.feasible && route.feasFrac > ROUTE_MAX_FEAS) return 'rideability';
+    return null;
   }
 
   /** Laplacian smoothing of the marched polyline in XZ, endpoints pinned. */
@@ -2949,6 +3635,18 @@ export function createTrail(ctx) {
       rawS,                            // ... smoothed over ~10 m; the excavation limits are measured against THIS
       tx, ty, tz, rx, rz,
       grade, curv, radius, phase,
+      // THE RADIUS A RIDER ACTUALLY MEETS. `radius` above is a tangent
+      // difference over a +-5 m stride, Gaussian-smoothed again over +-4 m —
+      // two low-passes on a quantity that only matters at its minimum, so it
+      // systematically OVER-reads exactly where the identity binds. Measured on
+      // the ON build at seed 20260726 arc 188 m: `radius` reports the corner
+      // slack enough to authorise 7.4 m/s while a 0.37 m-stencil circumradius on
+      // the same committed centreline reads 68 m and the honest cap is 6.4.
+      // `radiusR` is the plain +-4 m circumradius — the same stencil the
+      // acceptance harness uses, stated as the brief requires — and the speed,
+      // bank and identity all read it. `radius`/`curv` keep their old duty
+      // (feature siting, bank SIGN) so nothing else in the file moves.
+      radiusR: new Float32Array(N),
       width: new Float32Array(N),
       bank: new Float32Array(N),
       speed: new Float32Array(N),
@@ -3073,11 +3771,78 @@ export function createTrail(ctx) {
    * launched, and hold the corner at the speed you arrive at — are useless on
    * their own if the tyres are already spent resisting gravity.
    */
+  // THE FLOOR UNDER THE CORNER GRIP BUDGET, and why it had to come off.
+  //
+  // 0.12 was there so a genuinely steep chute is paced as a chute rather than as
+  // a stop. Measured on the ON build at seed 20260726, arc 186-194 m — where
+  // every one of six autopilot cells died within 4 m of the same point — it was
+  // doing something else entirely: grade 46%, plan radius 63-71 m, honest lean
+  // budget 0.1-2 deg, and the floor authorised mu = 0.12, which through
+  //     v = sqrt(g r (mu + tan phi) / (1 - mu tan phi))
+  // set the design speed to 11.1 m/s. The lean that corner then demands is
+  // 10.8 deg against 7.0 available. Without the floor the same station solves to
+  // 8.6 m/s and the identity closes exactly. A floor on the GRIP is a floor on
+  // the lie; the honest floor is on the SPEED, and V_DESIGN_FLOOR already is
+  // one — where the corner cap falls below it, the geometry has failed and
+  // safety.cornerFloorBound says so instead of the profile pretending.
   const MU_CORNER_MIN = 0.12;
+  const MU_CORNER_MIN_FEAS = 0.010;   // numerical floor only (keeps the sqrt sane)
+
+  /**
+   * The deceleration the SPEED PROFILE ITSELF demands at station i, m/s².
+   *
+   * This is the term the friction-circle audit found dominant and this module
+   * had never priced: decomposed on seed 20260726, `tan(theta) > mu_design`
+   * alone at 1.27% of stations but `mu_long > mu_design` at 3.88%, so the
+   * braking the design asks for outweighs the grade it asks it on. Zero on the
+   * first solve, when there is no profile yet — which is correct, not a gap:
+   * the solve is a fixed point and the first iterate has nothing to brake for.
+   */
+  function decelDemand(i) {
+    if (!S.speed || S.n < 3) return 0;
+    const a = Math.max(0, i - 1), b = Math.min(S.n - 1, i + 1);
+    const v = S.speed[i];
+    if (!(v > 0.5)) return 0;
+    const dv = (S.speed[b] - S.speed[a]) / ((b - a) * S.ds);
+    // Signed: a station the profile is ACCELERATING through is one where
+    // gravity, not the tyre, is doing the longitudinal work.
+    return clamp(-v * dv, -RIDE_DEC_CAP, RIDE_DEC_CAP);
+  }
+
+  /**
+   * The lean this station's rider can actually hold against the tread, radians.
+   * On flat dirt this is LEAN_DESIGN to the last digit; on a 45% grade under
+   * speed-holding braking it is about 2 deg. See the RIDEABILITY ENVELOPE note.
+   */
+  function leanBudgetAt(i) {
+    if (!SOLVER.feasible) return LEAN_DESIGN;
+    return leanBudget(tanFromSin(S.grade[i]), decelDemand(i), SURF_MU[S.surface[i]]);
+  }
+
+  /**
+   * The lateral friction left after the fall line and the brakes have been paid
+   * for, as a coefficient — which is exactly tan(the lean budget), because
+   * cornerSpeedCap() inverts v² = g·r·(mu + tan phi)/(1 − mu·tan phi) and the
+   * right-hand side of that is g·r·tan(atan(mu) + phi). So substituting the
+   * load-derived budget here makes the identity
+   *
+   *     atan(v²/(g r)) = phi + lean_available(grade, decel, surface)
+   *
+   * hold by construction at every corner where the cap binds, with a budget
+   * that collapses under braking the way the bike's own leanCeiling() does.
+   *
+   * WHAT THIS REPLACES. The old rule was the naive friction circle,
+   * sqrt(mu² − tan²theta) at a CONSTANT mu = tan(28 deg). It is the rule the
+   * skeptic's synthetic-course sweep falsified directly: it authorises 21 m/s
+   * through a 64 m corner on a 45% grade, where the bike cannot hold 6.
+   */
   function cornerGripBudget(i) {
-    const mu = clamp(MU_DESIGN * SURF_MU[S.surface[i]], 0.22, 1.0);
-    const fall = Math.abs(S.grade[i]);
-    return Math.max(MU_CORNER_MIN, Math.sqrt(Math.max(0, mu * mu - fall * fall)));
+    if (!SOLVER.feasible) {
+      const mu0 = clamp(MU_DESIGN * SURF_MU[S.surface[i]], 0.22, 1.0);
+      const fall = Math.abs(S.grade[i]);
+      return Math.max(MU_CORNER_MIN, Math.sqrt(Math.max(0, mu0 * mu0 - fall * fall)));
+    }
+    return Math.max(MU_CORNER_MIN_FEAS, Math.tan(leanBudgetAt(i)));
   }
 
   function cornerSpeedCap(i) {
@@ -3088,7 +3853,7 @@ export function createTrail(ctx) {
     const tb = Math.tan(clamp(helpfulBank(i), -0.55, 0.87));
     const denom = Math.max(0.20, 1 - mu * tb);
     const num = Math.max(0.02, mu + tb);
-    return Math.min(V_CAP, Math.sqrt(Math.max(1, G * S.radius[i] * num / denom)));
+    return Math.min(V_CAP, Math.sqrt(Math.max(1, G * rideRadius(i) * num / denom)));
   }
 
   // -------------------------------------------------------------------------
@@ -3211,15 +3976,148 @@ export function createTrail(ctx) {
     return Math.max(V_DESIGN_FLOOR, Math.min(wantSpeedCap(i), launchSpeedCap(i)));
   }
 
+  // -------------------------------------------------------------------------
+  // BRAKING — the term the friction-circle audit found DOMINANT, and the one
+  // this module had wrong by a factor of two.
+  //
+  // A_BRAKE is a constant 7.2 m/s². The trail's own design friction is
+  // tan(28 deg) = 0.532, so on FLAT ground the profile was already asking for
+  // 1.4x the deceleration it designs the corners against — and on a descent it
+  // is much worse, because gravity is pushing the other way: the honest limit is
+  //
+  //     a_brake = g * (mu_brake * cos theta - sin theta)
+  //
+  // which on a 20% grade is 3.2 m/s², on a 40% grade 1.7, and NEGATIVE past
+  // about 32 deg, where a bicycle cannot slow down at all. Measured on the
+  // shipped profile at seed 20260726: decel p95 3.9 m/s², p99 at the 5 m/s²
+  // measurement clamp — i.e. mu_long from braking alone running to 0.72 where
+  // 0.53 is designed for, which is precisely the audit's decomposition
+  // (mu_long > mu_design at 3.88% of stations against tan theta > mu_design at
+  // 1.27%). It is also what collapses the lean budget: at 5 m/s² of braking the
+  // rear load fraction goes NEGATIVE and leanBudget() returns zero, so 7-8% of
+  // the course had no cornering capacity at all for a reason that had nothing
+  // to do with the ground.
+  //
+  // mu_brake is the design's longitudinal share — the same LEAN_USE fraction of
+  // the bike's own grip, without the LAT_GRIP factor because that one is
+  // lateral — capped by the ENDO limit, which is the real bound on a bicycle's
+  // front brake and lands within 1% of the same number on dirt.
+  // ...AND IT IS SPENT AT A FRACTION, NOT IN FULL. A speed profile that brakes
+  // at 100% of the longitudinal budget has, by definition, no lateral capacity
+  // left anywhere it is braking — leanBudget() returns literally zero — so every
+  // gentle sweeper the profile happens to be slowing through becomes a
+  // violation. That is not a corner defect, it is a design that never left
+  // itself a reserve. 0.72 keeps mu_long at 0.44 on dirt, which leaves
+  // sqrt(0.532^2 - 0.44^2) = 0.30 of lateral inside the trail's own design
+  // friction — enough for a 150 m sweeper at 12 m/s five times over.
+  const BRAKE_USE = 0.72;
+  const BRAKE_A_MIN = 0.35;    // m/s², floor so the backward pass stays solvable
+  // Metres of straight the profile must be at corner speed BEFORE the apex.
+  // Braking into a corner is what makes the lean budget vanish exactly where it
+  // is needed; a rider brakes in a straight line and enters at a settled speed,
+  // and the speed profile has to say so or the corner cap and the grip budget
+  // chase each other down to the floor.
+  const BRAKE_LEAD = 6.0;
+
+  function brakeAccel(i) {
+    if (!SOLVER.feasible) return A_BRAKE;
+    const muS = SURF_MU[S.surface[i]] === undefined ? 1 : SURF_MU[S.surface[i]];
+    const muB = BRAKE_USE * Math.min(LEAN_USE * RIDE_MU0 * muS, RIDE_ENDO_MU);
+    const tanT = tanFromSin(S.grade[i]);          // signed, + = descending
+    const cosT = 1 / Math.sqrt(1 + tanT * tanT);
+    return Math.max(BRAKE_A_MIN, G * (muB * cosT - tanT * cosT));
+  }
+
+  /**
+   * The corner cap, min-filtered over the next BRAKE_LEAD metres. See the note
+   * above: this is what makes the profile arrive at a corner already slowed.
+   */
+  function cornerCapLead(cap, out) {
+    const n = S.n, lead = Math.max(1, Math.round(BRAKE_LEAD / S.ds));
+    for (let i = 0; i < n; i++) {
+      let m = cap[i];
+      const hi = Math.min(n - 1, i + lead);
+      for (let j = i + 1; j <= hi; j++) if (cap[j] < m) m = cap[j];
+      out[i] = m;
+    }
+    return out;
+  }
+
   /** Clamp the solved speed to the corner and section caps, then re-brake. */
+  const _capA = { arr: null, lead: null };
+  function capArrays() {
+    if (!_capA.arr || _capA.arr.length !== S.n) {
+      _capA.arr = new Float32Array(S.n); _capA.lead = new Float32Array(S.n);
+    }
+    return _capA;
+  }
+
+  /**
+   * THE FLOOR IS ON THE SPEED, NOT ON THE GRIP — the second half of taking
+   * MU_CORNER_MIN off, and it took a measurement to find.
+   *
+   * With the grip floor gone the corner cap is honest, and on steep ground the
+   * honest answer collapses: seed 12345 paced 24% of itself below 5.6 m/s and
+   * bottomed out at 1.0 m/s, seed 777 10%, and the autopilot's dominant failure
+   * became `stuck`. That is not a course. Worse, it is self-defeating in exactly
+   * the way this round's whole finding predicts: holding 4.8 m/s down a 46%
+   * grade costs the ENTIRE longitudinal budget in braking, which is what
+   * collapses leanCeiling() in the first place. Asking a rider to go slower on a
+   * steep pitch removes the grip they needed to corner. Measured at seed
+   * 20260726 arc 185-195 m: paced at 4.84 m/s the run crashed at 200 m; the
+   * same corner at 10 m/s crashed at 190 m; the geometry is what is wrong.
+   *
+   * So the design speed is floored at V_DESIGN_FLOOR and the stations where the
+   * unfloored corner cap was below it are COUNTED, not silently obeyed. That
+   * count is a statement that the geometry has failed — it is the number the
+   * march is being scored to drive to zero, and auditJointFeasibility() reports
+   * the same stations as infeasible rather than pretending a 1 m/s trail is a
+   * solution.
+   */
+  function designCap(cornerCap, i) {
+    const c = Math.min(cornerCap, techSpeedCap(i));
+    return SOLVER.feasible ? Math.max(V_DESIGN_FLOOR, c) : c;
+  }
+
   function applyCornerSpeedCap() {
     const n = S.n, ds = S.ds, v = S.speed;
+    const A = capArrays();
+    for (let i = 0; i < n; i++) A.arr[i] = cornerSpeedCap(i);
+    if (SOLVER.feasible) cornerCapLead(A.arr, A.lead); else A.lead.set(A.arr);
     for (let i = 0; i < n; i++) {
-      const cap = Math.min(cornerSpeedCap(i), techSpeedCap(i));
+      const cap = designCap(A.lead[i], i);
       if (v[i] > cap) v[i] = cap;
     }
+    // FORWARD ACCELERATION LIMIT, and it is not cosmetic.
+    //
+    // This pass clamps v DOWN at a station and then only ever ran a BACKWARD
+    // brake limit, so a station whose cap binds next to one whose cap does not
+    // left a STEP UP in the profile — and every consumer that differentiates the
+    // profile reads that step as an acceleration the trail is demanding. All 30
+    // of the friction-circle violations left on seed 20260726 after this round's
+    // route work were this artefact and nothing else: at arc 63.2-63.6 m the
+    // profile stepped 8.2 -> 10.8 m/s across 0.4 m, which is 70 m/s^2 and reads
+    // as mu_long = 3.5 where 0.53 is designed for. The lateral term at those
+    // same stations is 0.03-0.15, i.e. there was never anything wrong with the
+    // corner. A speed profile has to be reachable in BOTH directions.
+    if (SOLVER.feasible) {
+      for (let i = 1; i < n; i++) {
+        const gI = clamp(S.grade[i - 1], -0.6, 0.6);
+        const sinT = gI / Math.sqrt(1 + gI * gI);
+        const cosT = 1 / Math.sqrt(1 + gI * gI);
+        const vp = Math.max(1.0, v[i - 1]);
+        const crr = SURF_CRR[S.surface[i - 1]];
+        const ph = PHASES[S.phase[i - 1]];
+        const pedal = (ph.id === 'start' || ph.id === 'sprint') && vp < 15
+          ? PEDAL_POWER / (RIDER_MASS * vp) : 0;
+        const drag = 0.5 * AIR_RHO * CDA * vp * vp / RIDER_MASS;
+        const a = G * sinT - crr * G * cosT - drag + pedal;
+        const lim = Math.sqrt(Math.max(1.0, vp * vp + 2 * a * ds));
+        if (v[i] > lim) v[i] = lim;
+      }
+    }
     for (let i = n - 2; i >= 0; i--) {
-      const lim = Math.sqrt(v[i + 1] * v[i + 1] + 2 * A_BRAKE * ds);
+      const lim = Math.sqrt(v[i + 1] * v[i + 1] + 2 * brakeAccel(i) * ds);
       if (v[i] > lim) v[i] = lim;
     }
   }
@@ -3352,6 +4250,24 @@ export function createTrail(ctx) {
     }
   }
 
+  // WHY THERE IS NO "RESTORE THE IDENTITY FLOOR AFTER SMOOTHING" PASS, having
+  // built one and measured it.
+  //
+  // The bank solve computes need = atan(v²/(g r)) − lean_budget and then runs a
+  // Gaussian over the result, which costs a short corner about half its peak. It
+  // is tempting to put the floor back afterwards, and it measures WORSE: at seed
+  // 20260726 arc 187 m the restored floor declared 9.57 deg of bank across 12 m
+  // of trail, and the committed cross-slope on the acceptance secant came out at
+  // 3.2 deg — a realisation of 0.33 against terrain's published 0.92 — because
+  // terrain's band limit (sigma 0.555 m along track) cannot reproduce a bank
+  // spike that short, and neither can a rider. The design then priced a corner
+  // cap of 10.5 m/s against a berm that was never built.
+  //
+  // A bank is a RAMP, not a value. So the smoothed bank stands, and where it is
+  // not enough for the identity the SPEED gives way — which is what
+  // applyCornerSpeedCap() has always done and what it can now do honestly, since
+  // MU_CORNER_MIN no longer authorises grip the ground has not got.
+
   function solveSpeeds(rebank = true) {
     const n = S.n, ds = S.ds;
     const vmax = new Float32Array(n);
@@ -3362,8 +4278,11 @@ export function createTrail(ctx) {
     // on the tightest corners.
     const iters = rebank ? 3 : 1;
 
+    const A = capArrays();
     for (let iter = 0; iter < iters; iter++) {
-      for (let i = 0; i < n; i++) vmax[i] = Math.min(cornerSpeedCap(i), techSpeedCap(i));
+      for (let i = 0; i < n; i++) A.arr[i] = cornerSpeedCap(i);
+      if (SOLVER.feasible) cornerCapLead(A.arr, A.lead); else A.lead.set(A.arr);
+      for (let i = 0; i < n; i++) vmax[i] = designCap(A.lead[i], i);
       // Forward — physics-limited acceleration.
       v[0] = 3.0;
       for (let i = 1; i < n; i++) {
@@ -3380,9 +4299,10 @@ export function createTrail(ctx) {
         v[i] = Math.sqrt(Math.max(1.0, vp * vp + 2 * a * ds));
         if (v[i] > vmax[i]) v[i] = vmax[i];
       }
-      // Backward — braking-limited entry speeds.
+      // Backward — braking-limited entry speeds, at the deceleration the GRADE
+      // and the design friction actually allow. See brakeAccel().
       for (let i = n - 2; i >= 0; i--) {
-        const lim = Math.sqrt(v[i + 1] * v[i + 1] + 2 * A_BRAKE * ds);
+        const lim = Math.sqrt(v[i + 1] * v[i + 1] + 2 * brakeAccel(i) * ds);
         if (v[i] > lim) v[i] = lim;
         if (v[i] > vmax[i]) v[i] = vmax[i];
       }
@@ -3393,12 +4313,16 @@ export function createTrail(ctx) {
       // ---- bank every corner, in every phase -----------------------------
       for (let i = 0; i < n; i++) {
         const st = styleAt(i);
-        const r = S.radius[i];
+        const r = rideRadius(i);
         // atan(v²/(g·r)) is the bank that would make the corner feel flat.
         const ideal = Math.atan((v[i] * v[i]) / (G * r));
         // The identity floor: the bank this corner NEEDS so the rider is not
-        // asked for more than LEAN_DESIGN of lean against the tread.
-        const need = ideal - LEAN_DESIGN;
+        // asked for more lean against the tread than the ground will actually
+        // give them. On flat dirt that is LEAN_DESIGN, exactly as before; on
+        // steep ground it is far less, so the BERM has to do the work the lean
+        // cannot — which is option (b) in the builder's list, applied where the
+        // route has already committed to the grade.
+        const need = ideal - leanBudgetAt(i);
         // A genuinely straight section is left flat (the outslope pass below
         // gives it its drainage tilt). "Straight" now means BOTH slack in the
         // identity and slacker than the phase's own berm threshold — the old
@@ -4410,6 +5334,22 @@ export function createTrail(ctx) {
     launchWorstAtBefore: 0, launchWorstAtAfter: 0,
     launchSpeedGiven: 0, launchFloorBound: 0, bankConflict: 0,
     launchStage: { afterJoint: 0, afterSafety: 0 },
+    // ---- route rideability (marchRoute / routeAdmissible) ----
+    // `routeAdmissible` false means NO variant produced a course and the
+    // best-scoring broken one shipped; `routeFail` names the test it failed.
+    // `routeReseeded` true means the extended variant budget was used, i.e. the
+    // first seven attempts all failed and the route was deliberately re-drawn.
+    // `sbForced` counts switchbacks built through the relief valve — hairpins
+    // the rideability gate refused and the drift allowance overrode.
+    routeVariants: 0, routeAdmissible: true, routeFail: '', routeReseeded: false,
+    routeFeasFrac: 0, routeClimb: 0, routeMinR: 0, routeConflict: 0, sbForced: 0,
+    // ---- the joint (v, phi) feasibility of the SHIPPED stations ----
+    // `feasViol` counts stations where no speed in [V_DESIGN_FLOOR, design] and
+    // no bank inside the phase ceiling satisfies the lean identity against the
+    // load-derived budget; `gripFloorBound` counts stations where the corner
+    // budget hit MU_CORNER_MIN and the identity is knowingly not guaranteed.
+    feasViol: 0, feasWorstDeg: 0, feasWorstAt: 0, gripFloorBound: 0,
+    feasCorner: 0, feasLaunch: 0, cornerFloorBound: 0, feasDesignViol: 0,
   };
 
   /**
@@ -5038,10 +5978,10 @@ export function createTrail(ctx) {
       b[i] = S.bank[i];
       if (mask && mask[i]) continue;
       const st = styleAt(i);
-      const r = S.radius[i];
+      const r = rideRadius(i);
       const v = S.speed[i];
       const ideal = Math.atan((v * v) / (G * r));
-      const need = ideal - LEAN_DESIGN;
+      const need = ideal - leanBudgetAt(i);
       const hold = Math.atan((SLOW_FRAC * SLOW_FRAC * v * v) / (G * r)) + LEAN_HOLD;
       if (need <= 0.015 && r > st.minRadius * 4.5) { b[i] = 0; continue; }
       let mag = clamp(Math.max(ideal * st.style, need), 0, st.maxBank);
@@ -5069,6 +6009,98 @@ export function createTrail(ctx) {
     applyCornerSpeedCap();
   }
 
+  /**
+   * THE ACCEPTANCE MEASURE, taken on the stations that ship.
+   *
+   * A station is INFEASIBLE when there is no (v, phi) at all: no speed between
+   * V_DESIGN_FLOOR and the design speed, and no bank inside the phase's own
+   * ceiling, at which all three constraints hold at once —
+   *   1. the longitudinal demand leaves a lean budget (leanBudgetAt);
+   *   2. atan(v²/(g r)) <= phi + budget;
+   *   3. v <= sqrt(g / (LAUNCH_SAFETY * kappa_v)).
+   * Constraint 2 is easiest at the lowest admissible speed and constraints 1
+   * and 3 do not care about it, so the existence test is exactly "does the
+   * floor speed work" — which is why slowing down cannot rescue a station this
+   * counts, and why the fix had to be upstream in the route.
+   *
+   * `feasDesign` is the weaker, more familiar question — does the SHIPPED speed
+   * profile hold — and is reported alongside so the two are never conflated.
+   */
+  function auditJointFeasibility() {
+    safety.feasViol = 0; safety.feasWorstDeg = 0; safety.feasWorstAt = 0;
+    safety.feasDesignViol = 0; safety.gripFloorBound = 0; safety.cornerFloorBound = 0;
+    safety.feasCorner = 0; safety.feasLaunch = 0;
+    for (let i = 0; i < S.n; i++) {
+      const r = rideRadius(i);
+      const phi = Math.max(0, helpfulBank(i));
+      const st = styleAt(i);
+      // The bank a builder could still add here, not merely the one that is
+      // built: the existence test asks whether the corner CAN be made to work.
+      const phiMax = Math.max(phi, st.maxBank);
+      const budget = leanBudgetAt(i);
+      if (SOLVER.feasible && Math.min(cornerSpeedCap(i), techSpeedCap(i)) < V_DESIGN_FLOOR - 1e-3) {
+        safety.cornerFloorBound++;
+      }
+      if (SOLVER.feasible && Math.tan(budget) < MU_CORNER_MIN) safety.gripFloorBound++;
+      const shortLo = leanRequired(V_DESIGN_FLOOR, r) - (phiMax + budget);
+      const shortDes = leanRequired(S.speed[i], r) - (phi + budget);
+      const vLaunch = launchSpeedCap(i);
+      const badCorner = shortLo > 0, badLaunch = vLaunch < V_DESIGN_FLOOR - 1e-3;
+      if (badCorner) safety.feasCorner++;
+      if (badLaunch) safety.feasLaunch++;
+      const bad = badCorner || badLaunch;
+      if (bad) {
+        safety.feasViol++;
+        if (shortLo > safety.feasWorstDeg) {
+          safety.feasWorstDeg = shortLo; safety.feasWorstAt = i * S.ds;
+        }
+      }
+      if (shortDes > 0) safety.feasDesignViol++;
+    }
+    safety.feasWorstDeg = +THREE.MathUtils.radToDeg(safety.feasWorstDeg).toFixed(2);
+    safety.feasFrac = S.n ? safety.feasViol / S.n : 0;
+    safety.feasDesignFrac = S.n ? safety.feasDesignViol / S.n : 0;
+  }
+
+  /**
+   * Plain +-RIDE_STENCIL circumradius of the committed plan line. See the note
+   * at S.radiusR. Recomputed after every pass that moves px/pz.
+   */
+  const RIDE_STENCIL = 4.0;
+  let _kapR = null;
+  function computeRideRadius() {
+    if (!S || !S.radiusR) return;
+    const n = S.n, m = Math.max(1, Math.round(RIDE_STENCIL / S.ds));
+    if (!_kapR || _kapR.length !== n) _kapR = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = i - m, b = i + m;
+      if (a < 0 || b >= n) { _kapR[i] = 1 / 4000; continue; }
+      const ax = S.px[a] - S.px[i], az = S.pz[a] - S.pz[i];
+      const bx = S.px[b] - S.px[i], bz = S.pz[b] - S.pz[i];
+      const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+      const lc = Math.hypot(S.px[b] - S.px[a], S.pz[b] - S.pz[a]);
+      const ar = Math.abs(ax * bz - az * bx);
+      const r = (ar < 1e-7 || la < 1e-6 || lb < 1e-6)
+        ? 4000 : clamp((la * lb * lc) / (2 * ar), 3, 4000);
+      _kapR[i] = 1 / r;
+    }
+    // Smoothed in CURVATURE, not in radius, and only just: a circumradius on a
+    // 0.4 m lattice flaps between 177 m and 879 m from one station to the next
+    // on ground a rider would call one continuous bend, and a bank solved off
+    // that is a bank nobody can build. Radius 5 stations / sigma 2 (0.8 m) is
+    // an order of magnitude tighter than the +-4 m Gaussian on `curv`, so the
+    // corner survives and the lattice noise does not.
+    const ks = gaussianSmooth(_kapR, 5, 2);
+    for (let i = 0; i < n; i++) S.radiusR[i] = clamp(1 / Math.max(2.5e-4, ks[i]), 3, 4000);
+  }
+
+  /** The radius the corner solve prices: the honest one, never the smoothed one. */
+  function rideRadius(i) {
+    if (!SOLVER.feasible) return S.radius[i];
+    const rr = S.radiusR[i];
+    return rr > 0 && rr < S.radius[i] ? rr : S.radius[i];
+  }
+
   /** Recompute tangents, right vectors and grade from the current px/py/pz. */
   function refreshBasis() {
     const n = S.n;
@@ -5081,6 +6113,7 @@ export function createTrail(ctx) {
       S.rx[i] = -S.tz[i] / hl; S.rz[i] = S.tx[i] / hl;
       S.grade[i] = -S.ty[i];
     }
+    computeRideRadius();
   }
 
   /**
@@ -5739,11 +6772,29 @@ export function createTrail(ctx) {
     _terrainRef = terrain;
 
     // Route-find several times and keep the best line down the hill.
+    //
+    // The variant budget is now in two parts. The first ROUTE_VARIANTS are
+    // always marched and the best is kept, exactly as before. If that best is
+    // INADMISSIBLE — see routeAdmissible(); this is the seed-2 case — further
+    // variants are marched, deterministically, until one is admissible or the
+    // extended budget runs out. Each variant has its own subSeed'd stream, so
+    // the extra attempts are as reproducible as the first seven, and on a seed
+    // whose first attempt is admissible not one extra march is run: the world
+    // is bit-identical to a build without this loop.
     let route = null, bestScore = -Infinity;
+    let bestAdm = null, bestAdmScore = -Infinity;
     routeAudit.length = 0;
-    for (let v = 0; v < 7; v++) {
+    // With the rideability solve OFF the extended budget is off too, and the
+    // admissibility test does not influence the choice: the control path must
+    // reproduce the previous build BIT-IDENTICALLY or no A/B in this file's
+    // notes means anything. Verified: same fingerprint, same stamp count.
+    const ROUTE_VARIANTS = 7;
+    const ROUTE_VARIANTS_MAX = SOLVER.feasible ? 16 : 7;
+    for (let v = 0; v < ROUTE_VARIANTS_MAX; v++) {
       const cand = marchRoute(terrain, v);
       const sc = scoreRoute(terrain, cand);
+      const fail = SOLVER.feasible ? routeAdmissible(terrain, cand) : null;
+      cand.admFail = fail;
       routeAudit.push({
         variant: v, score: +sc.toFixed(2),
         startX: +cand.startX.toFixed(1), startY: +cand.startY.toFixed(1),
@@ -5753,11 +6804,34 @@ export function createTrail(ctx) {
         len: +(cand.marchedLength || 0).toFixed(0),
         drop: +(cand.marchedDrop || 0).toFixed(0),
         openGrade: +(cand.openGrade || 0).toFixed(3),
+        feasFrac: +(cand.feasFrac || 0).toFixed(4),
+        feasMean: +(cand.feasMean || 0).toFixed(2),
+        feasWorstDeg: +THREE.MathUtils.radToDeg(cand.feasWorst || 0).toFixed(1),
+        sbForced: cand.sbForced || 0,
+        climb: +(cand.admClimb || 0).toFixed(2),
+        flat: +(cand.admFlat || 0).toFixed(1),
+        minR: +(cand.admMinR || 0).toFixed(2),
+        conflict: +(cand.admConflict || 0).toFixed(2),
+        admissible: !fail, fail: fail || '',
       });
       if (sc > bestScore) { bestScore = sc; route = cand; }
+      if (SOLVER.feasible && !fail && sc > bestAdmScore) { bestAdmScore = sc; bestAdm = cand; }
+      // Stop as soon as the ordinary budget has produced something admissible.
+      if (v + 1 >= ROUTE_VARIANTS && (bestAdm || !SOLVER.feasible)) break;
     }
+    safety.routeVariants = routeAudit.length;
+    safety.routeAdmissible = !!bestAdm;
+    safety.routeFail = bestAdm ? '' : (route.admFail || '');
+    safety.routeReseeded = routeAudit.length > ROUTE_VARIANTS;
+    if (bestAdm) { route = bestAdm; bestScore = bestAdmScore; }
+    safety.routeFeasFrac = route.feasFrac || 0;
+    safety.routeClimb = route.admClimb || 0;
+    safety.routeMinR = route.admMinR || 0;
+    safety.routeConflict = route.admConflict || 0;
+    safety.sbForced = route.sbForced || 0;
     for (const r of routeAudit) r.chosen = r.variant === route.variant;
     buildStations(terrain, route);
+    computeRideRadius();
     // The relief has to be measured before the first speed solve, or the first
     // solve prices it at zero and every pass downstream inherits that.
     computeVertKappa();
@@ -5880,6 +6954,7 @@ export function createTrail(ctx) {
     // when a width actually moved, because techSpeedCap() reads it.
     auditLegConflicts('audit');
     if (auditLegConflicts('resolve')) solveSpeeds(false);
+    auditJointFeasibility();
 
     for (const f of features) {
       const mid = (f.i0 + f.i1) >> 1;

@@ -19,6 +19,50 @@
 //   for sky/water/vegetation: `sampleWetness(x,z)`, `sampleSnow(x,z)`, `sampleCarve(x,z)`,
 //   `treelineAt(x,z)`, `snowlineAt(x,z)`, `valleyY`, `creekLevel`, `group`, `chunks`.
 //
+// CONTRACT-NOTE (terrain → trail, NEW API FOR marchRoute): four directional queries, added
+//   for the route-finder's heading search. All are allocation-free and all are valid before
+//   applyCarve() — which is when the march runs — as well as after.
+//
+//     terrain.sampleGrade(x, z, dirX, dirZ)             -> dY per metre ALONG the heading.
+//                                                          SIGNED: descending is NEGATIVE.
+//     terrain.sampleCrossSlope(x, z, dirX, dirZ)        -> dY per metre to the rider's RIGHT
+//                                                          of that heading (+ = right high,
+//                                                          the same sign as CarveStamp.bank).
+//     terrain.sampleCurvatureAlong(x, z, dirX, dirZ, half)
+//                                                       -> d2Y/ds2 along the heading, by a
+//                                                          central difference at HALF-STENCIL
+//                                                          `half` metres. Convex (a crest) is
+//                                                          NEGATIVE. `half` is mandatory: a
+//                                                          curvature quoted without its
+//                                                          stencil is not a measurement, and
+//                                                          five rounds were lost to that.
+//     terrain.probeCorridor(x, z, dirX, dirZ, half, out)-> all of the above in ONE pass that
+//                                                          shares its samples, plus the
+//                                                          corridor probe. See probeCorridor()
+//                                                          for the full field list; the short
+//                                                          version is `planarL/planarR`
+//                                                          (metres out to which the hillside
+//                                                          stays a plane — the honest corridor
+//                                                          width), `fallL/fallR` (signed
+//                                                          departure at 5 m, - = exposure),
+//                                                          `cutL/cutR` (the cut a 2 m half
+//                                                          bench would have to make) and
+//                                                          `benchable` (0..1, one scalar for a
+//                                                          cost function).
+//
+//   `dirX/dirZ` need not be unit — they are normalised inside, because a heading sweep
+//   usually builds them from a sin/cos pair. `out` may be omitted, in which case a
+//   module-scope object is reused; keep a result across another call and you must pass your
+//   own. `probeReach`, `probeBand`, `probeFallAt` are exported so a caller can report the
+//   geometry its numbers came from.
+//
+//   COST, measured on this machine, so the march can budget rather than guess:
+//   sampleGrade / sampleCrossSlope are ~90 ns (one height sample; the gradient is analytic
+//   and comes free with it). sampleCurvatureAlong is ~3x that (a second derivative genuinely
+//   needs a stencil). probeCorridor is ~2.5 us, because its lateral walk is up to 40 height
+//   samples. SHORTLIST ON THE CHEAP ONES AND PROBE THE SURVIVORS: 64 headings x 6800 stations
+//   is 39 ms of sampleGrade and 1.1 s of probeCorridor.
+//
 // CONTRACT-NOTE (terrain → vegetation/water/anyone raycasting): the terrain is a
 //   quadtree whose chunk meshes toggle `visible` every frame as the cut moves, and
 //   three.js skips invisible objects when raycasting. Do NOT raycast the terrain
@@ -61,13 +105,41 @@
 //   a small stamp.
 //
 //   THE FILTER IS ANISOTROPIC AND THIS IS THE NUMBER THE TRAIL ENGINEER NEEDS. It is a
-//   Gaussian in the TRACK FRAME: sigma 0.555 m along the track, 0.35 m across it. The
-//   quantity to calibrate a banking solve against is the committed cross-slope as a
-//   fraction of tan(bank), measured on the +-0.36 x width secant:
-//         p50   0.921 / 0.922 / 0.926      (seeds 20260726 / 777 / 12345)
-//         p10   0.847 / 0.789 / 0.815
-//   and on the steepest berms alone (|tan bank| > 0.70), p50 0.92 / 0.78 / 0.86.
-//   It was 0.868 / 0.864 / 0.873 under the symmetric kernel this replaced.
+//   Gaussian in the TRACK FRAME: sigma 0.35 m ACROSS the track everywhere, and 0.555 m
+//   ALONG it where the design authors curvature, widening to 1.10 m where the design is
+//   flat (see the ADAPTIVE block in commitDetail()). The quantity to calibrate a banking
+//   solve against is the committed cross-slope as a fraction of tan(bank), measured on the
+//   +-0.36 x width secant. THE ADAPTIVE WIDENING IS ALONG-TRACK ONLY and therefore does not
+//   change that answer materially: 0.917/0.888/0.921 -> 0.913/0.884/0.921 across the three
+//   seeds, and on the steepest berms it does not move at all (0.928 -> 0.928).
+//
+//   THE ANISOTROPY QUESTION, SETTLED WITH NUMBERS. A/B in one process against one cached
+//   route and one cached base heightfield per seed, pre-carve heights hash identical across
+//   every variant; committed cross-slope / tan(bank), p50, seeds 20260726 / 777 / 12345:
+//
+//                                  all      by |tan bank| 0.05-0.15 / 0.15-0.35 / 0.35-0.70 / >0.70
+//     SYMMETRIC (iso, sigma 0.555) 0.876    0.886 / 0.871 / 0.871 / 0.881
+//                                  0.840    0.809 / 0.871 / 0.865 / -
+//                                  0.875    0.879 / 0.874 / 0.865 / -
+//     ANISOTROPIC (0.555 / 0.35)   0.917    0.907 / 0.919 / 0.932 / 0.928
+//                                  0.888    0.849 / 0.920 / 0.924 / -
+//                                  0.921    0.908 / 0.944 / 0.927 / -
+//     SHIPPED (adaptive + aniso)   0.913    0.899 / 0.917 / 0.928 / 0.928
+//                                  0.884    0.847 / 0.917 / 0.923 / -
+//                                  0.921    0.907 / 0.940 / 0.923 / -
+//
+//   The anisotropic kernel is worth 4.1-4.8 points of bank overall, and — the part that
+//   decides it — the symmetric kernel is flat or FALLING across the bank bands (0.886 ->
+//   0.871, 0.879 -> 0.865) while the anisotropic one RISES with them (0.907 -> 0.932,
+//   0.908 -> 0.944). Bank matters most where the berm is steepest, which is exactly where
+//   the symmetric kernel is relatively worst. Its price is 0.0022-0.0029 /m of flat-ground
+//   residual p90; the whole-course wheel test moves by +0.01 to +0.02 percentage points and
+//   the worst 25 m bin by -0.8 to 0.0, i.e. the wheel test does not separate them at all,
+//   and shaped-feature retention agrees to 0.005. SHIP THE ANISOTROPIC ONE — and with the
+//   adaptive along-track sigma now taking 37-41% off the residual p90, its residual cost is
+//   repaid many times over. (Reported on the wheel test and the cross-slope pair, never on
+//   band r.m.s. — a band r.m.s. cannot see a curvature, which is the round-6 lesson.)
+//
 //   THE CEILING IS NOT 1.0. The EMITTED design surface itself only realises
 //   0.962 / 0.949 / 0.953 of its own declared bank on the same secant (0.956 / 0.893 /
 //   0.934 on the steepest berms), because five stamps per station reconstructed by a
@@ -80,6 +152,41 @@
 //   p99 0.258-0.312 and max 0.85-1.13. That residual is the band limit doing its job, not
 //   the accumulator failing; it is measured at the stamps, which are exactly the points a
 //   low-pass is expected to miss.
+//
+// CONTRACT-NOTE (terrain → trail, WHAT THE COMMITTED SURFACE COSTS IN TOP SPEED, and what
+//   it does NOT): the residual convex curvature the commit leaves on ground the design asked
+//   to be FLAT — |kappa_design| < 0.012 /m at the 0.37 m stencil, no feature authored — is
+//   now, per seed 20260726 / 777 / 12345, against the r7 kernel on the same route:
+//         p90   0.0227 -> 0.0134     0.0217 -> 0.0137     0.0242 -> 0.0151   /m
+//         p95   0.0331 -> 0.0170     0.0352 -> 0.0172     0.0364 -> 0.0193
+//         p99   0.0557 -> 0.0315     0.0594 -> 0.0286     0.0571 -> 0.0326
+//         max   0.0725 -> 0.0660     0.1234 -> 0.1149     0.0918 -> 0.0630
+//   i.e. 37-41% off the p90, 47-51% off the p95, 43-52% off the p99. The launch-free speed
+//   at p95, sqrt(g / kappa_p95), rises from 16.4-17.2 m/s to 22.6-24.1 m/s.
+//   THE PRICE, stated where it can be found: the shaped-feature peak-to-peak mean falls
+//   0.932/0.927/0.938 -> 0.924/0.916/0.933 and its MINIMUM 0.808/0.795/0.812 ->
+//   0.808/0.761/0.811 — one feature on seed 777 loses an extra 3.4% of its lip; the 2-6 m
+//   band ratio falls 0.728/0.707/0.733 -> 0.716/0.689/0.712; the committed cross-slope p50
+//   falls 0.917/0.888/0.921 -> 0.913/0.884/0.921; and the carve costs 0-3% more.
+//   Stencil, reference and sampling for every one of those figures:
+//   plan path = centripetal Catmull-Rom through the emitted station plan points,
+//   arc-length resampled at 0.05 m; wheel-centre locus = morphological dilation of the
+//   profile by a 0.37 m disc; kappa = symmetric second difference at HALF-STENCIL 0.37 m,
+//   linearly interpolated off the grid; reference = the emitted station centreline S.py read
+//   by Catmull-Rom at the same fractional station index.
+//
+//   AND THE PART THE TRAIL ENGINEER SHOULD ACT ON. This does NOT move the wheel test's worst
+//   25 m bin, and the reason is worth having in writing. Of the launching samples on the
+//   whole course — 361 / 334 / 782 on the three seeds — **0.0% / 0.0% / 0.1% are at
+//   flat-design stations**, and the worst 25 m bin on every seed contains **none at all**
+//   (arc 1225 at 13.4%, arc 1150 at 12.4%, arc 1225 at 13.2%; flat-share 0% in each). The
+//   worst bins are curvature the design ASKED FOR at a speed `speedAt` also asked for.
+//   Terrain can hold its own residual to a
+//   twentieth of the launch threshold and the gate will not move, because the gate is not
+//   measuring terrain. Whole-course wheel test moves 0.63% -> 0.59% / 0.93% -> 0.87% /
+//   0.80% -> 0.73%; worst bin 13.4 -> 13.4 / 20.0 -> 20.0 / 13.2 -> 13.2, unmoved on all
+//   three seeds. Terrain's residual is not what stops the rider. The design's own curvature
+//   at the design's own speed is.
 //
 // CONTRACT-NOTE (terrain → everyone, DETERMINISM): world generation is a pure function of
 //   `ctx.seed` and the quality settings. It used to size the hydraulic-erosion droplet budget
@@ -1346,6 +1453,174 @@ export function createTerrain(ctx) {
   }
 
   // -------------------------------------------------------------------------
+  // MARCH SUPPORT — directional terrain queries for the route-finder
+  //
+  // See the CONTRACT-NOTE at the top of this file. `marchRoute` evaluates many
+  // candidate headings per station, BEFORE any carve exists, and needs the same
+  // four quantities at each: grade along the heading, cross-slope across it,
+  // curvature along it, and how the hillside behaves either side of it.
+  //
+  // Three properties these have to have, and each one is a decision:
+  //
+  //  * ALLOCATION-FREE. Every one of these writes into caller-supplied or
+  //    module-scope storage. A heading search is an inner loop.
+  //  * ANALYTIC, not finite-differenced, for grade and cross-slope. sampleField()
+  //    already computes the exact gradient of the bicubic reconstruction as a
+  //    by-product of the height, so a directional derivative is two multiplies
+  //    on top of one height sample rather than two extra samples. Curvature is
+  //    the exception: it is a second derivative and genuinely needs a stencil,
+  //    which is therefore an explicit argument and never a hidden default.
+  //  * TANGENT-PLANE REFERENCED for the corridor probe. `cross` already reports
+  //    the ambient cross-slope; what a route-finder additionally needs to know
+  //    is where the hillside STOPS being a plane — a cliff band, a gully lip,
+  //    the shoulder of a spur. So the probe measures departure from the tangent
+  //    plane at the query point, not raw height difference, and a uniform
+  //    cross-slope of any steepness reads as zero departure.
+  //
+  // Heading convention: (dirX, dirZ) is a plan-space direction, not required to
+  // be unit — it is normalised here, because a caller sweeping headings will
+  // usually have built it from a sin/cos pair and normalising twice is waste.
+  // "Right" is the rider's right of that heading, i.e. (-dirZ, dirX), matching
+  // CarveStamp.bank (+ = right side high) and trail.nearestT's `lateral`.
+  //
+  // Sign convention: grade is dY per metre ALONG the heading, so a descending
+  // heading is NEGATIVE. That is the opposite sign to trail.js's `S.grade`,
+  // which is a magnitude; it is signed here because the whole point of the
+  // query is to let the march tell downhill from uphill without a second call.
+  // -------------------------------------------------------------------------
+
+  const _probeOut = {
+    height: 0, gradient: 0, cross: 0, slope: 0, curvature: 0,
+    fallL: 0, fallR: 0, planarL: 0, planarR: 0, cutL: 0, cutR: 0, benchable: 0,
+  };
+
+  /** Normalise a heading into module scratch. Returns false for a degenerate one. */
+  let _hx = 0, _hz = -1;
+  function setHeading(dirX, dirZ) {
+    const l = Math.sqrt(dirX * dirX + dirZ * dirZ);
+    if (!(l > 1e-9)) { _hx = 0; _hz = -1; return false; }
+    _hx = dirX / l; _hz = dirZ / l;
+    return true;
+  }
+
+  /** dY per metre along the heading. Negative = descending. */
+  function sampleGrade(x, z, dirX, dirZ) {
+    setHeading(dirX, dirZ);
+    sampleField(x, z);
+    return _fgx * _hx + _fgz * _hz;
+  }
+
+  /** dY per metre to the rider's RIGHT of the heading. + = right side high. */
+  function sampleCrossSlope(x, z, dirX, dirZ) {
+    setHeading(dirX, dirZ);
+    sampleField(x, z);
+    return _fgx * -_hz + _fgz * _hx;
+  }
+
+  /**
+   * Second derivative of the surface along the heading, 1/m, by a symmetric
+   * central difference at HALF-STENCIL `half` metres. Convex (a crest, the thing
+   * that launches a wheel) is NEGATIVE, matching the sign of d2y/ds2.
+   *
+   * `half` is mandatory and there is no default on purpose: a curvature figure
+   * quoted without its stencil is not a measurement, and this file has been
+   * bitten by exactly that. For launch work the stencil is the wheel radius,
+   * 0.37 m; for route-scale relief it should be several metres.
+   */
+  function sampleCurvatureAlong(x, z, dirX, dirZ, half) {
+    if (!setHeading(dirX, dirZ)) return 0;
+    const H = half > 1e-3 ? half : 1e-3;
+    sampleField(x, z); const h0 = _fh;
+    sampleField(x + _hx * H, z + _hz * H); const hp = _fh;
+    sampleField(x - _hx * H, z - _hz * H); const hm = _fh;
+    return (hp - 2 * h0 + hm) / (H * H);
+  }
+
+  // Corridor probe geometry. PROBE_REACH is deliberately a little more than the
+  // 4 m batter run plus a 3 m tread half-width, so the answer covers everything
+  // a bench built here would actually disturb.
+  const PROBE_DS = 0.5;        // lateral step, metres
+  const PROBE_REACH = 10.0;    // how far out the probe walks, each side
+  const PROBE_BAND = 0.75;     // metres of departure from the tangent plane that
+                               // still counts as "the same hillside"
+  const PROBE_FALL = 5.0;      // the reference offset the fall-away is quoted at
+  const PROBE_BENCH = 2.0;     // half-width of the bench the cut is measured over
+
+  /**
+   * Everything the march needs at one (position, heading), in ONE pass that
+   * shares its height samples between the terms.
+   *
+   *   height     world Y at the query point
+   *   gradient   dY/m along the heading (negative = descending)
+   *   cross      dY/m to the rider's right
+   *   slope      radians from horizontal (the ambient steepness, unsigned)
+   *   curvature  d2Y/ds2 along the heading at half-stencil `half` (convex < 0)
+   *   planarL/R  metres out to which the hillside stays within PROBE_BAND of the
+   *              tangent plane. This is the honest "corridor width": it is how
+   *              far a bench can be shifted either way without meeting a break
+   *              in the ground. Saturates at PROBE_REACH.
+   *   fallL/R    departure from the tangent plane at PROBE_FALL metres out,
+   *              SIGNED, + = the ground stands above the plane (a cut bank),
+   *              - = it falls away (exposure). This is the exposure figure the
+   *              QA passes quote, measured against the plane so that ambient
+   *              cross-slope is not counted as fall-away.
+   *   cutL/R     the largest positive departure inside PROBE_BENCH — the cut a
+   *              bench of that half-width would have to make on each side.
+   *   benchable  min(planarL, planarR) / PROBE_REACH, 0..1 — one scalar the
+   *              march can put straight into a cost without reading the rest.
+   *
+   * `out` may be omitted, in which case a module-scope object is reused; a
+   * caller that keeps a result across another call must pass its own.
+   */
+  function probeCorridor(x, z, dirX, dirZ, half, out) {
+    const o = out || _probeOut;
+    if (!setHeading(dirX, dirZ)) { _hx = 0; _hz = -1; }
+    const hx = _hx, hz = _hz;
+    const rx = -hz, rz = hx;
+    sampleField(x, z);
+    const h0 = _fh, gx = _fgx, gz = _fgz;
+    o.height = h0;
+    o.gradient = gx * hx + gz * hz;
+    o.cross = gx * rx + gz * rz;
+    o.slope = Math.atan(Math.sqrt(gx * gx + gz * gz));
+    // Curvature reuses h0 but needs its own two samples (a second derivative
+    // cannot be had from one gradient).
+    const H = half > 1e-3 ? half : 1e-3;
+    sampleField(x + hx * H, z + hz * H); const hp = _fh;
+    sampleField(x - hx * H, z - hz * H); const hm = _fh;
+    o.curvature = (hp - 2 * h0 + hm) / (H * H);
+
+    // Lateral walk. `plane` is the tangent plane's height at the offset, so a
+    // uniform cross-slope contributes nothing and only breaks in the ground do.
+    const mCross = o.cross;
+    let planarL = PROBE_REACH, planarR = PROBE_REACH;
+    let fallL = 0, fallR = 0, cutL = 0, cutR = 0;
+    let doneL = false, doneR = false;
+    for (let d = PROBE_DS; d <= PROBE_REACH + 1e-6; d += PROBE_DS) {
+      if (!doneR) {
+        sampleField(x + rx * d, z + rz * d);
+        const dev = _fh - (h0 + mCross * d);
+        if (d <= PROBE_BENCH && dev > cutR) cutR = dev;
+        if (d <= PROBE_FALL + 1e-6) fallR = dev;
+        if ((dev < 0 ? -dev : dev) > PROBE_BAND) { planarR = d - PROBE_DS; doneR = true; }
+      }
+      if (!doneL) {
+        sampleField(x - rx * d, z - rz * d);
+        const dev = _fh - (h0 - mCross * d);
+        if (d <= PROBE_BENCH && dev > cutL) cutL = dev;
+        if (d <= PROBE_FALL + 1e-6) fallL = dev;
+        if ((dev < 0 ? -dev : dev) > PROBE_BAND) { planarL = d - PROBE_DS; doneL = true; }
+      }
+      if (doneL && doneR) break;
+    }
+    o.planarL = planarL; o.planarR = planarR;
+    o.fallL = fallL; o.fallR = fallR;
+    o.cutL = cutL; o.cutR = cutR;
+    o.benchable = (planarL < planarR ? planarL : planarR) / PROBE_REACH;
+    return o;
+  }
+
+  // -------------------------------------------------------------------------
   // applyCarve — the trail reshapes the mountain
   // -------------------------------------------------------------------------
 
@@ -2113,7 +2388,91 @@ export function createTerrain(ctx) {
       }
       arc[i] = a;
     }
-    return { tanX, tanZ, arc, grade, spacing, slope, cross, latOff, halfW };
+
+    // -----------------------------------------------------------------------
+    // SECOND PASS — the vertical curvature the DESIGN asks for. Input to the
+    // adaptive band limit; see commitDetail().
+    //
+    // `kapA` is d(slope)/d(arc): the vertical curvature of the emitted tread,
+    // 1/m, unsigned. It is the quantity that decides whether a wheel leaves the
+    // ground, and — the point of computing it here — it is the quantity that
+    // separates relief the trail AUTHORED from ripple the reconstruction left
+    // behind. The first is not terrain's to remove; the second is.
+    //
+    // It is a weighted least-squares regression against the along-track offset
+    // over the SAME neighbour bins and the SAME height-plausibility gate as the
+    // plane fit, so a switchback's other leg cannot contribute. The support is
+    // deliberately shorter than the plane fit's (KAP_R 1.8 m against 2.2 m): the
+    // regressand is already a fitted gradient, so its own resolution is ~2.2 m
+    // and a wider support here would only blur a feature edge into the flat
+    // ground beside it — the one error that matters, because it is the direction
+    // that over-filters.
+    //
+    // UNITS: `arc` advances by the PLAN along-track component, so kapA is
+    // d2Y/dx2 and not the true curvature d2Y/ds2 / (1 + Y')^1.5. On the steepest
+    // authored ground (40%) that reads ~16% high, which is the conservative
+    // direction — it keeps the narrow kernel — and is not worth a square root
+    // per stamp to correct.
+    //
+    // THE PLAN-CURVATURE LIMIT IS DELIBERATELY NOT COMPUTED HERE. A straight
+    // kernel on a curved tread departs the arc, so plan curvature does have to
+    // cap the widening — but a per-stamp d(theta)/d(arc) regressed from
+    // neighbouring stamps' PCA TANGENTS is an estimator built on the difference
+    // of two noisy angles, and it behaved like one: MEASURED, it pinned 32% of
+    // committed cells to the base kernel, which on a route whose 1st-percentile
+    // plan radius is 16 m would require a 2.5 m radius at a third of all
+    // stations. The cap is taken instead from the COHERENCE of the doubled-angle
+    // direction field the filter already accumulates — see smoothTrackFrame().
+    // That is a weighted vector sum rather than a difference of angles, it is
+    // measured over exactly the neighbourhood the kernel gathers from, and it
+    // falls for both of the reasons that warrant a narrow kernel: a bending
+    // tread, and two legs crossing.
+    // -----------------------------------------------------------------------
+    const kapA = new Float32Array(n);
+    const KAP_R2 = 1.8 * 1.8;
+    const KAP_K = 1 / (2 * 0.9 * 0.9);
+    for (let i = 0; i < n; i++) {
+      const st = stamps[i];
+      const bx = Math.floor((st.x - minX) / BIN);
+      const bz = Math.floor((st.z - minZ) / BIN);
+      const tx = tanX[i], tz = tanZ[i];
+      const h0 = st.targetHeight;
+      let saa = 0, sav = 0;
+      for (let bjo = -1; bjo <= 1; bjo++) {
+        for (let bio = -1; bio <= 1; bio++) {
+          const list = bins.get((bz + bjo) * 4096 + (bx + bio));
+          if (!list) continue;
+          for (let m = 0; m < list.length; m++) {
+            const jj = list[m];
+            if (jj === i) continue;
+            const o = stamps[jj];
+            const dx = o.x - st.x, dz = o.z - st.z;
+            const d2 = dx * dx + dz * dz;
+            if (d2 > KAP_R2 || d2 < 1e-8) continue;
+            const dh = o.targetHeight - h0;
+            const dhAbs = dh < 0 ? -dh : dh;
+            if (dhAbs > 0.8 * Math.sqrt(d2) + 0.3) continue;
+            const al = dx * tx + dz * tz;
+            if ((al < 0 ? -al : al) < 0.05) continue;   // no along-track leverage
+            const w = Math.exp(-d2 * KAP_K);
+            saa += w * al * al;
+            sav += w * al * (slope[jj] - slope[i]);
+          }
+        }
+      }
+      if (saa > 1e-6 && isFinite(sav / saa)) {
+        const ka = sav / saa;
+        kapA[i] = ka < 0 ? -ka : ka;
+      } else {
+        // A stamp with no along-track partners tells us nothing about curvature.
+        // Report it as fully curved: that keeps the NARROW kernel, which is the
+        // conservative answer everywhere. An unknown is never a licence to
+        // filter harder.
+        kapA[i] = 1;
+      }
+    }
+
+    return { tanX, tanZ, arc, grade, spacing, slope, cross, latOff, halfW, kapA };
   }
 
   /** Chamfer distance transform → metres from the trail centreline, on an 8 m grid. */
@@ -2564,6 +2923,16 @@ export function createTerrain(ctx) {
   //     0.555 (iso)  0.87 / 0.60 / 0.74      0.35  0.92 / 0.78 / 0.86
   //     0.26         0.94 / 0.85 / 0.91      0.175 0.95 / 0.92 / 0.95
   //
+  // RE-CONFIRMED IN ROUND 8 UNDER THE ADAPTIVE KERNEL, seed 20260726, one
+  // process, one route, everything else identical — so the cross decision does
+  // not have to be taken on trust from a superseded configuration:
+  //     sigma_cross 0.35  SHIPPED  x-slope p50 0.909, steepest berms 0.926,
+  //                                residual p90 0.0131
+  //     sigma_cross 0.555 (iso)    x-slope p50 0.868, steepest berms 0.879,
+  //                                residual p90 0.0117
+  // 4.1 points of bank overall and 4.7 on the steepest berms, for 0.0014 /m of
+  // residual p90. Same trade, same answer.
+  //
   // WHY 0.35 AND NOT 0.175, which retains more. Because below one lattice cell
   // the discrete kernel stops being a low-pass: cross-track content survives at
   // and above the 0.35 m lattice's Nyquist (0.7 m), and the bicubic
@@ -2607,6 +2976,19 @@ export function createTerrain(ctx) {
   // each and the iso-vs-track deltas reproduced every time; the cross-slope
   // figures quoted are from trail.js df2b1b8ec7f9, and 8107cc05a0ef gives
   // 0.870/0.865/0.873 -> 0.926/0.922/0.928 for the same swap.
+  //
+  // AND IT HAPPENED AGAIN IN ROUND 8, WORSE, SO HERE IS THE RULE. Two consecutive
+  // boots of the same seed 20 s apart produced 2718.68 m / 58 800 stamps and
+  // 2718.04 m / 58 860 stamps: trail.js was being saved between them. The route
+  // is therefore NOT a fixed quantity across processes and no absolute figure in
+  // this file may be compared against one taken in another process. What IS
+  // fixed, and was verified byte-identical across five concurrent processes at
+  // load average 4.3 on all three seeds, is everything terrain owns — the base
+  // heightfield and every field derived from it (see fingerprint()). Every
+  // measurement quoted in this file is therefore an A/B inside ONE process
+  // against ONE cached route and ONE cached base, with the pre-carve heights
+  // hash asserted equal across every variant of the comparison. That is the only
+  // form of measurement that survives a module being rewritten underneath it.
   const WHEEL_R = 0.37;             // contact patch the profile is integrated over
   // 1.5 wheel radii. Measured on the wheel test, seed 20260726 / 777 / 12345:
   //   1.0 R (4 passes)  4.73 / 5.93 / 6.34 %      1.5 R (5 passes) 4.07 / 5.29 / 5.48 %
@@ -2615,6 +2997,192 @@ export function createTerrain(ctx) {
   const TREAD_LP_SIGMA = WHEEL_R * 1.5;
   // Across the track: exactly one detail cell — see the Nyquist argument above.
   const TREAD_LP_SIGMA_CROSS = DSTEP;
+
+  // -------------------------------------------------------------------------
+  // THE ALONG-TRACK SIGMA IS ADAPTIVE, AND THIS IS THE ROUND-8 CHANGE
+  //
+  // THE DEFECT. At stations where the emitted design profile is FLAT — |kappa|
+  // below 0.012 /m at the 0.37 m acceptance stencil, with no feature authored —
+  // the committed surface still carried convex curvature the design never asked
+  // for. Measured across seeds 20260726 / 777 / 12345, one process and one
+  // cached route each (plan path = centripetal Catmull-Rom through the emitted
+  // station plan points arc-resampled at 0.05 m, wheel-centre locus = dilation
+  // by a 0.37 m disc, kappa by second difference at half-stencil 0.37 m,
+  // reference = the emitted station centreline S.py):
+  //     shipped kernel  p90 0.0198 / 0.0227 / 0.0198   p99 0.0583 / 0.0581 / 0.0535
+  // That p99 is very nearly the whole 0.059 /m a wheel can hold at the 12.9 m/s
+  // p50 design speed, arriving on ground the trail asked to be flat.
+  //
+  // WHY A FIXED SIGMA CANNOT FIX IT. The kernel's job is stated as a length —
+  // "1.5 wheel radii" — but the constraint it is being held to is a CURVATURE.
+  // A residual sinusoid of amplitude A and wavelength L passes the Gaussian at
+  // T(L) = exp(-2 pi^2 sigma^2 / L^2) and arrives carrying A*T(L)*(2 pi / L)^2
+  // of curvature. Maximise over L: the worst case is at L = pi*sigma*sqrt(2)
+  // (2.47 m at the shipped sigma) and its size is 2A/(e*sigma^2). The gain the
+  // rider feels therefore falls as 1/sigma^2 — which is why widening works.
+  //
+  // THE WHOLE LADDER, ONE PROCESS, ONE CACHED ROUTE, ONE CACHED BASE (seed
+  // 20260726; pre-carve heights hash identical across every row):
+  //
+  //   sigma_along  residual at flat stations      wheel test      shaped feature
+  //                p90     p95     max            course  worst   p2p mean / min  2-6 m
+  //     0.555 r7   0.0226  0.0335  0.074           0.61%  13.4%   0.932 / 0.808   0.728
+  //     0.75       0.0161  0.0220  0.053           0.53%  13.2%   0.906 / 0.739   0.607
+  //     1.00       0.0137  0.0169  0.067           0.24%   9.4%   0.870 / 0.642   0.489
+  //     1.30       0.0129  0.0164  0.145           0.10%   3.4%   0.825 / 0.527   0.406
+  //     1.40       0.0129  0.0168  0.206           0.09%   3.4%   0.811 / 0.490   0.390
+  //     2.50       0.0177  0.0250  1.251           0.39%  13.0%   0.674 / 0.187   0.393
+  //     4.00       0.0313  0.0480  2.543           1.03%  26.8%   0.559 / 0.042   0.581
+  //     ADAPTIVE   0.0133  0.0168  0.066           0.58%  13.4%   0.924 / 0.808   0.716
+  //
+  // Two things in that table decide the design.
+  //
+  // First, the fixed-sigma family turns back on itself: past ~1.4 m the residual
+  // rises again and its MAXIMUM explodes (0.06 -> 2.1 -> 3.4 /m), because a
+  // kernel wider than the corner it sits on stops filtering along the tread and
+  // starts smearing across it (see PLAN CURVATURE below). There is no fixed
+  // sigma that is safe and also strong.
+  //
+  // Second, and decisively: WIDENING FLATTENS WHAT THE TRAIL AUTHORED. A jump lip
+  // at 49% of its emitted amplitude (sigma 1.4) or 21% (sigma 2.5) is the
+  // "flattened into a fire road" failure this file exists to avoid. A global
+  // widen trades one acceptance criterion for another and is not a fix.
+  //
+  // The adaptive row reaches the fixed family's best residual — p90 0.0133 and
+  // p95 0.0168, against 0.0129 / 0.0164 at sigma 1.30 — while holding the
+  // shaped-feature minimum at the r7 kernel's own figure to the last digit
+  // (0.808 against 0.808), where sigma 1.30 loses 35% of it. It also has the
+  // lowest MAXIMUM residual of any row in the table (0.066 against 0.145 at
+  // sigma 1.30 and 1.25 at 2.50), because the coherence cap withdraws exactly
+  // where a fixed wide kernel does its damage. That is the entire claim of this
+  // block.
+  //
+  // The one thing it does NOT do is move the wheel test: 0.61% -> 0.58% course,
+  // worst 25 m bin 13.4% -> 13.4%. See the CONTRACT-NOTE on top speed — 1.1% of
+  // the launching samples on this course are at flat-design stations, so that
+  // gate is not measuring terrain and no amount of this work will move it.
+  //
+  // THE FIX. Widen the kernel ONLY where the design asked for nothing, and there
+  // the widening costs nothing BY CONSTRUCTION — there is no authored relief at
+  // a flat station to lose. sigma_along is selected per detail cell from the
+  // design's own curvature, carried by the stamps (prepareStamps' kapA):
+  //
+  //   kapA <= KAPPA_DESIGN_FLAT     -> sigma_along = TREAD_LP_SIGMA_FLAT
+  //   kapA >= KAPPA_DESIGN_FEATURE  -> sigma_along = TREAD_LP_SIGMA (unchanged)
+  //   between                        -> smoothstep, quantised to LP_NLEV levels
+  //
+  // TREAD_LP_SIGMA_FLAT = 1.10 is the KNEE of that curve, not its minimum, and
+  // the knee is the right choice because past it the residual is flat and the
+  // only thing a wider kernel can still do is damage. Sweeping it alone, same
+  // process and route as the ladder above:
+  //     flat sigma  residual p90 / p95 / p99    feature mean / min   x-slope p50 / steep
+  //       0.555 r7    0.0226 / 0.0335 / 0.0558    0.932 / 0.808       0.917 / 0.926
+  //       0.90        0.0143 / 0.0184 / 0.0336    0.927 / 0.808       0.914 / 0.926
+  //       1.10 SHIP   0.0133 / 0.0168 / 0.0300    0.924 / 0.808       0.912 / 0.926
+  //       1.30        0.0131 / 0.0170 / 0.0314    0.920 / 0.808       0.909 / 0.926
+  //       1.60        0.0136 / 0.0182 / 0.0336    0.916 / 0.789       0.904 / 0.926
+  //       2.20        0.0173 / 0.0249 / 0.0445    0.910 / 0.736       0.894 / 0.926
+  // The shaped-feature MINIMUM — the jump lip that would be flattened — is
+  // bit-for-bit the r7 figure up to 1.30 and starts falling at 1.60, and the
+  // committed cross-slope on the steepest berms does not move at all across the
+  // whole sweep (0.926, every row), because the widening runs ALONG the berm.
+  // 1.10 and 1.30 measure the same; 1.10 is taken because filtering less for the
+  // same answer is the error this file would rather make.
+  //
+  // KAPPA_DESIGN_FLAT is the acceptance criterion's own flatness threshold, so
+  // the widened kernel is applied exactly on the set the residual is measured
+  // over and nowhere else. KAPPA_DESIGN_FEATURE is g / v^2 at the p50 design
+  // speed: at or above it the trail is authoring launch-scale relief, which is
+  // its decision to make and not terrain's to filter away.
+  //
+  // PLAN CURVATURE IS A HARD CAP ON THE WIDENING, and it is what stops the
+  // non-monotone blow-up above. The kernel's "along the track" is one straight
+  // bearing per cell, so on a corner of plan radius r a tap half-span L departs
+  // the arc by L^2/(2r) at the ends; past a fraction of the tread half-width
+  // that stops being a low-pass along the tread and becomes a smear across it,
+  // which is exactly what a berm cannot afford.
+  //
+  // The cap is taken from the COHERENCE of the doubled-angle direction field
+  // this filter already accumulates, C = |sum w e^(2 i theta)| / sum w, and NOT
+  // from a per-stamp plan-curvature estimate. The estimate was tried and
+  // measured first: regressing d(theta)/d(arc) from neighbouring stamps' PCA
+  // tangents pinned 32% of committed cells to the base kernel on a route whose
+  // 1st-percentile plan radius is 16 m — it was reading its own angle noise.
+  // Coherence is a weighted vector sum instead of a difference of two noisy
+  // angles, it is evaluated over the very neighbourhood the kernel gathers
+  // from, and it falls for both of the reasons that warrant a narrow kernel:
+  // the tread is bending, or two legs are crossing.
+  //
+  // And it converts to a departure in closed form, with no threshold to invent.
+  // C = <cos 2 delta> = 1 - 2<delta^2> + O(delta^4), so the r.m.s. angle between
+  // the bearing the kernel assumes and the bearing the tread actually has is
+  // delta = sqrt((1 - C)/2). A kernel of half-span L applied at that error walks
+  // L*delta off the tread, so requiring the 2-sigma span to stay inside PLAN_TOL
+  // gives, exactly,
+  //         sigma <= PLAN_TOL / sqrt(2 * (1 - C)).
+  // MEASURED coherence over the committed cells of seed 20260726, one process,
+  // one cached route: p10 0.914, p50 0.992. That is 1.98 m of allowance at the
+  // median (no cap at all, the design gate binds first) and 0.60 m at the tenth
+  // percentile (straight back to the base kernel), which is the behaviour asked
+  // for: unrestricted on the open trail, withdrawn on the switchback stacks and
+  // the tightest berms.
+  //
+  // CONSERVATISM, AND WHERE IT IS AND IS NOT TAKEN. The design curvature is
+  // accumulated per cell as a BROAD weighted mean of the stamps reaching it —
+  // weighted by the height-blend STRENGTH, which is ~1 for every stamp across
+  // the whole bench, so it genuinely averages the neighbourhood. Two other
+  // estimators were tried and both are worse. Three-way A/B, ONE process, ONE
+  // cached route, ONE cached base, everything else identical:
+  //
+  //     accumulation of kapA per cell   residual p90 / p95 / p99 / max    v95
+  //       MAX over the stamps           0.0167 / 0.0287 / 0.0520 / 0.075  18.5
+  //       SHEPARD-weighted mean         0.0139 / 0.0186 / 0.0457 / 0.145  22.9
+  //       STRENGTH-weighted mean SHIP   0.0131 / 0.0170 / 0.0314 / 0.072  24.0
+  //
+  // The MAX is the obvious "conservative" choice and it is the worst of the
+  // three, which is worth understanding rather than just noting: ~30 stamps
+  // reach a typical tread cell, each carrying a regression's worth of noise, so
+  // a max over them is an order statistic on the noise tail. It does not produce
+  // a narrower kernel — its median sigma is the HIGHEST of the three, 1.108
+  // against 0.992 — it produces an INCOHERENT one, flipping between wide and
+  // narrow cell to cell as the noise tail moves, and a spatially incoherent
+  // kernel width is itself a source of curvature.
+  //
+  // The SHEPARD weight fails for a different reason: that kernel is singular at
+  // the sample and hands the nearest stamp ~85% of the total, so a
+  // "Shepard-weighted mean" of a per-stamp quantity is very nearly the nearest
+  // stamp's own value and averages almost nothing. Its p99 and max give it away
+  // (0.046 and 0.145 against 0.031 and 0.072).
+  //
+  // Conservatism is taken SPATIALLY instead, which is where it belongs: the
+  // per-cell sigma field is eroded (running minimum) by LP_SIG_ERODE cells on
+  // each axis, so no cell inside a feature's own reconstruction footprint can
+  // inherit a flat neighbour's wide kernel. A mean averages the noise down; the
+  // erosion still guarantees the only error it can make is filtering too little.
+  // An unknown — an incoherent bearing, a stamp with no along-track partners —
+  // is always resolved toward the shipped kernel, never away from it.
+  //
+  // WHAT IS DELIBERATELY UNCHANGED: sigma_cross. It stays at one detail cell at
+  // every level, so the committed cross-slope — and therefore the bank a berm
+  // realises, which is the dominant crash cause on two seeds — is bit-for-bit
+  // the shipped answer wherever the design has curvature and within measurement
+  // noise of it everywhere else. The anisotropy question and the residual
+  // question are settled independently, on purpose.
+  // -------------------------------------------------------------------------
+  const TREAD_LP_SIGMA_FLAT = 1.10;      // sigma_along on ground the design left flat
+  const KAPPA_DESIGN_FLAT = 0.012;       // 1/m — the acceptance criterion's own threshold
+  const KAPPA_DESIGN_FEATURE = 0.060;    // 1/m — g / (12.9 m/s)^2, the launch scale
+  const PLAN_TOL = 0.25;                 // m the kernel may depart the tread by
+  const LP_NLEV = 12;                    // sigma_along quantisation levels
+  // Detail cells of min-erosion on the sigma field. MEASURED across 0/2/4/6 on
+  // seed 20260726, one process, one route: the shaped-feature minimum moves
+  // 0.783 -> 0.785 and the residual p95 0.0174 -> 0.0185, i.e. the erosion is
+  // very nearly free in both directions on this route. It is kept at a 1.4 m
+  // guard band — the same order as the widest kernel's one-sigma — as insurance
+  // for a route where a feature DOES sit against flat ground, which this route
+  // cannot prove never happens, and because its only possible error is
+  // filtering too little.
+  const LP_SIG_ERODE = 4;
   // A [1,2,1]/4 pass has variance DSTEP^2/2, so N passes give sigma = DSTEP*sqrt(N/2).
   // Only the 'iso' mode uses this; it is kept so the shipped round-5/6 surface can
   // still be reproduced exactly for an A/B.
@@ -2626,9 +3194,20 @@ export function createTerrain(ctx) {
   // same settings, and never consulted by anything else. It exists so a harness
   // can A/B two kernels against ONE cached world in ONE process, which is the
   // only way any of the numbers above can be trusted.
-  //   { mode: 'track' | 'iso' | 'none', sigmaAlong, sigmaCross }
+  //   { mode: 'track' | 'iso' | 'none', sigmaAlong, sigmaCross, sigmaAlongFlat,
+  //     kappaFlat, kappaFeature, planTol, erodeCells }
   const TREAD_FILTER_DEFAULT = Object.freeze({
-    mode: 'track', sigmaAlong: TREAD_LP_SIGMA, sigmaCross: TREAD_LP_SIGMA_CROSS,
+    mode: 'track',
+    sigmaAlong: TREAD_LP_SIGMA,
+    sigmaCross: TREAD_LP_SIGMA_CROSS,
+    // `sigmaAlongFlat === sigmaAlong` disables the adaptive widening entirely
+    // and reproduces the round-7 surface exactly, which is what makes the A/B
+    // above runnable from this file alone.
+    sigmaAlongFlat: TREAD_LP_SIGMA_FLAT,
+    kappaFlat: KAPPA_DESIGN_FLAT,
+    kappaFeature: KAPPA_DESIGN_FEATURE,
+    planTol: PLAN_TOL,
+    erodeCells: LP_SIG_ERODE,
   });
   const treadFilter = (() => {
     const o = settings.treadFilter;
@@ -2640,7 +3219,18 @@ export function createTerrain(ctx) {
     // Floored at half a lattice cell: below that the sampled Gaussian is
     // narrower than the lattice it lives on and is a comb, not a filter.
     const sc = Math.max(DSTEP * 0.5, num(o.sigmaCross, TREAD_FILTER_DEFAULT.sigmaCross, 0));
-    const spec = Object.freeze({ mode, sigmaAlong: sa, sigmaCross: sc });
+    // The flat-ground sigma can never be NARROWER than the base one: the ladder
+    // runs from `sigmaAlong` upward, and inverting it would filter features
+    // harder than flat ground, which is the opposite of the whole argument.
+    const saf = Math.max(sa, num(o.sigmaAlongFlat, TREAD_FILTER_DEFAULT.sigmaAlongFlat, 1e-6));
+    const kf = num(o.kappaFlat, TREAD_FILTER_DEFAULT.kappaFlat, 0);
+    const kx = Math.max(kf + 1e-6, num(o.kappaFeature, TREAD_FILTER_DEFAULT.kappaFeature, 0));
+    const pt = num(o.planTol, TREAD_FILTER_DEFAULT.planTol, 1e-4);
+    const ec = Math.round(num(o.erodeCells, TREAD_FILTER_DEFAULT.erodeCells, 0));
+    const spec = Object.freeze({
+      mode, sigmaAlong: sa, sigmaCross: sc, sigmaAlongFlat: saf,
+      kappaFlat: kf, kappaFeature: kx, planTol: pt, erodeCells: ec,
+    });
     console.info('[terrain] tread filter overridden by settings.treadFilter:', spec,
       '(default', TREAD_FILTER_DEFAULT, ')');
     return spec;
@@ -2654,55 +3244,93 @@ export function createTerrain(ctx) {
   let lpTaps = null;
 
   /**
-   * Precompute the tap list of the anisotropic kernel for every direction bin,
-   * plus one extra isotropic set at index LP_NDIR used wherever the track
-   * direction is unknown.
+   * Precompute the tap list of the anisotropic kernel for every direction bin at
+   * every sigma_along LEVEL, plus one isotropic set per level used wherever the
+   * track direction is unknown.
+   *
+   * Bin layout is `level * (LP_NDIR + 1) + dir`, with `dir === LP_NDIR` the
+   * isotropic fallback. THE FALLBACK IS AT THE BASE SIGMA AT EVERY LEVEL: an
+   * unknown bearing is a reason to filter conservatively, and a widened
+   * ISOTROPIC kernel would low-pass across the track as hard as along it, which
+   * is precisely the cross-slope damage the anisotropic kernel exists to avoid.
+   *
+   * Level 0 is the base sigma and reproduces the previous single-kernel tables
+   * exactly, so `sigmaAlongFlat === sigmaAlong` is a bit-identical no-op.
    *
    * Taps are stored CSR-style (start[] into offI[]/offJ[]/wt[]) and weights are
    * normalised per bin, so a gather is a plain weighted mean with no per-cell
    * transcendentals. Nothing here reads a clock or an rng: the tables are a pure
-   * function of the two sigmas.
+   * function of the sigma ladder.
    */
-  function buildLpTaps(sa, sc) {
-    const R = Math.max(1, Math.ceil((3 * Math.max(sa, sc)) / DSTEP));
-    const nBins = LP_NDIR + 1;
+  function buildLpTaps(sa, saFlat, sc) {
+    const nLev = saFlat > sa * (1 + 1e-9) ? LP_NLEV : 1;
+    const perLev = LP_NDIR + 1;
+    const nBins = nLev * perLev;
     const start = new Int32Array(nBins + 1);
     const oi = [], oj = [], wv = [];
-    const ia = 1 / (2 * sa * sa);
-    const ic = 1 / (2 * sc * sc);
-    for (let d = 0; d < nBins; d++) {
-      start[d] = wv.length;
-      // The extra bin (d === LP_NDIR) is isotropic at sigma_along.
-      const iso = d === LP_NDIR;
-      const th = ((d + 0.5) * Math.PI) / LP_NDIR;
-      const tx = Math.cos(th), tz = Math.sin(th);
-      let sum = 0;
-      const first = wv.length;
-      for (let dj = -R; dj <= R; dj++) {
-        for (let di = -R; di <= R; di++) {
-          const px = di * DSTEP, pz = dj * DSTEP;
-          let w;
-          if (iso) {
-            w = Math.exp(-(px * px + pz * pz) * ia);
-          } else {
-            const a = px * tx + pz * tz;
-            const c = -px * tz + pz * tx;
-            w = Math.exp(-a * a * ia - c * c * ic);
+    let Rmax = 1;
+    for (let L = 0; L < nLev; L++) {
+      const saL = nLev === 1 ? sa : sa + ((saFlat - sa) * L) / (nLev - 1);
+      // Each level is sized on its own sigma, so the wide levels do not make the
+      // narrow ones pay for taps that weigh nothing.
+      const R = Math.max(1, Math.ceil((3 * Math.max(saL, sc)) / DSTEP));
+      if (R > Rmax) Rmax = R;
+      const iaL = 1 / (2 * saL * saL);
+      const iaBase = 1 / (2 * sa * sa);
+      const ic = 1 / (2 * sc * sc);
+      for (let d = 0; d < perLev; d++) {
+        const bin = L * perLev + d;
+        start[bin] = wv.length;
+        const iso = d === LP_NDIR;
+        const th = ((d + 0.5) * Math.PI) / LP_NDIR;
+        const tx = Math.cos(th), tz = Math.sin(th);
+        // The isotropic fallback is built at the BASE sigma and therefore needs
+        // only the base radius.
+        const RR = iso ? Math.max(1, Math.ceil((3 * Math.max(sa, sc)) / DSTEP)) : R;
+        let sum = 0;
+        const first = wv.length;
+        for (let dj = -RR; dj <= RR; dj++) {
+          for (let di = -RR; di <= RR; di++) {
+            const px = di * DSTEP, pz = dj * DSTEP;
+            let w;
+            if (iso) {
+              w = Math.exp(-(px * px + pz * pz) * iaBase);
+            } else {
+              const a = px * tx + pz * tz;
+              const c = -px * tz + pz * tx;
+              w = Math.exp(-a * a * iaL - c * c * ic);
+            }
+            if (w < 1e-4) continue;
+            oi.push(di); oj.push(dj); wv.push(w); sum += w;
           }
-          if (w < 1e-4) continue;
-          oi.push(di); oj.push(dj); wv.push(w); sum += w;
         }
+        for (let t = first; t < wv.length; t++) wv[t] /= sum;
       }
-      for (let t = first; t < wv.length; t++) wv[t] /= sum;
     }
     start[nBins] = wv.length;
     lpTaps = {
-      R, nBins, start,
-      offI: Int8Array.from(oi),
-      offJ: Int8Array.from(oj),
+      R: Rmax, nLev, perLev, nBins, start,
+      // Offsets can exceed +-127 only if a sigma above ~14 m were configured;
+      // Int16 removes the question at the cost of one byte per tap.
+      offI: Int16Array.from(oi),
+      offJ: Int16Array.from(oj),
       wt: Float32Array.from(wv),
     };
     return lpTaps;
+  }
+
+  /**
+   * The sigma_along a stamp permits from the DESIGN'S OWN VERTICAL CURVATURE, in
+   * metres. The plan-curvature cap is applied separately, per cell, from the
+   * direction field's coherence — see the ADAPTIVE block and smoothTrackFrame().
+   */
+  function sigmaAllowed(kapA) {
+    const f = treadFilter;
+    let t = (kapA - f.kappaFlat) / (f.kappaFeature - f.kappaFlat);
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    const ease = t * t * (3 - 2 * t);            // 0 at flat, 1 at feature scale
+    const s = f.sigmaAlongFlat + (f.sigmaAlong - f.sigmaAlongFlat) * ease;
+    return s < f.sigmaAlong ? f.sigmaAlong : s;
   }
 
   // Coherence below which a cell's accumulated bearing is not trusted and the
@@ -2796,14 +3424,80 @@ export function createTerrain(ctx) {
    * so a sample two tiles share is computed from the same neighbourhood in both
    * and the copies stay bit-identical.
    */
-  function smoothTrackFrame(src, dCells, accW, dirA, dirB, dirW) {
+  /**
+   * Erode the per-cell sigma_along field by `cells` samples on each axis, so a
+   * cell can never be filtered wider than the narrowest requirement in its own
+   * neighbourhood. A separable running minimum — the morphological dual of the
+   * [1,2,1] smoother above, and the conservative direction by construction: the
+   * only error it can make is filtering too little.
+   *
+   * Reads through the same global lattice addressing as everything else, so the
+   * duplicated border samples two tiles share stay bit-identical.
+   */
+  function erodeSigma(sigIn, dCells, cells) {
+    if (cells <= 0 || nTiles === 0) return sigIn;
+    let src = sigIn;
+    let dst = new Float32Array(dCells);
+    const keys = slotKeys();
+    for (let pass = 0; pass < 2; pass++) {
+      const alongX = pass === 0;
+      for (let s = 0; s < nTiles; s++) {
+        const key = keys[s];
+        const ti = key % DTILES;
+        const tj = (key / DTILES) | 0;
+        const gi0 = ti * DT_INNER - 1;
+        const gj0 = tj * DT_INNER - 1;
+        const base = s * DTS * DTS;
+        for (let j = 0; j < DTS; j++) {
+          for (let i = 0; i < DTS; i++) {
+            let m = src[base + j * DTS + i];
+            for (let k = -cells; k <= cells; k++) {
+              if (k === 0) continue;
+              const q = alongX ? detailCellAt(gi0 + i + k, gj0 + j)
+                : detailCellAt(gi0 + i, gj0 + j + k);
+              // A missing neighbour is outside the allocated corridor and holds
+              // no tread; it must not pull the sigma down.
+              if (q < 0) continue;
+              if (src[q] < m) m = src[q];
+            }
+            dst[base + j * DTS + i] = m;
+          }
+        }
+      }
+      const t = src; src = dst; dst = t;
+    }
+    return src;
+  }
+
+  function smoothTrackFrame(src, dCells, accW, dirA, dirB, dirW, sigA) {
     if (nTiles === 0) return src;
-    const taps = lpTaps || buildLpTaps(treadFilter.sigmaAlong, treadFilter.sigmaCross);
+    const taps = lpTaps
+      || buildLpTaps(treadFilter.sigmaAlong, treadFilter.sigmaAlongFlat, treadFilter.sigmaCross);
     const start = taps.start, offI = taps.offI, offJ = taps.offJ, wt = taps.wt;
+    const perLev = taps.perLev, nLev = taps.nLev;
     const isoBin = LP_NDIR;
+    // Level lookup: 0 at the base sigma, nLev-1 at the flat-ground sigma.
+    const sa0 = treadFilter.sigmaAlong;
+    const levScale = nLev > 1 ? (nLev - 1) / (treadFilter.sigmaAlongFlat - sa0) : 0;
     const dst = new Float32Array(dCells);
     const keys = slotKeys();
     const binScale = LP_NDIR / Math.PI;
+    // Coherence -> plan-curvature cap on the widening, in closed form: the
+    // kernel may not walk more than planTol off the tread at its 2-sigma span,
+    // and the r.m.s. bearing error is sqrt((1 - coherence)/2). See the ADAPTIVE
+    // block for the derivation and the measured coherence distribution.
+    const planTol = treadFilter.planTol;
+    // Instrumentation: what the adaptive band limit ACTUALLY did, per committed
+    // cell, after both the design-curvature gate and the coherence cap. Not a
+    // knob — "the widening never reached the flat ground" is otherwise invisible
+    // from outside this file, and it is the failure mode a per-stamp plan
+    // curvature estimate already produced once.
+    const NB = 64;
+    const hist = new Int32Array(NB);
+    const cHist = new Int32Array(NB);
+    let hN = 0, hSum = 0;
+    const hLo = sa0, hSpan = treadFilter.sigmaAlongFlat > sa0
+      ? treadFilter.sigmaAlongFlat - sa0 : 1;
     for (let s = 0; s < nTiles; s++) {
       const key = keys[s];
       const ti = key % DTILES;
@@ -2823,6 +3517,11 @@ export function createTerrain(ctx) {
           let bin = isoBin;
           const a = dirA[p], b = dirB[p];
           const mag = Math.sqrt(a * a + b * b);
+          const coher = wc > 0 ? mag / wc : 0;
+          // Deliberately the same multiply-form test as before rather than
+          // `coher > LP_DIR_COHERENCE`: the two are algebraically identical but
+          // not bit-identical, and this branch decides the bearing of the
+          // shipped surface.
           if (wc > 0 && mag > wc * LP_DIR_COHERENCE) {
             let th = Math.atan2(b, a) * 0.5;      // (-pi/2, pi/2]
             if (th < 0) th += Math.PI;
@@ -2830,6 +3529,28 @@ export function createTerrain(ctx) {
             if (bin >= LP_NDIR) bin = LP_NDIR - 1;
             else if (bin < 0) bin = 0;
           }
+
+          // sigma_along level from the design's own curvature, capped by the
+          // coherence of the bearing this kernel is about to assume (see the
+          // ADAPTIVE block). The isotropic fallback bin stays at the base sigma
+          // at every level, so an unknown bearing is never widened.
+          let sigUsed = sa0;
+          if (nLev > 1 && bin !== isoBin) {
+            const d2 = 2 * (1 - coher);
+            const cap = d2 > 1e-9 ? planTol / Math.sqrt(d2) : Infinity;
+            sigUsed = sigA[p] < cap ? sigA[p] : cap;
+            if (sigUsed < sa0) sigUsed = sa0;
+            let lev = Math.round((sigUsed - sa0) * levScale);
+            if (lev < 0) lev = 0; else if (lev > nLev - 1) lev = nLev - 1;
+            bin += lev * perLev;
+          }
+          hN++; hSum += sigUsed;
+          let hb = Math.floor(((sigUsed - hLo) / hSpan) * NB);
+          if (hb < 0) hb = 0; else if (hb > NB - 1) hb = NB - 1;
+          hist[hb]++;
+          let cb = Math.floor(coher * NB);
+          if (cb < 0) cb = 0; else if (cb > NB - 1) cb = NB - 1;
+          cHist[cb]++;
 
           const t0 = start[bin], t1 = start[bin + 1];
           let acc = 0, wsum = 0;
@@ -2855,6 +3576,23 @@ export function createTerrain(ctx) {
         }
       }
     }
+    const quant = (h, f, lo, span, nb) => {
+      const want = f * hN;
+      let acc = 0;
+      for (let b = 0; b < nb; b++) { acc += h[b]; if (acc >= want) return lo + ((b + 0.5) / nb) * span; }
+      return lo + span;
+    };
+    timings.lpSigma = hN === 0 ? null : {
+      cells: hN,
+      mean: hSum / hN,
+      p10: quant(hist, 0.10, hLo, hSpan, NB),
+      p50: quant(hist, 0.50, hLo, hSpan, NB),
+      p90: quant(hist, 0.90, hLo, hSpan, NB),
+      baseFrac: hist[0] / hN,
+      wideFrac: hist[NB - 1] / hN,
+      coherP10: quant(cHist, 0.10, 0, 1, NB),
+      coherP50: quant(cHist, 0.50, 0, 1, NB),
+    };
     return dst;
   }
 
@@ -2866,14 +3604,35 @@ export function createTerrain(ctx) {
    * an error budget of 0.10 m. Absolute 1700 m elevations in Float32 would be
    * good to 2e-4 m, which is still fine, but the datum costs nothing.
    */
-  function commitDetail(accW, accWT, accMax, dCells, dirA, dirB, dirW) {
+  function commitDetail(accW, accWT, accMax, dCells, dirA, dirB, dirW, kapA) {
     let src = new Float32Array(dCells);
     for (let p = 0; p < dCells; p++) {
       const w = accW[p];
       src[p] = (w === 0 ? dHeights[p] : dHeights[p] + accWT[p] / w) - BASE_Y;
     }
+    // Cleared here rather than left from a previous applyCarve on the same
+    // instance: only the 'track' path produces it, and a stale one would be
+    // read as a live measurement.
+    timings.lpSigma = null;
     if (treadFilter.mode === 'iso') src = smoothSeparable(src, dCells, TREAD_LP_PASSES);
-    else if (treadFilter.mode === 'track') src = smoothTrackFrame(src, dCells, accW, dirA, dirB, dirW);
+    else if (treadFilter.mode === 'track') {
+      // Design curvature -> permitted sigma_along, in place (kapA is scratch and
+      // is not read again), then eroded so the widening cannot creep onto a
+      // feature from the flat ground beside it.
+      //
+      // A cell no stamp reached carries the FLAT sigma, not the base one. It is
+      // never committed, so its own value is irrelevant; the only thing it does
+      // is act as an input to the erosion, and there is no authored curvature
+      // out there to protect. Giving it the base sigma instead makes the
+      // erosion pull every tread cell within LP_SIG_ERODE of the corridor's
+      // edge down to the base kernel for no reason at all.
+      for (let p = 0; p < dCells; p++) {
+        const w = dirW[p];
+        kapA[p] = w > 0 ? sigmaAllowed(kapA[p] / w) : treadFilter.sigmaAlongFlat;
+      }
+      const sig = erodeSigma(kapA, dCells, treadFilter.erodeCells);
+      src = smoothTrackFrame(src, dCells, accW, dirA, dirB, dirW, sig);
+    }
     for (let p = 0; p < dCells; p++) {
       if (accW[p] === 0) continue;
       dHeights[p] += (src[p] + BASE_Y - dHeights[p]) * accMax[p];
@@ -3018,6 +3777,12 @@ export function createTerrain(ctx) {
     const dDirA = new Float32Array(dCells);
     const dDirB = new Float32Array(dCells);
     const dDirW = new Float32Array(dCells);
+    // The design's own vertical curvature per detail cell, accumulated with the
+    // height-blend STRENGTH as its weight — the same summand as dDirW, which is
+    // therefore its denominator. A broad mean, deliberately not the Shepard one:
+    // see the CONSERVATISM paragraph in the ADAPTIVE block. Converted to a
+    // sigma_along and eroded in commitDetail.
+    const dKapA = new Float32Array(dCells);
 
     for (let s = 0; s < list.length; s++) {
       const st = list[s];
@@ -3029,6 +3794,9 @@ export function createTerrain(ctx) {
       const halfW = prep.halfW[s];
       const tx = prep.tanX[s], tz = prep.tanZ[s];
       const rx = -tz, rz = tx;
+      // Constant over this stamp's footprint, so it is hoisted out of the cell
+      // loop exactly like the doubled-angle bearing below.
+      const kapAs = prep.kapA[s];
       // Doubled-angle form of this stamp's bearing; constant over its footprint.
       const dir2a = tx * tx - tz * tz, dir2b = 2 * tx * tz;
       const arc0 = prep.arc[s];
@@ -3098,6 +3866,7 @@ export function createTerrain(ctx) {
               dDirB[p] += _scWH * dir2b;
               dDirW[p] += _scWH;
               if (_scWH > dAccMax[p]) dAccMax[p] = _scWH;
+              dKapA[p] += _scWH * kapAs;
 
               if (st.material !== undefined && st.material !== null) {
                 if (w > 0.50) {
@@ -3128,7 +3897,7 @@ export function createTerrain(ctx) {
       }
     }
 
-    commitDetail(dAccW, dAccWT, dAccMax, dCells, dDirA, dDirB, dDirW);
+    commitDetail(dAccW, dAccWT, dAccMax, dCells, dDirA, dDirB, dDirW, dKapA);
 
     detailReady = true;
 
@@ -4192,6 +4961,15 @@ export function createTerrain(ctx) {
     sampleWetness,
     sampleSnow,
     sampleCarve,
+
+    // --- march support: directional queries, allocation-free (see §MARCH) ---
+    sampleGrade,
+    sampleCrossSlope,
+    sampleCurvatureAlong,
+    probeCorridor,
+    probeReach: PROBE_REACH,
+    probeBand: PROBE_BAND,
+    probeFallAt: PROBE_FALL,
     // The trail's emitted design surface at a point (see sampleDesign()). QA
     // measures the committed heightfield against this; nothing on a hot path
     // reads it.
