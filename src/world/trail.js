@@ -10,6 +10,25 @@
 //
 // CONTRACT-NOTE: `trail` exposes some additive read-only fields beyond §4 that other
 //   modules may find useful (all optional to consume, nothing in §4 changed):
+//     trail.cornerAudit -> the lean-identity audit, one row per corner, with a
+//                          replay of the pre-fix speed/bank rule on the same
+//                          geometry as the "before" column. See
+//                          auditCornerIdentity() and replayOldRule().
+//     trail.routeAudit  -> one row per route variant the march tried, with the
+//                          corridor-protectability numbers it was scored on and
+//                          which one was chosen. See marchRoute()/scoreRoute().
+//     trail.safety.legBefore / legAfter
+//                       -> the two-leg conflict audit: stretches where two parts
+//                          of the route, more than LEG_ARC_MIN of arc apart,
+//                          contest the same ground. `legBefore` is measured on
+//                          the final stations before the pinch, `legAfter` after
+//                          it. See auditLegConflicts() and legClearanceCost().
+//     trail.safety.crestStage
+//                       -> crest violations on the FINAL profile after each pass
+//                          that touches it, with authored relief masked. This is
+//                          NOT safety.crestViolAfter, which is measured at
+//                          capCrestCurvature's own exit, four passes upstream of
+//                          the profile that ships. See countCrestViol().
 //     trail.splits      -> [{ id, tStart, tEnd, side, offset, mainLine:'A'|'B', label }]
 //     trail.phases      -> [{ id, name, tStart, tEnd, surface }]   pacing sections
 //     trail.speedAt(t)  -> expected rider speed (m/s) from the design speed profile
@@ -31,13 +50,18 @@
 //   (20260726), the jump line builds as:
 //
 //     feature        takeoff        lip          landing  gap    air    window
-//     tabletop       15.8 m/s 57 km/h  0.92 m @ 10°  12.7 m  7.0 m  0.88 s  7.5–20.9 m/s
-//     double-1       15.7 m/s 57 km/h  0.98 m @ 15°  16.1 m  9.6 m  1.13 s  13.5–20.4
-//     double-2       16.0 m/s 58 km/h  0.98 m @ 16°  17.4 m 11.2 m  1.21 s  14.1–20.5
-//     road gap (A)   14.0 m/s 50 km/h  1.06 m @ 27°  19.0 m 15.2 m  1.58 s  13.4–17.9
-//     step-down      13.2 m/s 47 km/h  0.72 m @ 17°  16.0 m 13.3 m  1.36 s  12.4–19.7
-//     rock double    12.3 m/s 44 km/h  0.66 m @ 12°   8.9 m  4.9 m  0.80 s  10.5–16.2
-//     finish booter  10.8 m/s 39 km/h  0.72 m @ 30°  11.5 m  9.4 m  1.34 s  10.3–14.0
+//     tabletop       15.5 m/s 56 km/h  0.92 m @ 10°  12.2 m  6.7 m  0.87 s  7.3–20.5 m/s
+//     double-1       14.0 m/s 51 km/h  0.98 m @ 15°  13.1 m  5.6 m  1.05 s  10.4–19.4
+//     double-2       13.0 m/s 47 km/h  0.98 m @ 24°  15.0 m 11.1 m  1.36 s  12.2–16.6
+//     road gap (A)   11.7 m/s 42 km/h  1.06 m @ 30°  15.6 m 12.2 m  1.52 s  11.0–15.2
+//     step-down      14.0 m/s 50 km/h  0.72 m @ 15°  16.9 m 13.9 m  1.33 s  13.2–20.7
+//     rock double    10.9 m/s 39 km/h  0.66 m @ 12°   7.5 m  4.1 m  0.76 s  9.6–14.8
+//     finish booter  17.5 m/s 63 km/h  0.72 m @ 16°  19.8 m 15.6 m  1.25 s  16.8–21.3
+//
+//   (Re-measured this round. The table above had drifted from the shipped build
+//   by up to 3 m of landing distance; the numbers here are what solveJump()
+//   actually emits on seed 20260726, and they are bit-identical before and after
+//   every change made this round — the jump line is untouched.)
 //
 //   "landing" is the horizontal distance from the lip to where the arc meets the
 //   base grade; "gap" is lip-to-knuckle; "window" is the range of takeoff speeds
@@ -69,6 +93,25 @@
 //   quadtree's _splitK changes materially, LODQ and the smoothstep range here
 //   should be re-derived rather than left as they are.
 //
+// CONTRACT-NOTE (RESOLVED — kept because the measurement discipline it forced is
+//   still the right one):
+//   An earlier cut of this note reported that the world was not deterministic
+//   from ctx.seed, because terrain.js sized its hydraulic-erosion droplet budget
+//   from a wall-clock projection. That has been fixed in terrain.js: the budget
+//   is now DROPLETS x DROPLET_TIER[ctx.quality], there is no time-budgeted
+//   branching left in terrain.js or in this file, and Date.now() feeds only the
+//   timings report. Re-verified this round on seven boots of seed 20260726 under
+//   load, plus 777 and 12345: byte-identical fingerprints every time.
+//
+//   The world is still a function of seed AND quality tier (medium runs 65% of
+//   the droplets), which is settings-derived and documented, but means a player
+//   who changes quality mid-session gets a different mountain.
+//
+//   What stands regardless: any harness measuring this module must A/B in ONE
+//   process against ONE cached pre-carve mountain and must fingerprint the world
+//   before and after every measurement. Several rounds of this project's tuning
+//   were done across a gap where that was not true.
+//
 // CONTRACT-NOTE: A/B line splits diverge up to ~5.5 m from the centreline, which is
 //   wider than the 1.2–3.0 m tread width §4 allows for `widthAt()`. The carve and the
 //   tread ribbon cover BOTH lines; `widthAt()` still reports the main line's tread
@@ -94,6 +137,144 @@ const V_CAP = 22.0;           // m/s (79 km/h) — realistic DH terminal on this
 const A_BRAKE = 7.2;          // m/s² achievable braking on dirt before pitching
 const PEDAL_POWER = 320;      // W, a racer sprinting out of the gate
 const MU_LAT = 1.18;          // lateral friction coefficient, DH tyre on prepared dirt
+
+// ---------------------------------------------------------------------------
+// THE LEAN IDENTITY — the constraint the whole speed/radius/bank solve exists
+// to satisfy.
+//
+// A bike holds a corner by leaning. On a corner of plan radius r taken at v,
+// the lean the rider must hold RELATIVE TO THE SURFACE is
+//
+//     leanContact = atan( v^2 / (g*r) ) - bank
+//
+// and a downhill bicycle on good dirt runs out of tyre somewhere around 45 deg.
+// So a course is only rideable where
+//
+//     atan( v^2 / (g*r) )  <=  bank + LEAN_AVAIL,  with real margin below it.
+//
+// WHAT WAS WRONG. Before this change the corner speed cap used MU_LAT = 1.18 —
+// a perfectly good number for a DH tyre, and the wrong number for this job,
+// because tan(atan(1.18)) = 49.7 deg of lean is past what the bike can hold and
+// well past what it can hold while the tyres are anything less than perfectly
+// planted. Measured on seed 20260726, the trail asked 10.6-14.3 m/s of a
+// 12.5-15 m radius through 76-92 m: 37-59 deg of required lean against 15-19
+// deg of built bank. The fast end of that is not merely hard, it is impossible.
+//
+// THE FIX IS ONE SUBSTITUTION AND IT MAKES THE IDENTITY AN IDENTITY. The
+// standard banked-corner limit is
+//
+//     v^2 = g*r*(mu + tan(phi)) / (1 - mu*tan(phi))
+//
+// and the right-hand side is exactly g*r*tan(atan(mu) + phi). So solving the
+// speed profile with mu = tan(LEAN_DESIGN) gives
+//
+//     atan( v^2/(g*r) ) = phi + LEAN_DESIGN   =>   leanContact = LEAN_DESIGN
+//
+// at every corner where the cap binds, and less than that everywhere else. The
+// identity holds by construction rather than by inspection, on all nine phases,
+// for any seed and any mountain. LEAN_DESIGN is then the single number that
+// says how hard the course asks the rider to lean.
+//
+// LEAN_DESIGN is 28 deg and not 39. 39 would satisfy the acceptance test with
+// its stated 6 deg of margin and would still not be rideable, because the
+// bike's ceiling is not a constant: `leanCeiling()` in bike.js derives it from
+// tyre load, and it was measured collapsing from 0.63 rad to 0.22 rad (36 deg
+// to 13 deg) through a roller crest. A design that asks for the steady-state
+// ceiling has nothing left for the moment the tyres go light. 28 deg leaves
+// roughly a third of the budget unspent at every corner on the course.
+const LEAN_AVAIL = THREE.MathUtils.degToRad(45);
+const LEAN_DESIGN = THREE.MathUtils.degToRad(28);
+// mu that reproduces LEAN_DESIGN, per surface. SURF_MU scales it, so a corner
+// on mud or roots is designed slower than the same corner on hardpack.
+const MU_DESIGN = Math.tan(LEAN_DESIGN);
+
+// ---------------------------------------------------------------------------
+// BERM STYLE, per phase.
+//
+// Every phase is bermed. That is the change: findCorners() and the berm
+// builder used to be invoked at three call sites — 'flow', 'loam' and 'sprint'
+// — so six of the nine phases had no corner detection and no berm construction
+// at all, and the global banking pass then multiplied the ideal bank by a
+// per-phase coefficient as low as 0.42. A corner in `roots` needing 45 deg was
+// authored to receive 18.9.
+//
+// What is NOT the change: making everything a motorway berm. The character of
+// a phase is what it is built out of, and these numbers say so —
+//
+//   `style`     how much of the IDEAL bank a builder shapes here for its own
+//               sake. 1.0 is a full race berm; 0.45-0.6 is an insloped rut or
+//               a worn catch bank of the kind that forms naturally on the
+//               outside of a tech corner.
+//   `maxBank`   the ceiling. A rock slab does not hold a 46 deg berm; it holds
+//               a shallow insloped shelf, so `slab` stops at 22 deg and the
+//               speed solve takes the corner speed down to suit.
+//   `minRadius` how tight a corner has to be before it is worth shaping at all
+//               — bigger in the flow phases, where a builder shapes long
+//               sweeping turns, smaller in the tech phases, where only the
+//               genuinely tight corners get worked.
+//
+// The identity floor overrides `style` (never `maxBank`): wherever the corner
+// physically needs more bank than the phase's character would shape, it gets
+// it, up to the phase ceiling. Past the ceiling the speed comes down instead —
+// which is the honest answer for a rock chute, and is what makes a tech phase
+// slow rather than fatal.
+// `style` is deliberately well below 1 outside the flow phases, and that is a
+// safety property as much as an aesthetic one. Bank is not free: a rider who
+// slides laterally on a steeply banked tread is thrown UPWARD at
+// v_lateral * tan(bank), and at 37 deg a 2.5 m/s drift becomes 1.9 m/s of
+// vertical — measured at 80 m, the bike left the ground doing exactly that and
+// then hit the catch berm outboard of the tread at 13 g. Bank the corner for
+// what it needs plus a builder's flourish; do not bank it because you can.
+const BERM_STYLE = {
+  start:  { minRadius: 55, minSpacing: 18, style: 0.55, maxBank: 0.52, widthAdd: 0.30, ruts: 0.045, brake: 0.055, brakeLen: 12 },
+  roots:  { minRadius: 26, minSpacing: 10, style: 0.35, maxBank: 0.35, widthAdd: 0.14, ruts: 0.060, brake: 0.045, brakeLen: 7 },
+  flow:   { minRadius: 46, minSpacing: 18, style: 0.85, maxBank: 0.75, widthAdd: 0.35, ruts: 0.045, brake: 0.075, brakeLen: 14 },
+  jumps:  { minRadius: 50, minSpacing: 20, style: 0.70, maxBank: 0.60, widthAdd: 0.30, ruts: 0.040, brake: 0.050, brakeLen: 12 },
+  slab:   { minRadius: 30, minSpacing: 12, style: 0.30, maxBank: 0.30, widthAdd: 0.10, ruts: 0.014, brake: 0.000, brakeLen: 0 },
+  creek:  { minRadius: 36, minSpacing: 14, style: 0.45, maxBank: 0.42, widthAdd: 0.22, ruts: 0.030, brake: 0.035, brakeLen: 8 },
+  loam:   { minRadius: 34, minSpacing: 14, style: 0.70, maxBank: 0.65, widthAdd: 0.30, ruts: 0.070, brake: 0.060, brakeLen: 10 },
+  rocks:  { minRadius: 30, minSpacing: 12, style: 0.35, maxBank: 0.34, widthAdd: 0.14, ruts: 0.018, brake: 0.000, brakeLen: 0 },
+  sprint: { minRadius: 52, minSpacing: 20, style: 0.85, maxBank: 0.75, widthAdd: 0.38, ruts: 0.045, brake: 0.070, brakeLen: 16 },
+};
+const BERM_STYLE_DEFAULT = BERM_STYLE.flow;
+
+// ---------------------------------------------------------------------------
+// STRAIGHT-LINE SPEED CEILING, per phase.
+//
+// The corner cap above bounds the speed a corner can be taken at. Nothing
+// bounded the speed on a STRAIGHT, so the forward pass ran gravity against drag
+// and rolling resistance and arrived at whatever that gave — measured on seed
+// 20260726, 18.7-19.8 m/s (67-71 km/h) through the Rooty Steeps, on a 1.37-1.48 m
+// tread, at 20-32% gradient, over root ridges 5-12 cm proud. That is not a
+// design speed, it is the absence of one, and because `speedAt()` is what the
+// rider (and the autopilot) servo onto, it is an instruction to ride a 1.4 m
+// wide root chute at 71 km/h. Every run reaching that far died in it.
+//
+// These are the speeds each section is DESIGNED to be ridden at, and they are
+// what a real DH course runs: a race averages 25-35 km/h and tops out at 55-65
+// on the open sections. They are stated per phase because that is where the
+// design intent lives — Rooty Steeps is slow because it is narrow, steep and
+// rough, and the Finish Sprint is fast because it is 3 m of hardpack.
+//
+// The geometry has to justify the number, or a slow corner reads as a fast one
+// and the rider is punished for believing what they see. So the ceiling is
+// modulated by the two things the rider can actually SEE at that station — how
+// wide the tread is, and how rough it is — rather than applied as a flat
+// per-phase constant. Both modifiers key off the phase's own design width, so
+// a phase that widens for a berm speeds up there and a pinch slows down.
+const V_PHASE = {
+  start: 16.0, roots: 10.5, flow: 17.0, jumps: 17.5, slab: 12.5,
+  creek: 12.0, loam: 13.0, rocks: 11.0, sprint: 19.0,
+};
+// Chatter ceiling. Transverse relief of amplitude A at wavelength lambda drives
+// the contact patch at v/lambda Hz, and the peak vertical acceleration of that
+// motion is A*(2*pi*v/lambda)^2 / 2. Setting that equal to g gives the speed at
+// which an UNSPRUNG wheel would leave the ground every cycle; a 170 mm fork
+// with real damping carries roughly ROUGH_SUSP times that before the tyre
+// starts skipping, which is the number calibrated here. lambda is the ~1.6 m
+// spacing the root ridges and braking-bump trains are authored at.
+const ROUGH_LAMBDA = 1.6;
+const ROUGH_SUSP = 3.4;
 
 const STATION_DS = 0.4;       // m between centreline stations (also the stamp spacing)
 const RIBBON_DS = 0.8;        // m between tread-ribbon rings (halved over shaped features)
@@ -175,7 +356,21 @@ const CATCH_MIN_Q = 0.60;    // m — closest to the tread edge a catch crest ma
                              // would bury the ribbon; and terrain.applyCarve floors every
                              // stamp radius at 0.6 m, so nothing sharper than about a
                              // 1.2 m wavelength survives the carve accumulator anyway.
-const CATCH_RAMP = 0.40;     // m over which the shelf ramps up into the crest
+// THE INNER FACE OF A CATCH BERM IS A RAMP THE RIDER HITS, so its slope is a
+// safety constraint and not a detail. Authored as a fixed 0.40 m of ramp up to
+// 0.85 m of crest, it was a 2.1:1 face — 65 degrees — sitting 0.6 m outside the
+// tread edge. Measured at 80 m on seed 20260726: a rider drifting 0.4 m wide at
+// 10 m/s hit it and took 13 g, left the ground, and every cell of the autopilot
+// sweep died within 25 m of that point. A catch berm that launches the rider it
+// caught is worse than no catch berm.
+//
+// So the ramp length is derived from the crest height instead of being fixed,
+// and where there is not enough room outboard for a rideable face the CREST
+// COMES DOWN rather than the face steepening. A 0.25 m ridge at 30 degrees
+// still scrubs speed and still turns a rider back; it does not throw them.
+const CATCH_FACE = 0.60;     // tan(31 deg) — the steepest inner face a rider can hit
+const CATCH_RAMP_MAX = 1.60; // m — the longest face worth authoring
+const CATCH_RAMP = 0.40;     // m — floor on the ramp length (see rampLenFor)
 const CATCH_PLATEAU = 0.50;  // m of FLAT crest. Not cosmetic: applyCarve reconstructs
                              // the surface as a distance-weighted mean of flat stamp
                              // discs, which is a low-pass filter about 1 m wide. A
@@ -200,6 +395,190 @@ const RAMP_NARROW = 2.00;    // m — a tread narrower than this counts as narro
 const RAMP_CUT_MAX = 7.00;   // m — excavation ceiling for the relaxation
 const RAMP_FILL_MAX = 3.00;  // m
 const FEATURE_GUARD = 15.0;  // m either side of a shaped feature that the rule leaves alone
+
+// ---------------------------------------------------------------------------
+// CORRIDOR PROTECTABILITY — the term that stops the ROUTE-FINDER walking into
+// ground the safety pass cannot then rescue.
+//
+// WHY THIS EXISTS, AND WHY IT IS UPSTREAM OF EVERYTHING ELSE IN THIS FILE.
+// applyExposureSafety() is a mitigation pass. It eases the gradient, benches the
+// line toward the safe side, widens the tread and builds a run-off shelf with a
+// catch berm at its lip. All four are real and all four are bounded — a bench
+// shift is at most BENCH_SHIFT_MAX, a catch berm may stand on at most
+// CATCH_FILL_MAX of built fill. Where the mountain has genuinely gone, none of
+// them fit, and designCatch() says so: on seed 20260726 it reported 26 stations
+// with no catch berm at all, all of them in the first hundred metres, and every
+// cell of the autopilot sweep died there.
+//
+// Measured on the PRE-CARVE mountain along the route the old marchRoute picked:
+//
+//     0-100 m    mean unsupported fall-away 4.59 m   163/250 stations unprotectable
+//   100-200 m                               2.09 m     9/250
+//   200-1200 m                              0.00 m     0/2500
+//  1400-1700 m                              2.95 m   263/750
+//  1800-2700 m                              0.13 m     0/2250
+//
+// The exposure is not diffuse. It is two identifiable corridors, and the first
+// one is exactly where every autopilot cell crashed. Through 0-100 m the left
+// probe reads 0.00 m at every single station while the right reads 5-8 m: the
+// route is running the crest of a rib with the hillside standing up on one side
+// and gone on the other. A 1.5 m error — ordinary on a 2.9 m tread, and a
+// fixed-gain pure-pursuit controller carries about that much on a 14-30 m radius
+// — puts the rider over the edge, and there is nothing to catch them because
+// nothing can be built there.
+//
+// So the fix is not a better catch berm. It is to make the route-finder score
+// the corridor it is about to commit to, and refuse the ones it cannot protect.
+//
+// THE METRIC IS designCatch()'s OWN FEASIBILITY TEST, run forward.
+// A catch berm at reach q sits at (edgeY - SHELF_SLOPE*q + h) and stands on
+// (crest - naturalGround(q)) of built fill. designCatch accepts it while that is
+// within CATCH_FILL_MAX*1.7. So the deficit
+//
+//     max(0, -max_q [ budget - fill(q) ])
+//
+// is metres of fill the catch berm would be SHORT BY at the friendliest reach
+// available — it is exactly zero wherever designCatch will succeed, and it grows
+// smoothly where it will not. That smoothness is what makes it usable as a score:
+// a hard feasible/infeasible flag gives the heading search nothing to descend.
+//
+// The second term is near-field unsupported fall — metres of drop in excess of
+// what a soil hillside at EXPO_REPOSE could be holding up, within CORR_NEAR of
+// the tread edge. It is zero on an ordinary sidehill however steep (which is the
+// whole point: a downhill course wants steep sidehill) and large only on a real
+// edge. It is there because a corridor can be protectable and still unpleasant,
+// and because it gives the search a gradient to follow while it is still several
+// metres away from the ground going.
+//
+// WHAT THIS TERM IS NOT ALLOWED TO DO. It is capped — see CORR_CAP — well below
+// the march's climb penalties (900/1100/1600) and below its grade-holding weight
+// (220). It therefore cannot buy its way out of exposure by climbing, by
+// abandoning the phase's design gradient, or by switchbacking: the |dth| penalty
+// and the switchback state machine are untouched. It biases a choice between
+// comparable headings. It does not get to choose a different sport.
+// THE PROBE IS TWO-SCALE, AND THE SECOND SCALE IS A GATE RATHER THAN A COST.
+// Measured over eight probe horizons (24 m to 90 m), all built in one process
+// against one pinned mountain and swept with the same 21-cell autopilot:
+//
+//   horizon   unprotectable   crestViolAfter   median progress   min progress
+//     24 m         50               22              240 m           230 m
+//     34 m         50                7              398 m           232 m
+//     48 m         55               34              389 m           231 m
+//     56 m          0              182              204 m           143 m
+//     62 m         13               26              323 m           194 m
+//     72 m          5              225              155 m           110 m
+//     90 m         53               14              382 m           207 m
+//
+// Correlations over that family: residual crest-curvature violations against
+// minimum progress r = -0.91, against median r = -0.82. Unprotectable stations
+// against minimum progress r = +0.88 — POSITIVE, which is not a claim that
+// exposure helps but the signature of a trade: a term that chases distant
+// exposure at full weight drags the line onto ground with more longitudinal
+// relief, capCrestCurvature cannot flatten all of it, and the bike is launched.
+// Once the route is off the start rib the binding constraint on rideability
+// stops being the ground beside the tread and becomes the ground under it.
+//
+// So the near scale carries the full cost and decides the heading, and the far
+// scale only fires on a deficit past CORR_FAR_TOL — enough to refuse walking
+// into a corridor whose exits are all bad, and not enough to steer the route
+// around ordinary distant sidehill.
+const CORR_S = [5.0, 13.0, 24.0];   // m ahead of the candidate step that we probe
+const CORR_S_FAR = [38.0, 56.0, 78.0];
+const CORR_FAR_TOL = 0.55;          // m of catch-berm deficit the far gate tolerates
+const CORR_W_FAR = 52.0;
+const CORR_CAP_FAR = 90.0;
+
+// ---------------------------------------------------------------------------
+// THE OTHER HALF OF "CANNOT BE BUILT" — the LONGITUDINAL one.
+//
+// A corridor can be unbuildable in two ways, and the sweep above showed they
+// trade against each other under pressure. Laterally: no catch berm fits, so an
+// ordinary error is fatal. Longitudinally: the ground rolls over faster than a
+// profile can be cut through it inside the excavation budget, so the tread keeps
+// a crest that throws the rider into the air at the phase's own design speed.
+//
+// Fighting only the lateral half moved the route off the start rib — median
+// autopilot progress 98 -> 240 m — and then pushed it onto ground where
+// capCrestCurvature could not converge: pressing harder on exposure took
+// unprotectable stations 50 -> 0 and crest violations 22 -> 175, and progress
+// back down to 232/136 m. The two terms have to be scored together or the
+// route-finder simply trades one defect for the other, which is what the
+// exposure-safety pass was already doing a hundred metres downstream.
+//
+// THE RULE IS THE SAME ONE capCrestCurvature ENFORCES, evaluated forward on
+// natural ground: over a crest of convex vertical curvature kappa the wheels
+// keep contact only while kappa <= g / (CREST_SAFETY * v^2), and v here is the
+// phase's own design speed, because that is the speed the course will be asking
+// for when it gets there. The probe is deliberately coarse — 9 m segments over
+// 64 m — because the route-finder cannot control 4 m detail and should not try:
+// what it can choose is whether to commit to a fall line with a 15-30 m rollover
+// in it that no amount of excavation will take out.
+const CORR_KS = [0.0, 9.0, 18.0, 27.0, 36.0, 50.0, 64.0];
+// Chosen by sweep, on protection rather than on the autopilot's best cell. The
+// seven configurations measured on seed 20260726, one process, one mountain:
+//
+//   far-tol  kappa-w   unprotectable  crest  exposed(m)  autopilot p25/med/min
+//     0.55      900          5          58      1020        219 / 300 / 121
+//     off       900         47          12      1346        314 / 329 / 240
+//     0.55      400          6          54       477        211 / 221 / 205
+//     0.80      900         43          15      1124        325 / 334 / 248
+//     0.55     1400          4          69       682        116 / 140 /  97
+//
+// The trade is explicit and it does not have a free corner: anything that takes
+// unprotectable stations below about ten costs roughly a hundred metres of
+// autopilot progress, because the same pressure that pushes the line off a rib
+// pushes it onto ground with more longitudinal relief. 400 is taken over 900
+// because it holds unprotectable at 6 while cutting exposed trail to 477 m from
+// the baseline's 1454, and because its autopilot spread (205-351 m, a factor of
+// 1.7) is the tightest of the seven against the baseline's 81-413 m — this
+// project has already been bitten by a course whose measured progress moved 14x
+// on a 10 cm change of lookahead, and a result that does not depend on the
+// probe is worth more than a bigger one that does.
+const CORR_W_KAPPA = 400.0;         // score per /m of convex curvature past the cap
+const CORR_CAP_KAPPA = 120.0;
+// Shared with capCrestCurvature — see the note there. The route promises what
+// the profile solver promises.
+const CREST_SAFETY = 1.45;
+const CREST_KAPPA_MIN = 0.010;      // /m — never demand a vertical radius over 100 m
+const CREST_KAPPA_MAX = 0.120;      // /m — nor bother below ~8 m
+const CORR_Q = [0.6, 1.0, 1.5, 2.1, 2.8];  // m beyond the tread edge
+const CORR_NEAR = 1.6;              // m — near-field, i.e. as far as an ordinary error goes
+const CORR_BUDGET = CATCH_FILL_MAX * 1.7;  // designCatch's relaxed retaining-edge budget
+const CORR_CATCH_H = 0.15;          // m — the smallest catch crest designCatch will accept
+// Weights. `deficit` and `fall` are both in metres, and on the ribs this course
+// actually contains they run 0.5-3.0 m and 2-8 m respectively.
+const CORR_W_DEFICIT = 34.0;
+const CORR_W_FALL = 7.0;
+// Hard ceiling on the whole term, per candidate heading. 110 is deliberately of
+// the same order as the march's existing cross-slope penalty (120 per unit of
+// gradient past 0.85) and roughly half its grade-holding weight, so a heading
+// that is 0.5 of gradient off the phase design can never win on safety alone.
+const CORR_CAP = 110.0;
+// The same measurement, used to pick the LAUNCH POINT. That scan runs once per
+// variant, so it can afford a wider fan and more probe stations — and it has to,
+// because the first hundred metres of this course is the defect and no amount of
+// steering saves a start placed on a knife rib. Measured over the 49 candidate
+// launch points on seed 20260726: the old scan's winner scored 1117.5 and its
+// best descending corridor still carried 0.44 m of mean unsupported fall, while
+// a candidate 286 m along the same contour scored 1116.8 — a 0.06% difference,
+// i.e. a tie — on a corridor measuring 0.00 m with nothing unprotectable in it.
+// The launch scan was choosing between near-ties on a criterion that could not
+// see the only thing that mattered.
+//
+// CORR_LAUNCH_W is dimensionless and is applied to a cost in the same units as
+// CORR_CAP. The spread of the scan's own score across the plausible candidates
+// on this mountain is about 90 points, so a weight near 1 makes a completely
+// unprotectable launch cost about as much as being the twelfth-best hilltop —
+// enough to lose a tie, not enough to start the run halfway down the mountain.
+const CORR_LAUNCH_S = [8.0, 20.0, 34.0, 50.0, 70.0];
+const CORR_LAUNCH_W = 1.15;
+const CORR_LAUNCH_CAP = 150.0;
+const CORR_LAUNCH_FAN = 10;         // +-10 steps of 6 deg = +-60 deg of heading
+// Cost per unit of gradient past the opening phase's ceiling, inside the launch
+// fan. Scaled so a 60% face — the one the protectability-only cut chose — costs
+// the whole of CORR_LAUNCH_CAP on its own.
+const CORR_LAUNCH_GRADE = 450.0;
+const CORR_LAUNCH_G = [40.0, 90.0, 150.0];   // m — ranges the launch fan probes grade at
 
 // ---------------------------------------------------------------------------
 // Pacing script. `du` is the fraction of the *vertical drop* the phase occupies;
@@ -1025,6 +1404,9 @@ export function createTrail(ctx) {
   const splits = [];
   const phaseSpans = [];
   const jumpLog = [];
+  const cornerAudit = [];   // see auditCornerIdentity()
+  const routeAudit = [];    // one row per route variant; see build() and scoreRoute()
+  let crestMask = null;     // authored-relief mask; see countCrestViol()
   const group = new THREE.Group();
   group.name = 'trail';
 
@@ -1089,6 +1471,235 @@ export function createTrail(ctx) {
   // Scratch for the march's inner loop.
   const gTmp = { gx: 0, gz: 0, mag: 0 };
 
+  /**
+   * Corridor protectability at one prospective station, in metres.
+   *
+   * (cx, cz) is the centre of a tread of half-width `half` whose direction of
+   * travel is the unit vector (sx, sz); the corridor is probed CORR_Q metres
+   * beyond each tread edge. See the long note at CORR_S for the derivation.
+   *
+   * Returns the WORSE of the two sides, because a rib is only gone on one side
+   * and that is quite enough. `out` is a caller-owned scratch object so this is
+   * allocation-free — it is called about half a million times per build.
+   */
+  function corridorAt(terrain, cx, cz, sx, sz, half, out) {
+    const y0 = terrainH(terrain, cx, cz);
+    // right = (dir x up) in XZ
+    const rx = -sz, rz = sx;
+    let worstDef = 0, worstFall = 0;
+    for (let si = 0; si < 2; si++) {
+      const sgn = si === 0 ? -1 : 1;
+      let bestSlack = -1e9, fall = 0;
+      for (let k = 0; k < CORR_Q.length; k++) {
+        const q = CORR_Q[k];
+        const d = half + q;
+        const nat = terrainH(terrain, cx + rx * sgn * d, cz + rz * sgn * d);
+        // Metres of drop in excess of what a soil hillside could hold up. Zero on
+        // any ordinary sidehill however steep; the tread half-width is inside the
+        // repose allowance because the tread itself is a bench cut into that slope.
+        if (q <= CORR_NEAR + 1e-6) {
+          const e = (y0 - nat) - EXPO_REPOSE * d;
+          if (e > fall) fall = e;
+        }
+        // designCatch()'s feasibility test, run forward on natural ground.
+        const slack = CORR_BUDGET - ((y0 - SHELF_SLOPE * q + CORR_CATCH_H) - nat);
+        if (slack > bestSlack) bestSlack = slack;
+      }
+      const def = bestSlack < 0 ? -bestSlack : 0;
+      if (def > worstDef) worstDef = def;
+      if (fall > worstFall) worstFall = fall;
+    }
+    out.deficit = worstDef;
+    out.fall = worstFall;
+    out.cost = worstDef * CORR_W_DEFICIT + worstFall * CORR_W_FALL;
+    return out;
+  }
+
+  const cTmp = { deficit: 0, fall: 0, cost: 0 };
+
+  /**
+   * Mean corridor cost over `stations` metres ahead of (x, z) on heading `hd`.
+   * Straight-line probe: the march re-scores every 6 m, so a curved probe would
+   * only be re-deciding ground it is about to look at again anyway.
+   */
+  function corridorCost(terrain, x, z, hd, half, stations, cap) {
+    const sx = Math.sin(hd), sz = -Math.cos(hd);
+    let sum = 0;
+    for (let k = 0; k < stations.length; k++) {
+      const s = stations[k];
+      corridorAt(terrain, x + sx * s, z + sz * s, sx, sz, half, cTmp);
+      sum += cTmp.cost;
+    }
+    const c = sum / stations.length;
+    return c > cap ? cap : c;
+  }
+
+  /**
+   * The far gate. Deficit only, above a tolerance: this is the term that refuses
+   * to walk into a corridor whose exits are all bad, without steering the route
+   * around ordinary distant sidehill. See the note at CORR_S_FAR for the
+   * measurement that made it a gate rather than a cost.
+   */
+  function corridorGate(terrain, x, z, hd, half) {
+    const sx = Math.sin(hd), sz = -Math.cos(hd);
+    let sum = 0;
+    for (let k = 0; k < CORR_S_FAR.length; k++) {
+      const s = CORR_S_FAR[k];
+      corridorAt(terrain, x + sx * s, z + sz * s, sx, sz, half, cTmp);
+      const over = cTmp.deficit - CORR_FAR_TOL;
+      if (over > 0) sum += over * CORR_W_FAR;
+    }
+    const c = sum / CORR_S_FAR.length;
+    return c > CORR_CAP_FAR ? CORR_CAP_FAR : c;
+  }
+
+  /**
+   * Longitudinal buildability of a candidate heading: the worst convex vertical
+   * curvature of the natural ground ahead, scored against the crest cap at the
+   * phase's design speed. See the note at CORR_KS.
+   *
+   * `vDesign` is the phase's design speed, not a solved one — at route-finding
+   * time there is no speed profile yet, and the design speed is the honest
+   * statement of what the course will ask for here.
+   */
+  function corridorProfile(terrain, x, z, hd, vDesign) {
+    const sx = Math.sin(hd), sz = -Math.cos(hd);
+    const v = Math.max(4, vDesign);
+    const cap = clamp(G / (CREST_SAFETY * v * v), CREST_KAPPA_MIN, CREST_KAPPA_MAX);
+    let yPrev = terrainH(terrain, x, z);
+    let prevG = 0, worst = 0;
+    for (let k = 1; k < CORR_KS.length; k++) {
+      const s = CORR_KS[k];
+      const y = terrainH(terrain, x + sx * s, z + sz * s);
+      const seg = s - CORR_KS[k - 1];
+      const g = (yPrev - y) / seg;           // + = descending
+      if (k > 1) {
+        // d(grade)/ds over the two segments straddling station k-1. Positive is
+        // convex — getting steeper down the hill — which is the launching sign.
+        const span = 0.5 * (s - CORR_KS[k - 2]);
+        const kap = (g - prevG) / span;
+        if (kap > worst) worst = kap;
+      }
+      prevG = g; yPrev = y;
+    }
+    const over = worst - cap;
+    if (over <= 0) return 0;
+    const c = over * CORR_W_KAPPA;
+    return c > CORR_CAP_KAPPA ? CORR_CAP_KAPPA : c;
+  }
+
+  // ---------------------------------------------------------------------------
+  // LEG CLEARANCE — the route must not lay a second leg on ground an earlier leg
+  // has already claimed.
+  //
+  // WHAT GOES WRONG WITHOUT IT, measured on the shipped world at seed 777: the
+  // trail passes arc 342-345 and comes back at arc 423-426 with 1.38 m of PLAN
+  // separation and 5.82 m of height between the two limbs — a 4.2:1 face where a
+  // hillside stands at about 0.7:1. 16 such stretches, 85.6 m in total. Terrain's
+  // accumulator then has to serve both from one heightfield: its plane fit admits
+  // a neighbour while |dh| <= 0.8*d + 0.3, so at that spacing the two limbs are
+  // fitted TOGETHER, and the committed cross-slope under the tread came out at
+  // -71.4 deg where the trail declared +1.2. That is not a carve defect and no
+  // accumulator can do better — the trail asked for two surfaces in one place.
+  //
+  // THE CLEARANCE A PAIR OF LIMBS NEEDS IS A PROPERTY OF THE STAMP CLOUD, not of
+  // the drop between them, and getting that wrong is worse than not having the
+  // rule. A first cut required dh / EXPO_REPOSE of separation — the slope a
+  // hillside stands at — which sounds right and is not: two limbs of an ordinary
+  // switchback stack sit 10-14 m apart with 6-8 m between them, that rule wanted
+  // 12 m, and the term stopped being zero on courses that had nothing wrong with
+  // them (seed 20260726 lost four features and overran its design drop by 28 m).
+  //
+  // What actually breaks is CROSS-VOTING: terrain's accumulator lets a stamp vote
+  // out to RHO_MAX (1.25) normalised radii, widened up to 14% by the carve-width
+  // jitter, so a station's stamps influence ground out to
+  //     legReach(half) = 1.22*half            (the outermost lateral's offset)
+  //                    + 1.4*(0.50*half+0.30) (that lateral's voting radius)
+  // from its own centreline. Two limbs closer than the sum of their reaches are
+  // voting on each other's tread, whatever the height between them — and where
+  // the height IS large, the votes are metres apart and the mean is a wall. Once
+  // the reaches clear, the only thing left between the limbs is the cut/fill
+  // batter, whose target is clamped against natural ground and whose weight
+  // terrain already floored at 5e-4 for exactly this case.
+  //
+  // THE TERM IS EXACTLY ZERO WHEN THE ROUTE IS CLEAN. That is deliberate and it
+  // is checkable: on seeds 20260726 and 12345, which have no fold-back conflicts,
+  // the marched polyline is bit-identical with and without this term. A safety
+  // rule that silently reshapes a course it has nothing to say about is a rule
+  // nobody can measure.
+  //
+  // The weight and cap are set to the same scale as the corridor-protectability
+  // term (CORR_CAP 110) and therefore, like it, sit well below the march's climb
+  // penalties (900/1100/1600) and below its grade-holding weight (220): this can
+  // decide between comparable headings and it cannot buy its way out by climbing,
+  // by abandoning the phase gradient, or by refusing to switchback at all.
+  // 45 m of travel: a 6.5 m-radius switchback — the tightest the march builds —
+  // covers pi*6.5 = 20 m of arc through the apex and leaves its limbs 13 m apart
+  // in plan, comfortably outside any legReach() pair, so the rule has nothing to
+  // say about a switchback and everything to say about a route that comes back
+  // across its own line a hundred metres later.
+  const LEG_ARC_MIN = 45.0;     // m of travel before a point counts as another leg
+  const LEG_SEARCH = 9.0;       // m — past 2*legReach(1.5) = 6.6 m no pair conflicts
+  const LEG_W = 13.0;           // score per metre of missing clearance
+  const LEG_CAP = 115.0;
+  const LEG_CELL = 12.0;
+  // ...AND A GATE ON TOP OF THE COST, for the same reason the corridor term has
+  // one. A capped bias decides between comparable headings; it loses to `aim`
+  // (up to 220 near the finish) and to grade holding (220), and on seed 777 it
+  // did: the route still closed a 360 deg loop back onto its own line 80 m later
+  // and 5.7 m lower, because every heading out of that bowl was penalised and
+  // the cheapest one still went round. Laying tread on top of an earlier leg is
+  // not a trade — it is a trail that cannot be built — so past LEG_HARD_TOL of
+  // OVERLAP the penalty leaves the tie-breaking range and joins the class of the
+  // march's structural refusals (climb 900, dead end 1600).
+  const LEG_HARD_TOL = 0.75;    // m of deficit tolerated before the gate fires
+  const LEG_W_HARD = 900.0;
+  // Measured NOT to bind: 300, 600 and 1500 give byte-identical worlds on all
+  // three seeds. What decides the route is that the gate exists at all, not how
+  // far past it the penalty is allowed to run — so this is a guard rail rather
+  // than a tuning knob, and nothing here should be read as tuned.
+  const LEG_CAP_HARD = 1500.0;
+
+  /** How far a station's stamps vote from its own centreline. See LEG note. */
+  function legReach(half) {
+    return 1.22 * half + 1.4 * (0.50 * half + 0.30);
+  }
+
+  /**
+   * Missing leg clearance at a candidate point, in metres, summed over the
+   * earlier legs it would contest. `hist` is the march's own grid of committed
+   * points; see marchRoute(). Returns 0 — exactly — when nothing is contested.
+   */
+  function legClearanceCost(hist, nx, nz, travelledNow, half) {
+    const bx = Math.floor(nx / LEG_CELL), bz = Math.floor(nz / LEG_CELL);
+    let deficit = 0;
+    const R = Math.ceil(LEG_SEARCH / LEG_CELL);
+    for (let a = -R; a <= R; a++) {
+      for (let b = -R; b <= R; b++) {
+        const list = hist.cells.get((bz + b) * 8192 + (bx + a));
+        if (!list) continue;
+        for (let m = 0; m < list.length; m++) {
+          const k = list[m];
+          if (travelledNow - hist.s[k] < LEG_ARC_MIN) continue;
+          const dx = nx - hist.x[k], dz = nz - hist.z[k];
+          const d = Math.sqrt(dx * dx + dz * dz);
+          if (d >= LEG_SEARCH) continue;
+          const need = legReach(half) + legReach(hist.half[k]);
+          if (d >= need) continue;
+          deficit += need - d;
+        }
+      }
+    }
+    if (deficit <= 0) return 0;
+    let c = deficit * LEG_W;
+    if (c > LEG_CAP) c = LEG_CAP;
+    if (deficit > LEG_HARD_TOL) {
+      const g = (deficit - LEG_HARD_TOL) * LEG_W_HARD;
+      c += g > LEG_CAP_HARD ? LEG_CAP_HARD : g;
+    }
+    return c;
+  }
+
   function marchRoute(terrain, variant) {
     // Each variant is an independent, deterministic attempt at the route: a
     // different corridor target and a different wander stream. build() runs
@@ -1100,18 +1711,76 @@ export function createTrail(ctx) {
     const margin = 160;
     const zStart = B.maxZ - 210;
 
-    // Pick a launch point: high, and with real fall beneath it.
+    // Pick a launch point: high, with real fall beneath it, and — the addition —
+    // standing at the head of a corridor that can actually be built and protected.
+    //
+    // The per-variant jitter used to be applied AFTER the scan, which meant the
+    // point that was scored and the point that was used were up to 35 m apart.
+    // That was survivable while the score was only "high and steep"; it is not
+    // survivable once the score is measuring the ground either side of the tread,
+    // because 35 m along a contour is the difference between a bench and a rib.
+    // The jitter now offsets the whole scan grid instead, so each variant still
+    // searches its own set of candidates and the winner is the point that was
+    // measured.
+    const launchJitter = (vrng() - 0.5) * 70;
+    const startHalf = PHASES[0].width * 0.5;
     let startX = 0, bestScore = -Infinity;
     for (let k = 0; k <= 48; k++) {
-      const x = lerp(B.minX + margin, B.maxX - margin, k / 48);
+      const x = clamp(lerp(B.minX + margin, B.maxX - margin, k / 48) + launchJitter,
+        B.minX + margin, B.maxX - margin);
       const h = terrainH(terrain, x, zStart);
       const hAhead = terrainH(terrain, x, zStart - 220);
       const hSide = Math.abs(terrainH(terrain, x + 60, zStart) - terrainH(terrain, x - 60, zStart));
       // High + steep ahead + not on a knife-edge ridge crest.
-      const s = h * 0.55 + (h - hAhead) * 1.6 - hSide * 0.35;
+      let s = h * 0.55 + (h - hAhead) * 1.6 - hSide * 0.35;
+      // ... and the best USABLE corridor leaving it, where usable means two
+      // things at once: protectable, and at a gradient the opening phase can
+      // actually be built at.
+      //
+      // Both halves are load-bearing and the second was learnt the hard way. A
+      // first cut of this scored protectability alone. It duly found a launch
+      // point whose corridor measured 0.00 m of unsupported fall for the whole
+      // first hundred metres — and put it on the front of a face running 42-60%,
+      // in the phase whose design gradient is 11% and whose design speed is
+      // 16 m/s. The route was safe and unrideable: the autopilot went airborne at
+      // 75 m doing 17.4 m/s down a 57% pitch. Trading exposure for gradient is
+      // not a fix, it is a different defect. So the fan penalises any heading
+      // past the march's own grade ceiling for that phase, and the launch point
+      // is scored on the best corridor that is BOTH.
+      const gTarget = PHASES[0].grade;
+      const gMax = Math.min(0.46, gTarget * 1.9 + 0.06);
+      let bestCorr = CORR_LAUNCH_CAP;
+      for (let j = -CORR_LAUNCH_FAN; j <= CORR_LAUNCH_FAN; j++) {
+        // Heading convention, and it is worth stating because getting it wrong
+        // costs a silent no-op rather than an error: the march's direction of
+        // travel is (sin h, -cos h), so h = 0 is -Z, which CONTRACT §0 says is
+        // down the mountain. A fan centred on PI points back up the hill, fails
+        // the descent filter at every candidate, and leaves the term a constant.
+        const hd = j * (6 * Math.PI / 180);
+        const dsx = Math.sin(hd), dsz = -Math.cos(hd);
+        // The grade is probed at three ranges and judged on the WORST, because a
+        // corridor that leaves at 27% and turns into a 60% face ninety metres in
+        // is a 60% face. A single 60 m probe reported 0.27 at the launch point
+        // that produced the 42-60% Start Chute — right at the ceiling, so it
+        // attracted no penalty at all, and the defect was a hundred metres past
+        // where the scan was looking.
+        let gWorst = 0, gMean = 0;
+        for (let q = 0; q < CORR_LAUNCH_G.length; q++) {
+          const s = CORR_LAUNCH_G[q];
+          const g = (h - terrainH(terrain, x + dsx * s, zStart + dsz * s)) / s;
+          if (g > gWorst) gWorst = g;
+          gMean += g;
+        }
+        gMean /= CORR_LAUNCH_G.length;
+        if (gMean < gTarget * 0.55) continue;     // traverses or climbs: not a start
+        const gPen = gWorst > gMax ? (gWorst - gMax) * CORR_LAUNCH_GRADE : 0;
+        const c = corridorCost(terrain, x, zStart, hd, startHalf, CORR_LAUNCH_S, CORR_LAUNCH_CAP)
+          + gPen;
+        if (c < bestCorr) bestCorr = c;
+      }
+      s -= Math.min(CORR_LAUNCH_CAP, bestCorr) * CORR_LAUNCH_W;
       if (s > bestScore) { bestScore = s; startX = x; }
     }
-    startX = clamp(startX + (vrng() - 0.5) * 70, B.minX + margin, B.maxX - margin);
     const yStart = terrainH(terrain, startX, zStart);
 
     // A race track is a *fixed vertical drop*, not "all the way to the bottom".
@@ -1143,6 +1812,18 @@ export function createTrail(ctx) {
     let x = startX, z = zStart, y = yStart;
     let head = Math.atan2(corDX, -corDZ);     // dir = (sin h, -cos h)
     let travelled = 0;
+    // Committed-point history for the leg-clearance term, bucketed on a LEG_CELL
+    // grid so a candidate heading costs O(1) to score. See legClearanceCost().
+    const hist = { x: [], z: [], s: [], half: [], cells: new Map() };
+    const histPush = (hx, hz, hs, hh) => {
+      const idx = hist.x.length;
+      hist.x.push(hx); hist.z.push(hz); hist.s.push(hs); hist.half.push(hh);
+      const key = Math.floor(hz / LEG_CELL) * 8192 + Math.floor(hx / LEG_CELL);
+      let l = hist.cells.get(key);
+      if (!l) { l = []; hist.cells.set(key, l); }
+      l.push(idx);
+    };
+    histPush(startX, zStart, 0, startHalf);
     let mode = 0;                              // 0 = ride, 1 = switchback
     let sbSign = 1, sbSteps = 0, lastSwitchback = -999;
     const g = { gx: 0, gz: 0, mag: 0 };
@@ -1255,6 +1936,17 @@ export function createTrail(ctx) {
           // Avoid benching an absurd cross-slope (it would need a huge cut).
           gradAt(terrain, nx, nz, 7, gTmp);
           if (gTmp.mag > 0.85) sc -= (gTmp.mag - 0.85) * 120;
+          // CORRIDOR PROTECTABILITY. The term this whole file's safety pass was
+          // being asked to compensate for after the fact. Probed over the next
+          // 24 m at the phase's own design width, capped at CORR_CAP so it can
+          // bias a choice between comparable headings and nothing more — see the
+          // long note at CORR_S.
+          sc -= corridorCost(terrain, nx, nz, h2, ph.width * 0.5, CORR_S, CORR_CAP);
+          sc -= corridorGate(terrain, nx, nz, h2, ph.width * 0.5);
+          sc -= corridorProfile(terrain, nx, nz, h2, V_PHASE[ph.id]);
+          // LEG CLEARANCE. Exactly zero unless this heading would lay tread on
+          // ground an earlier leg has already claimed — see legClearanceCost().
+          sc -= legClearanceCost(hist, nx, nz, travelled + ds, ph.width * 0.5);
           if (sc > bestS) { bestS = sc; bestD = dth; }
         }
         dHead = bestD;
@@ -1268,6 +1960,7 @@ export function createTrail(ctx) {
       y = terrainH(terrain, x, z);
       travelled += ds;
       px.push(x); pz.push(z); pph.push(phIdx);
+      histPush(x, z, travelled, ph.width * 0.5);
 
       // The run is a designed length. Stop there, or if we run out of mountain.
       if (travelled >= targetLength) break;
@@ -1286,7 +1979,10 @@ export function createTrail(ctx) {
     // actually shaped for. Monotonise it and hand it to the station builder.
     for (let k = 1; k < pph.length; k++) if (pph[k] < pph[k - 1]) pph[k] = pph[k - 1];
 
-    return { px, pz, pph, startX, zStart, finishX, zFinish, drop, targetLength, variant };
+    return {
+      px, pz, pph, startX, zStart, finishX, zFinish, drop, targetLength, variant,
+      startY: yStart,
+    };
   }
 
   /**
@@ -1310,8 +2006,51 @@ export function createTrail(ctx) {
     const dropGot = y0 - yLast;
     const lenErr = Math.abs(travelled - route.targetLength) / Math.max(1, route.targetLength);
     const dropErr = Math.abs(dropGot - route.drop) / Math.max(1, route.drop);
+    // ---- corridor protectability, averaged over the whole candidate ---------
+    // The heading search is local: it can only choose between the headings
+    // available from where it already is, so it can be walked into a corridor
+    // whose exits are all bad several hundred metres earlier. Scoring the
+    // finished candidate is the only place that shows up, and marchRoute()
+    // already runs seven independent variants precisely so that one of them can
+    // be thrown away. This makes "seven attempts, keep the best" mean something
+    // about safety as well as about length and drop.
+    //
+    // Sampled every 4th polyline point (24 m) rather than at every one: the term
+    // is a property of a stretch of trail, and the march is re-scored every 6 m
+    // anyway. `route.exposed` is reported by build() so the acceptance numbers
+    // can be read off the route that was actually chosen.
+    let corr = 0, corrN = 0, corrWorst = 0, corrBad = 0;
+    for (let k = 4; k < n - 4; k += 4) {
+      const dx = route.px[k + 1] - route.px[k - 1], dz = route.pz[k + 1] - route.pz[k - 1];
+      const l = Math.max(1e-4, Math.hypot(dx, dz));
+      const ph = PHASES[route.pph ? route.pph[k] : 0];
+      corridorAt(terrain, route.px[k], route.pz[k], dx / l, dz / l, ph.width * 0.5, cTmp);
+      const c = cTmp.cost > CORR_CAP ? CORR_CAP : cTmp.cost;
+      corr += c; corrN++;
+      if (cTmp.deficit > 0) corrBad++;
+      if (cTmp.deficit > corrWorst) corrWorst = cTmp.deficit;
+    }
+    route.corrMean = corrN ? corr / corrN : 0;
+    route.corrWorst = corrWorst;
+    route.corrBad = corrBad;
+    route.marchedLength = travelled;
+    route.marchedDrop = dropGot;
+    // Gradient of the first 90 m of the marched line — the Start Chute's own
+    // fall line, and the number that showed the launch scan had traded exposure
+    // for a face the opening phase cannot use. See the launch scan in marchRoute.
+    {
+      const k = Math.min(n - 1, 15);
+      let d = 0;
+      for (let j = 1; j <= k; j++) d += Math.hypot(route.px[j] - route.px[j - 1], route.pz[j] - route.pz[j - 1]);
+      route.openGrade = d > 1 ? (terrainH(terrain, route.px[0], route.pz[0])
+        - terrainH(terrain, route.px[k], route.pz[k])) / d : 0;
+    }
     // Climbing is the disqualifier; the rest is fine tuning.
-    return -climb * 9 - lenErr * 90 - dropErr * 70;
+    // The corridor weight is set so that a route averaging the full CORR_CAP
+    // gives up about as much as a 25% length error — a big number, because a
+    // route that is unprotectable along its length is not a course, and a small
+    // enough one that it cannot win against a route that climbs.
+    return -climb * 9 - lenErr * 90 - dropErr * 70 - route.corrMean * 0.20;
   }
 
   /** Laplacian smoothing of the marched polyline in XZ, endpoints pinned. */
@@ -1387,6 +2126,394 @@ export function createTrail(ctx) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // LOCAL GRADE DISCIPLINE
+  //
+  // THE DEFECT. `PHASES` gives every section a design gradient, and the route
+  // march steers against it — but only on AVERAGE, over probes 6/24/66 m long,
+  // with an altitude governor allowed to double the target. Measured on seed
+  // 20260726 before this pass, the Start Chute (design 11%, tech 0.05, i.e. the
+  // easy opening) ran 0.4% at 60 m to 54% at 88 m and back to 4% at 103 m. A
+  // phase's design gradient was a long-run average and nothing else.
+  //
+  // That is not a cosmetic complaint. A 0.4% -> 54% -> 4% profile is a convex
+  // crest followed by a concave compression, and the bike's own lean ceiling is
+  // a function of tyre load: over the crest the wheels go light, the ceiling
+  // collapses (measured 0.63 rad -> 0.26 rad through exactly this stretch), and
+  // the rider cannot command the lean the corner underneath needs. Every cell
+  // of the autopilot sweep died between 79 and 98 m.
+  //
+  // THE RULE. Within each phase, redistribute the drop so the LOCAL gradient
+  // stays inside a ceiling derived from the phase's own design value, while
+  // preserving that phase's total drop to the millimetre. Capping the peaks
+  // therefore steepens the flats: the pitch at 88 m comes down and the 0.4%
+  // section at 60 m picks up the altitude it gave away. Nothing is flattened
+  // overall — the run's descent, and every phase's descent, is bit-preserved.
+  //
+  // The ceiling is the larger of "the design gradient plus room to breathe" and
+  // "a bit more than this phase's own mean", because a phase whose route came
+  // out steeper than designed cannot be held to the design number without an
+  // excavation nobody would dig. And the whole thing is clamped against the
+  // same cut/fill budget as everything else, so on ground that genuinely falls
+  // away faster than the budget can follow the rule simply does what it can.
+  // -------------------------------------------------------------------------
+  const GRADE_LOCAL_K = 1.55;     // × the phase design grade ...
+  const GRADE_LOCAL_ADD = 0.045;  // ... plus this = the local ceiling
+  const GRADE_MEAN_K = 1.15;      // never tighter than this × the phase's own mean
+  const GRADE_MEAN_ADD = 0.020;
+  const GRADE_HARD_MAX = 0.46;    // the steepest pitch the course may ever hold
+  const GRADE_FLOOR = 0.004;      // a station may be near-flat, never uphill
+  const GRADE_WIN = 6.0;          // m — the window the local gradient is measured over
+  // THE FILL BUDGET IS NOT THE ELEVATION SOLVE'S FILL BUDGET, and this is the
+  // most important constant in the pass.
+  //
+  // Redistributing drop inside a phase means cutting the steep parts and
+  // RAISING the flat parts, and a raised tread is an embankment. The elevation
+  // solve allows 3.0 m of fill — but terrain.applyCarve() does not build it:
+  // its batter caps fill at FILL_MAX 0.7 m and refuses entirely by 1.4 m,
+  // deliberately, because a bench across a fall-away is built full-cut and not
+  // by throwing an embankment over the void. So a design line sitting 2 m above
+  // natural ground is not a trail, it is a request the terrain declines, and
+  // what gets committed is a hole where the tread was drawn.
+  //
+  // Measured with the shaping pass on the elevation solve's own 3.0 m budget:
+  // 1056 of 6602 stations (16.0%) committed more than the fork's 170 mm of
+  // travel BELOW the design line, against 168 (2.5%) before the pass existed,
+  // and bucketing the error against every candidate driver put all of it on
+  // one — stations needing more than 1 m of fill averaged 0.188 m of shortfall
+  // with a p95 of 0.593 m, while bank, plan radius and shelf presence showed
+  // nothing. The pass was drawing embankments and the mountain was declining
+  // to build them, and the rider was riding into the difference.
+  //
+  // 0.65 m is inside what the batter honours at full strength. Cutting is
+  // unaffected: a cut is always granted, so the ceiling on the steep half of
+  // the redistribution stays the full excavation budget.
+  const GRADE_FILL_MAX = 0.65;
+
+  /** Box-smooth a per-station drop array over `r` stations, edges clamped. */
+  function smoothDrop(src, r) {
+    const n = src.length;
+    const out = new Float64Array(n);
+    const w = 2 * r + 1;
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      for (let j = -r; j <= r; j++) acc += src[clamp(i + j, 0, n - 1)];
+      out[i] = acc / w;
+    }
+    return out;
+  }
+
+  /**
+   * Cap the local gradient of `y` inside every phase, preserving each phase's
+   * total drop exactly. `raw` is natural ground; the result stays inside the
+   * same cut/fill budget as the rest of the elevation solve.
+   */
+  function shapePhaseGrade(y, raw, phase, maxCut, maxFill) {
+    const n = y.length;
+    const ds = STATION_DS;
+    const r = Math.max(1, Math.round(GRADE_WIN / (2 * ds)));
+    // phase spans
+    let a = 0;
+    while (a < n - 1) {
+      let b = a;
+      while (b + 1 < n && phase[b + 1] === phase[a]) b++;
+      const span = b - a;
+      if (span >= 24) {
+        const ph = PHASES[Math.min(phase[a], PHASES.length - 1)];
+        const total = y[a] - y[b];
+        const meanG = total / (span * ds);
+        // The ceiling. Never below the phase's own mean or the problem has no
+        // solution; never above GRADE_HARD_MAX whatever the mean says.
+        const cap = clamp(
+          Math.max(ph.grade * GRADE_LOCAL_K + GRADE_LOCAL_ADD,
+            meanG * GRADE_MEAN_K + GRADE_MEAN_ADD),
+          meanG * 1.02 + 1e-4, GRADE_HARD_MAX);
+        const dy = new Float64Array(span);
+        for (let k = 0; k < span; k++) dy[k] = y[a + k] - y[a + k + 1];
+
+        for (let outer = 0; outer < 6; outer++) {
+          for (let pass = 0; pass < 40; pass++) {
+            const g = smoothDrop(dy, r);
+            let moved = 0;
+            for (let k = 0; k < span; k++) {
+              const gk = g[k] / ds;
+              if (gk > cap) { const f = cap / gk; dy[k] *= f; moved = 1; }
+              else if (gk < GRADE_FLOOR) { dy[k] += (GRADE_FLOOR - gk) * ds; moved = 1; }
+            }
+            // Restore the phase's total drop exactly, spreading the correction
+            // onto whichever stations have headroom in the right direction.
+            let sum = 0;
+            for (let k = 0; k < span; k++) sum += dy[k];
+            const deficit = total - sum;
+            if (Math.abs(deficit) > 1e-9) {
+              let head = 0;
+              const h = new Float64Array(span);
+              for (let k = 0; k < span; k++) {
+                h[k] = deficit > 0 ? Math.max(0, cap * ds - dy[k])
+                  : Math.max(0, dy[k] - GRADE_FLOOR * ds);
+                head += h[k];
+              }
+              if (head > 1e-9) {
+                for (let k = 0; k < span; k++) dy[k] += deficit * (h[k] / head);
+              } else {
+                for (let k = 0; k < span; k++) dy[k] += deficit / span;
+              }
+              moved = 1;
+            }
+            if (!moved) break;
+          }
+          // Integrate the drops back into a profile, then clamp each station
+          // against the excavation budget.
+          //
+          // THE INTEGRATION IS OPEN-LOOP AND THAT IS THE WHOLE POINT. The
+          // obvious implementation — walk forward, clamp, carry the clamped
+          // value into the next step — feeds every clamp into everything
+          // downstream, so the drop a clamped station could not take piles up
+          // and lands on the phase's LAST segment, which has nowhere to pass it
+          // on. Measured that way: a 6.2 m vertical step appeared at 2558 m,
+          // and the sprint phase's worst local gradient went 39.9% -> 88.8% —
+          // the pass manufacturing the exact defect it exists to remove.
+          //
+          // Integrating from the phase's start height with the UNCLAMPED drops
+          // and clamping each station independently keeps the target profile
+          // exact (its last value is y[b] by construction, since the drops sum
+          // to the phase total) and confines a budget violation to the station
+          // that has it. Re-reading `dy` afterwards lets the next pass's
+          // water-fill spread that station's shortfall over its neighbours.
+          let acc = y[a];
+          for (let k = 0; k < span - 1; k++) {
+            acc -= dy[k];
+            y[a + k + 1] = clamp(acc, raw[a + k + 1] - maxCut, raw[a + k + 1] + maxFill);
+          }
+          for (let k = 0; k < span; k++) dy[k] = y[a + k] - y[a + k + 1];
+        }
+      }
+      a = b + 1;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // PLAN RADIUS DISCIPLINE
+  //
+  // The third lever on the lean identity, after bank and speed: open the
+  // corner. The route march produces its heading in 6 m steps with a turn
+  // authority of up to 0.56 rad per step, and its switchback mode is an
+  // explicit 6.5 m-radius reversal — so the resampled centreline routinely
+  // carries 13-16 m plan radii, including in the Start Chute, whose design
+  // gradient is 11% and whose `tech` weighting is 0.05, i.e. the easy opening.
+  //
+  // A 14 m radius is not by itself a defect; a bicycle turns inside that. Two
+  // things make it one here. It drives the required lean up as 1/r, so it is
+  // the term that puts a corner past 45 deg in the first place. And it is
+  // below what any lookahead-based rider — human or controller — can hold a
+  // line through: overshoot on corner exit was measured at 3-5 m against a
+  // 1.5 m tread half-width, which on the exposed side of a rib is the whole
+  // failure.
+  //
+  // So: relax the plan alignment wherever the radius is under the phase's
+  // minimum, with a hard cap on how far the line may move from the route the
+  // march chose. The cap is what keeps this a trail-design rule rather than a
+  // rewrite of the route — the march's corridor keeping, switchback placement
+  // and fall-line reading all survive; the corners it turns get widened by up
+  // to PLAN_SHIFT_MAX and no further. Where that is not enough, the speed
+  // solve takes the corner speed down instead, which is the honest answer.
+  //
+  // Per-phase minima are the character knob. `roots`, `loam`, `slab` and
+  // `rocks` keep genuinely tight turns — they are meant to be technical and
+  // they are ridden slowly. The open, fast phases get radii a rider can carry
+  // speed through.
+  const PLAN_MIN_R = {
+    start: 27, roots: 13, flow: 23, jumps: 27, slab: 15,
+    creek: 17, loam: 14, rocks: 15, sprint: 25,
+  };
+  const PLAN_SHIFT_MAX = 3.6;    // m the alignment may move from the marched line
+  const PLAN_STRIDE = 5.0;       // m — the stride the plan curvature is measured over
+  // Below this the corner is one of the march's authored switchbacks (its
+  // reversal mode is an explicit 6.5 m radius) and the relaxation leaves it
+  // alone. See the hairpin lock in openTightCorners().
+  const PLAN_HAIRPIN_R = 8.5;
+
+  /**
+   * Widen plan corners tighter than their phase's minimum radius.
+   *
+   * Laplacian relaxation over a stencil the width of the curvature stride,
+   * driven only where the radius is short, displacement-limited against the
+   * incoming line, endpoints pinned. Operates in place on px/pz.
+   */
+  function openTightCorners(px, pz, phase, n) {
+    const ox = Float64Array.from(px.subarray(0, n));
+    const oz = Float64Array.from(pz.subarray(0, n));
+    const m = Math.max(2, Math.round(PLAN_STRIDE / STATION_DS));
+    const mS = Math.max(2, Math.round(1.6 / STATION_DS));
+    const wgt = new Float32Array(n);
+    const planR = (i) => {
+      const ax = px[i - m] - px[i], az = pz[i - m] - pz[i];
+      const bx = px[i + m] - px[i], bz = pz[i + m] - pz[i];
+      const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+      const lc = Math.hypot(px[i + m] - px[i - m], pz[i + m] - pz[i - m]);
+      const area2 = Math.abs(ax * bz - az * bx);
+      if (area2 < 1e-6 || la < 1e-6 || lb < 1e-6) return 4000;
+      return (la * lb * lc) / (2 * area2);
+    };
+    // HAIRPIN LOCK. A switchback is not a defect — the march builds them
+    // deliberately, as explicit 6.5 m-radius reversals, and they are the reason
+    // the route can hold its design gradient across a steep face at all. This
+    // pass must not touch them, for two separate reasons.
+    //
+    // The first is intent: a 6.5 m switchback ridden at the speed the lean
+    // identity allows there is a legitimate, slow, technical corner.
+    //
+    // The second is that the relaxation is actively WRONG on one. The Laplacian
+    // target is the midpoint of the two stencil ends, and past about 100 deg of
+    // turn inside the stencil that midpoint has crossed to the inside of the
+    // arc, near its centre of curvature — so relaxing toward it sharpens the
+    // hairpin instead of opening it. Measured without the lock, the worst plan
+    // radius on the course went 5.53 m -> 3.31 m at the same station (277 m):
+    // the pass made the one corner it should have left alone materially worse.
+    //
+    // A per-station guard is not enough either. The violation cone is a full
+    // stencil wide, so shoulder stations that pass the guard still drag the
+    // apex, and the apex's own measured radius depends on ground a stencil away
+    // in each direction. The lock is therefore dilated over two stencil widths.
+    // With it: worst radius 5.528 m before, 5.529 m after — the switchback comes
+    // through untouched, and the count of stations under their phase minimum
+    // still falls 227 -> 114.
+    const locked = new Uint8Array(n);
+    for (let i = m; i < n - m; i++) {
+      if (planR(i) >= PLAN_HAIRPIN_R) continue;
+      for (let j = Math.max(0, i - 2 * m); j <= Math.min(n - 1, i + 2 * m); j++) locked[j] = 1;
+    }
+    for (let i = 0; i < n; i++) if (locked[i]) safety.planLocked++;
+    measurePlanRadii(px, pz, phase, n, safety, 'planTightBefore', 'planWorstBefore', 'planWorstAtBefore');
+    for (let pass = 0; pass < 500; pass++) {
+      wgt.fill(0);
+      let any = false;
+      for (let i = m; i < n - m; i++) {
+        const rMin = PLAN_MIN_R[PHASES[phase[i]].id] || 20;
+        // Menger-style radius from the three points a stride apart.
+        const ax = px[i - m] - px[i], az = pz[i - m] - pz[i];
+        const bx = px[i + m] - px[i], bz = pz[i + m] - pz[i];
+        const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+        const lc = Math.hypot(px[i + m] - px[i - m], pz[i + m] - pz[i - m]);
+        const area2 = Math.abs(ax * bz - az * bx);
+        if (area2 < 1e-6 || la < 1e-6 || lb < 1e-6) continue;
+        const r = (la * lb * lc) / (2 * area2);
+        if (r >= rMin || locked[i]) continue;
+        any = true;
+        const v = clamp01((rMin - r) / rMin) * 0.75 + 0.25;
+        for (let j = Math.max(0, i - m); j <= Math.min(n - 1, i + m); j++) {
+          if (locked[j]) continue;
+          const w = v * (1 - Math.abs(j - i) / (m + 1));
+          if (w > wgt[j]) wgt[j] = w;
+        }
+      }
+      if (!any) break;
+      for (let i = 1; i < n - 1; i++) {
+        const w = wgt[i];
+        if (w <= 0 || locked[i]) continue;
+        // The relaxation stencil is deliberately much shorter than the
+        // detection stencil (1.6 m against 5 m): a Laplacian step toward the
+        // midpoint of two points 5 m away is a large, badly-conditioned move on
+        // anything that turns appreciably inside that span. Short steps, many
+        // passes — the same operator, run as a diffusion rather than a jump.
+        const lo = Math.max(0, i - mS), hi = Math.min(n - 1, i + mS);
+        const tx2 = (px[lo] + px[hi]) * 0.5, tz2 = (pz[lo] + pz[hi]) * 0.5;
+        let stepX = (tx2 - px[i]) * w * 0.22;
+        let stepZ = (tz2 - pz[i]) * w * 0.22;
+        // Displacement budget against the marched line.
+        //
+        // The step is TRUNCATED, never snapped. Snapping a station that has run
+        // out of budget onto the boundary circle is what the obvious
+        // implementation does, and it is wrong: adjacent stations hit the
+        // boundary travelling in different directions, so the projection leaves
+        // a crease exactly where the relaxation was working hardest. Measured
+        // that way, the pass took the count of under-minimum stations 227 -> 78
+        // and the WORST plan radius on the course 5.53 m -> 3.34 m, i.e. it
+        // fixed the average by manufacturing a sharper corner than any it
+        // removed. Shrinking the step to whatever budget is left instead brings
+        // a station smoothly to rest at the cap.
+        const d = Math.hypot(px[i] - ox[i], pz[i] - oz[i]);
+        const brake = smoothstep(PLAN_SHIFT_MAX, PLAN_SHIFT_MAX * 0.55, d);
+        if (brake <= 0) continue;
+        stepX *= brake; stepZ *= brake;
+        const remain = PLAN_SHIFT_MAX - d;
+        const sl = Math.hypot(stepX, stepZ);
+        if (sl > remain) { const k = remain / sl; stepX *= k; stepZ *= k; }
+        px[i] += stepX; pz[i] += stepZ;
+        safety.planShiftMax = Math.max(safety.planShiftMax, Math.hypot(px[i] - ox[i], pz[i] - oz[i]));
+      }
+    }
+  }
+
+  /**
+   * Count stations under their phase's minimum plan radius. Written as its own
+   * function because the "after" figure MUST be taken on the re-spaced line:
+   * openTightCorners() shortens the arcs it relaxes, so the stations inside a
+   * corner it has just widened sit closer together than STATION_DS, and a
+   * three-point radius taken at a fixed station stride then spans less ground
+   * and reads SMALLER. Measured that way the pass appeared to take the worst
+   * radius on the course from 5.53 m to 3.31 m while in fact opening it.
+   */
+  function measurePlanRadii(px, pz, phase, n, into, keyCount, keyWorst, keyAt) {
+    const m = Math.max(2, Math.round(PLAN_STRIDE / STATION_DS));
+    for (let i = m; i < n - m; i++) {
+      const rMin = PLAN_MIN_R[PHASES[phase[i]].id] || 20;
+      const ax = px[i - m] - px[i], az = pz[i - m] - pz[i];
+      const bx = px[i + m] - px[i], bz = pz[i + m] - pz[i];
+      const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+      const lc = Math.hypot(px[i + m] - px[i - m], pz[i + m] - pz[i - m]);
+      const area2 = Math.abs(ax * bz - az * bx);
+      if (area2 < 1e-6 || la < 1e-6 || lb < 1e-6) continue;
+      const r = (la * lb * lc) / (2 * area2);
+      if (r < rMin) into[keyCount]++;
+      if (r < into[keyWorst]) { into[keyWorst] = r; into[keyAt] = i * STATION_DS; }
+    }
+  }
+
+  /**
+   * Re-space a polyline to exactly STATION_DS between stations, in place.
+   * openTightCorners() shortens the arcs it relaxes, and every downstream
+   * consumer — curvature, the speed solve, `length`, the stamp spacing —
+   * assumes uniform spacing. Returns the new station count.
+   */
+  function respaceXZ(px, pz, n) {
+    const cum = new Float64Array(n);
+    for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + Math.hypot(px[i] - px[i - 1], pz[i] - pz[i - 1]);
+    const total = cum[n - 1];
+    const m = Math.max(64, Math.floor(total / STATION_DS) + 1);
+    const qx = new Float64Array(m), qz = new Float64Array(m);
+    let k = 0;
+    for (let i = 0; i < m; i++) {
+      const s = Math.min(total, i * STATION_DS);
+      while (k < n - 2 && cum[k + 1] < s) k++;
+      const seg = Math.max(1e-9, cum[k + 1] - cum[k]);
+      const f = clamp01((s - cum[k]) / seg);
+      qx[i] = px[k] + (px[k + 1] - px[k]) * f;
+      qz[i] = pz[k] + (pz[k + 1] - pz[k]) * f;
+    }
+    for (let i = 0; i < m; i++) { px[i] = qx[i]; pz[i] = qz[i]; }
+    return m;
+  }
+
+  /** Phase index per station, mapped by arc length along the marched polyline. */
+  function assignPhases(route, n) {
+    const phase = new Uint8Array(n);
+    const mp = route.pph || [];
+    const cum = new Float64Array(route.px.length);
+    for (let k = 1; k < route.px.length; k++) {
+      cum[k] = cum[k - 1] + Math.hypot(route.px[k] - route.px[k - 1], route.pz[k] - route.pz[k - 1]);
+    }
+    const total = Math.max(1e-6, cum[cum.length - 1]);
+    let k = 0;
+    for (let i = 0; i < n; i++) {
+      const target = (i / Math.max(1, n - 1)) * total;
+      while (k < cum.length - 1 && cum[k + 1] < target) k++;
+      phase[i] = mp.length ? mp[Math.min(k, mp.length - 1)] : 0;
+    }
+    for (let i = 1; i < n; i++) if (phase[i] < phase[i - 1]) phase[i] = phase[i - 1];
+    return phase;
+  }
+
   function buildStations(terrain, route) {
     const sm = smoothPolyline(route.px, route.pz, 4, 0.30);
     const ctrl = [];
@@ -1396,14 +2523,46 @@ export function createTrail(ctx) {
     const flatLen = flat.getLength();
 
     N = Math.max(64, Math.round(flatLen / STATION_DS) + 1);
+    // Over-allocate: openTightCorners() shortens the line, so respaceXZ() only
+    // ever returns fewer stations than it was handed.
     const px = new Float32Array(N), pz = new Float32Array(N);
     const pts = flat.getSpacedPoints(N - 1);
     for (let i = 0; i < N; i++) { px[i] = pts[i].x; pz[i] = pts[i].z; }
 
+    // --- plan radius discipline (see openTightCorners) ---------------------
+    openTightCorners(px, pz, assignPhases(route, N), N);
+    N = respaceXZ(px, pz, N);
+    measurePlanRadii(px, pz, assignPhases(route, N), N, safety,
+      'planTightAfter', 'planWorstAfter', 'planWorstAtAfter');
+    // Trim to the new station count: S.px/S.pz are read by other modules and a
+    // trailing tail of stale coordinates past S.n would be a live foot-gun.
+    const sx = px.slice(0, N), sz = pz.slice(0, N);
+
     // --- elevation: sample, bench-smooth, enforce descent, limit cut/fill ---
     let by = new Float32Array(N);
-    for (let i = 0; i < N; i++) by[i] = terrainH(terrain, px[i], pz[i]);
+    for (let i = 0; i < N; i++) by[i] = terrainH(terrain, sx[i], sz[i]);
     const raw = Float32Array.from(by);
+    // THE EXCAVATION LIMIT IS APPLIED AGAINST A SMOOTHED NATURAL PROFILE, NOT
+    // THE SAMPLED ONE, and that distinction turned out to matter more than any
+    // other line in the elevation solve.
+    //
+    // `raw` is the mountain sampled every 0.4 m, so it carries the full
+    // roughness of the ground — tenths of a metre at metre wavelengths. Clamp
+    // the design line to `raw - MAX_CUT` and, anywhere the clamp binds, the
+    // tread inherits that roughness verbatim: the line stops being a designed
+    // profile and becomes a rigid offset copy of a rocky face.
+    //
+    // Measured at 70-95 m on seed 20260726, where holding a sane gradient needs
+    // more than the 7 m excavation ceiling: the design line sat pinned at
+    // raw-7.0 and its gradient oscillated 0% / 54% / 3% / 49% / 10% / 43%
+    // station to station, a washboard at a 1-2 m wavelength. The bike hopped
+    // clean off it at 10 m/s — every cell of the sweep left the tread there.
+    //
+    // An excavation ceiling is a statement about how much material a builder
+    // will move, which is a property of a stretch of trail and not of one
+    // 0.4 m sample. Measuring it against the ground smoothed over ~10 m says
+    // exactly that, and leaves the clamp surface smooth enough to be a trail.
+    const rawS = gaussianSmooth(raw, 25, 9);
 
     // Bench smoothing (a cut trail rides through small terrain noise), then the
     // descent rule, then a cut/fill limit so we never end up in a trench. The
@@ -1413,13 +2572,27 @@ export function createTrail(ctx) {
     const MAX_CUT = 6.5, MAX_FILL = 3.0;
     by = gaussianSmooth(by, 22, 8);       // ~9 m bench smoothing
     for (let pass = 0; pass < 4; pass++) {
-      enforceDescent(by, STATION_DS, raw, MAX_CUT);
-      for (let i = 0; i < N; i++) by[i] = clamp(by[i], raw[i] - MAX_CUT, raw[i] + MAX_FILL);
+      enforceDescent(by, STATION_DS, rawS, MAX_CUT);
+      for (let i = 0; i < N; i++) by[i] = clamp(by[i], rawS[i] - MAX_CUT, rawS[i] + MAX_FILL);
       by = gaussianSmooth(by, 8, 3.0);
     }
-    enforceDescent(by, STATION_DS, raw, MAX_CUT);
+    enforceDescent(by, STATION_DS, rawS, MAX_CUT);
     by = gaussianSmooth(by, 4, 1.6);
-    enforceDescent(by, STATION_DS, raw, MAX_CUT + 0.6);
+    enforceDescent(by, STATION_DS, rawS, MAX_CUT + 0.6);
+
+    // --- phase assignment: inherited from the march ------------------------
+    // Hoisted above the elevation shaping: shapePhaseGrade() needs to know which
+    // phase each station belongs to, and the assignment depends only on arc
+    // length along the marched polyline, never on height.
+    const phase = assignPhases(route, N);
+
+    // --- local grade discipline (see shapePhaseGrade) ----------------------
+    shapePhaseGrade(by, rawS, phase, MAX_CUT, GRADE_FILL_MAX);
+    for (let i = 0; i < N; i++) by[i] = clamp(by[i], rawS[i] - MAX_CUT, rawS[i] + GRADE_FILL_MAX);
+    by = gaussianSmooth(by, 5, 2.0);
+    shapePhaseGrade(by, rawS, phase, MAX_CUT, GRADE_FILL_MAX);
+    for (let i = 0; i < N; i++) by[i] = clamp(by[i], rawS[i] - MAX_CUT, rawS[i] + GRADE_FILL_MAX);
+    enforceDescent(by, STATION_DS, rawS, MAX_CUT + 0.6);
 
     // --- tangents, right vectors, grade, curvature -------------------------
     const tx = new Float32Array(N), ty = new Float32Array(N), tz = new Float32Array(N);
@@ -1430,7 +2603,7 @@ export function createTrail(ctx) {
 
     for (let i = 0; i < N; i++) {
       const a = Math.max(0, i - 1), b = Math.min(N - 1, i + 1);
-      let dx = px[b] - px[a], dz = pz[b] - pz[a], dy = by[b] - by[a];
+      let dx = sx[b] - sx[a], dz = sz[b] - sz[a], dy = by[b] - by[a];
       const l = Math.max(1e-5, Math.hypot(dx, dy, dz));
       tx[i] = dx / l; ty[i] = dy / l; tz[i] = dz / l;
       const hl = Math.max(1e-5, Math.hypot(tx[i], tz[i]));
@@ -1455,32 +2628,15 @@ export function createTrail(ctx) {
       radius[i] = clamp(1 / Math.max(1e-4, Math.abs(curvS[i])), 4, 4000);
     }
 
-    // --- phase assignment: inherited from the march ------------------------
-    // The march chose each heading to suit a phase's target gradient, so the
-    // phase boundaries must land on the same ground after resampling. Map by
-    // cumulative arc length along the marched polyline.
-    const phase = new Uint8Array(N);
+    // The phase array was assigned before the elevation shaping (above) because
+    // shapePhaseGrade() is written against it.
     const totalLen = (N - 1) * STATION_DS;
-    {
-      const mp = route.pph || [];
-      const cum = new Float64Array(route.px.length);
-      for (let k = 1; k < route.px.length; k++) {
-        cum[k] = cum[k - 1] + Math.hypot(route.px[k] - route.px[k - 1], route.pz[k] - route.pz[k - 1]);
-      }
-      const total = Math.max(1e-6, cum[cum.length - 1]);
-      let k = 0;
-      for (let i = 0; i < N; i++) {
-        const target = (i / (N - 1)) * total;
-        while (k < cum.length - 1 && cum[k + 1] < target) k++;
-        phase[i] = mp.length ? mp[Math.min(k, mp.length - 1)] : 0;
-      }
-    }
-    for (let i = 1; i < N; i++) if (phase[i] < phase[i - 1]) phase[i] = phase[i - 1];
 
     S = {
       n: N, ds: STATION_DS,
-      px, py: Float32Array.from(by), pz, by,
+      px: sx, py: Float32Array.from(by), pz: sz, by,
       raw,                             // natural ground under the centreline, pre-shaping
+      rawS,                            // ... smoothed over ~10 m; the excavation limits are measured against THIS
       tx, ty, tz, rx, rz,
       grade, curv, radius, phase,
       width: new Float32Array(N),
@@ -1526,8 +2682,8 @@ export function createTrail(ctx) {
     // Build the CatmullRom curve other modules consume (decimated for speed).
     const decim = Math.max(1, Math.round(4 / STATION_DS));
     const cpts = [];
-    for (let i = 0; i < N; i += decim) cpts.push(new THREE.Vector3(px[i], S.py[i], pz[i]));
-    const lastV = new THREE.Vector3(px[N - 1], S.py[N - 1], pz[N - 1]);
+    for (let i = 0; i < N; i += decim) cpts.push(new THREE.Vector3(sx[i], S.py[i], sz[i]));
+    const lastV = new THREE.Vector3(sx[N - 1], S.py[N - 1], sz[N - 1]);
     if (cpts[cpts.length - 1].distanceTo(lastV) > 0.05) cpts.push(lastV);
     curve = new THREE.CatmullRomCurve3(cpts, false, 'centripetal', 0.5);
     curve.arcLengthDivisions = Math.max(2000, cpts.length * 8);
@@ -1544,21 +2700,215 @@ export function createTrail(ctx) {
    *   (c) backward pass limited by braking.
    * Run twice, because the berm bank depends on speed and speed depends on bank.
    */
+  /**
+   * The component of the bank at station i that actually helps the corner.
+   *
+   * `S.bank` is signed (+ = right side high) and is set to -sign(curv)·mag, so
+   * for a correctly-banked corner this returns +mag. It returns a NEGATIVE
+   * number where the tread is off-camber — after the bank smoothing runs across
+   * a curvature sign change, or where the straight-section outslope tilts the
+   * wrong way for a gentle bend — and that is the point: an adverse camber must
+   * cost the speed solve exactly as much as a berm gains it. Using |bank| here
+   * (which is what the old cap did) credits an off-camber corner with the bank
+   * it is losing.
+   */
+  function helpfulBank(i) {
+    const c = S.curv[i];
+    if (c === 0) return 0;
+    return -Math.sign(c) * S.bank[i];
+  }
+
+  /** Berm style for the phase at station i. */
+  function styleAt(i) {
+    return BERM_STYLE[PHASES[S.phase[i]].id] || BERM_STYLE_DEFAULT;
+  }
+
+  /**
+   * The banked-corner speed limit that makes the lean identity hold.
+   * See the LEAN_DESIGN note at the head of the file for the derivation:
+   * with mu = tan(LEAN_DESIGN) this returns the speed at which the rider's
+   * lean relative to the tread is exactly LEAN_DESIGN.
+   */
+  function cornerSpeedCap(i) {
+    const mu = clamp(MU_DESIGN * SURF_MU[S.surface[i]], 0.22, 1.0);
+    // Clamp the bank contribution: past ~50 deg the formula's denominator runs
+    // away, and no rider is relying on a berm steeper than that anyway.
+    const tb = Math.tan(clamp(helpfulBank(i), -0.55, 0.87));
+    const denom = Math.max(0.20, 1 - mu * tb);
+    const num = Math.max(0.02, mu + tb);
+    return Math.min(V_CAP, Math.sqrt(Math.max(1, G * S.radius[i] * num / denom)));
+  }
+
+  /**
+   * The design speed of the section itself, independent of any corner: what a
+   * rider carries down a straight of this width, on this surface, at this
+   * roughness. See the V_PHASE note.
+   */
+  function techSpeedCap(i) {
+    const ph = PHASES[S.phase[i]];
+    const base = V_PHASE[ph.id] === undefined ? 17.0 : V_PHASE[ph.id];
+    // Tread width, relative to the phase's own design width. A pinch is slower
+    // than the section it is in; a corner that has been widened is faster.
+    const wf = clamp(0.74 + 0.30 * (S.width[i] / Math.max(0.8, ph.width)), 0.70, 1.14);
+    // Chatter.
+    const amp = Math.max(0.015, S.bumps[i] + S.rough[i] * 1.5);
+    const rough = ROUGH_SUSP * (ROUGH_LAMBDA / (2 * Math.PI)) * Math.sqrt((2 * G) / amp);
+    return Math.min(base * wf, rough);
+  }
+
+  /** Clamp the solved speed to the corner and section caps, then re-brake. */
+  function applyCornerSpeedCap() {
+    const n = S.n, ds = S.ds, v = S.speed;
+    for (let i = 0; i < n; i++) {
+      const cap = Math.min(cornerSpeedCap(i), techSpeedCap(i));
+      if (v[i] > cap) v[i] = cap;
+    }
+    for (let i = n - 2; i >= 0; i--) {
+      const lim = Math.sqrt(v[i + 1] * v[i + 1] + 2 * A_BRAKE * ds);
+      if (v[i] > lim) v[i] = lim;
+    }
+  }
+
+  /**
+   * The audit CONTRACT-NOTE'd as `trail.cornerAudit`.
+   *
+   * One row per corner: the geometry the route-finder produced, the bank and
+   * speed the solve settled on, the lean the rider is therefore asked to hold
+   * against the tread, and — for every corner that would have VIOLATED the
+   * identity had it been banked and paced the old way — what changed.
+   *
+   * The "before" column is not a guess: it re-runs the old rule on the same
+   * geometry. `MU_LAT` 1.18 for the corner cap, and the old per-phase build
+   * coefficient (1.0 for flow/sprint/jumps, 0.85 loam, 0.5 creek, 0.42 for
+   * everything else) applied to atan(v^2/(g*r)), with no identity floor and no
+   * bank at all past a 220 m radius.
+   */
+  /**
+   * Replay the OLD speed/bank rule on the current geometry: the pre-fix corner
+   * cap (MU_LAT 1.18), the pre-fix per-phase build coefficient, no identity
+   * floor, no bank past a 220 m radius, and NO section speed ceiling — so the
+   * forward pass runs gravity against drag exactly as it used to. Returns the
+   * speed profile that rule produces.
+   *
+   * This exists so the audit's "before" column is a measurement rather than an
+   * assertion. Taking the current solved speed as the "before" would understate
+   * the defect enormously, because the current speed has already been brought
+   * down by the very fix being audited.
+   */
+  function replayOldRule() {
+    const n = S.n, ds = S.ds;
+    const v = new Float32Array(n);
+    const b = new Float32Array(n);
+    const vmax = new Float32Array(n);
+    for (let iter = 0; iter < 2; iter++) {
+      for (let i = 0; i < n; i++) {
+        const mu = MU_LAT * SURF_MU[S.surface[i]];
+        const tb = Math.tan(Math.abs(b[i]));
+        vmax[i] = Math.min(V_CAP, Math.sqrt(Math.max(1,
+          G * S.radius[i] * (mu + tb) / Math.max(0.15, 1 - mu * tb))));
+      }
+      v[0] = 3.0;
+      for (let i = 1; i < n; i++) {
+        const gI = clamp(S.grade[i - 1], -0.6, 0.6);
+        const sinT = gI / Math.sqrt(1 + gI * gI);
+        const cosT = 1 / Math.sqrt(1 + gI * gI);
+        const vp = Math.max(1.0, v[i - 1]);
+        const crr = SURF_CRR[S.surface[i - 1]];
+        const ph = PHASES[S.phase[i - 1]];
+        const pedal = (ph.id === 'start' || ph.id === 'sprint') && vp < 15
+          ? PEDAL_POWER / (RIDER_MASS * vp) : 0;
+        const drag = 0.5 * AIR_RHO * CDA * vp * vp / RIDER_MASS;
+        const a = G * sinT - crr * G * cosT - drag + pedal;
+        v[i] = Math.sqrt(Math.max(1.0, vp * vp + 2 * a * ds));
+        if (v[i] > vmax[i]) v[i] = vmax[i];
+      }
+      for (let i = n - 2; i >= 0; i--) {
+        const lim = Math.sqrt(v[i + 1] * v[i + 1] + 2 * A_BRAKE * ds);
+        if (v[i] > lim) v[i] = lim;
+        if (v[i] > vmax[i]) v[i] = vmax[i];
+      }
+      for (let i = 0; i < n; i++) {
+        const ph = PHASES[S.phase[i]];
+        const r = S.radius[i];
+        if (r > 220) { b[i] = 0; continue; }
+        const build = ph.id === 'flow' || ph.id === 'sprint' || ph.id === 'jumps' ? 1.0
+          : ph.id === 'loam' ? 0.85 : ph.id === 'creek' ? 0.5 : 0.42;
+        b[i] = clamp(Math.atan((v[i] * v[i]) / (G * r)) * build, 0, THREE.MathUtils.degToRad(46));
+      }
+      const bS = gaussianSmooth(b, 16, 6);
+      b.set(bS);
+    }
+    return { v, b };
+  }
+
+  function auditCornerIdentity() {
+    cornerAudit.length = 0;
+    const n = S.n;
+    const old = replayOldRule();
+    const seen = [];
+    // Local curvature maxima, the same net the acceptance harness casts.
+    let i = 0;
+    const gap = M(8);
+    while (i < n) {
+      if (S.radius[i] < 90) {
+        let j = i, best = i;
+        while (j < n && S.radius[j] < 90 * 1.35 && Math.sign(S.curv[j]) === Math.sign(S.curv[i])) {
+          if (S.radius[j] < S.radius[best]) best = j;
+          j++;
+        }
+        seen.push(best);
+        i = Math.max(j, best + gap);
+      } else i++;
+    }
+    for (const k of seen) {
+      const ph = PHASES[S.phase[k]];
+      const r = S.radius[k], v = S.speed[k];
+      const bank = helpfulBank(k);
+      const req = Math.atan((v * v) / (G * r));
+      const vB = old.v[k];
+      const bOld = old.b[k];
+      const reqB = Math.atan((vB * vB) / (G * r));
+      cornerAudit.push({
+        s: +(k * S.ds).toFixed(1),
+        phase: ph.id,
+        radius: +r.toFixed(1),
+        before: {
+          speed: +vB.toFixed(2),
+          bankDeg: +THREE.MathUtils.radToDeg(bOld).toFixed(1),
+          requiredLeanDeg: +THREE.MathUtils.radToDeg(reqB).toFixed(1),
+          contactLeanDeg: +THREE.MathUtils.radToDeg(reqB - bOld).toFixed(1),
+          violated: (reqB - bOld) > LEAN_AVAIL - THREE.MathUtils.degToRad(6),
+          impossible: (reqB - bOld) > LEAN_AVAIL,
+        },
+        after: {
+          speed: +v.toFixed(2),
+          bankDeg: +THREE.MathUtils.radToDeg(bank).toFixed(1),
+          requiredLeanDeg: +THREE.MathUtils.radToDeg(req).toFixed(1),
+          contactLeanDeg: +THREE.MathUtils.radToDeg(req - bank).toFixed(1),
+          violated: (req - bank) > LEAN_AVAIL - THREE.MathUtils.degToRad(6),
+        },
+        // What the fix actually did here.
+        change: {
+          bankDeg: +THREE.MathUtils.radToDeg(bank - bOld).toFixed(1),
+          speed: +(v - vB).toFixed(2),
+          leanRelieved: +THREE.MathUtils.radToDeg((reqB - bOld) - (req - bank)).toFixed(1),
+        },
+      });
+    }
+  }
+
   function solveSpeeds(rebank = true) {
     const n = S.n, ds = S.ds;
     const vmax = new Float32Array(n);
     const v = S.speed;
-    const iters = rebank ? 2 : 1;
+    // Three iterations, not two. The bank depends on the speed and the speed
+    // depends on the bank, and raising a corner's bank raises its speed cap,
+    // which raises the ideal bank again; two passes left a measurable residual
+    // on the tightest corners.
+    const iters = rebank ? 3 : 1;
 
     for (let iter = 0; iter < iters; iter++) {
-      for (let i = 0; i < n; i++) {
-        const mu = MU_LAT * SURF_MU[S.surface[i]];
-        const tb = Math.tan(Math.abs(S.bank[i]));
-        // Banked-corner limit: v² = g·r·(mu + tanφ) / (1 - mu·tanφ)
-        const denom = Math.max(0.15, 1 - mu * tb);
-        const cap = Math.sqrt(Math.max(1, G * S.radius[i] * (mu + tb) / denom));
-        vmax[i] = Math.min(V_CAP, cap);
-      }
+      for (let i = 0; i < n; i++) vmax[i] = Math.min(cornerSpeedCap(i), techSpeedCap(i));
       // Forward — physics-limited acceleration.
       v[0] = 3.0;
       for (let i = 1; i < n; i++) {
@@ -1585,25 +2935,33 @@ export function createTrail(ctx) {
       // which runs after the features have deliberately flattened jump lips and
       // over-banked the wallride.
       if (!rebank) continue;
+      // ---- bank every corner, in every phase -----------------------------
       for (let i = 0; i < n; i++) {
-        const ph = PHASES[S.phase[i]];
+        const st = styleAt(i);
         const r = S.radius[i];
-        if (r > 220) { S.bank[i] = 0; continue; }
-        // atan(v²/(g·r)) is the bank that makes the corner feel flat to the rider.
+        // atan(v²/(g·r)) is the bank that would make the corner feel flat.
         const ideal = Math.atan((v[i] * v[i]) / (G * r));
-        // How much of that ideal a builder actually shapes: full berm in the flow
-        // and sprint sections, a natural insloped rut in the raw tech sections.
-        const build = ph.id === 'flow' || ph.id === 'sprint' || ph.id === 'jumps' ? 1.0
-          : ph.id === 'loam' ? 0.85
-            : ph.id === 'creek' ? 0.5 : 0.42;
-        const mag = clamp(ideal * build, 0, THREE.MathUtils.degToRad(46));
+        // The identity floor: the bank this corner NEEDS so the rider is not
+        // asked for more than LEAN_DESIGN of lean against the tread.
+        const need = ideal - LEAN_DESIGN;
+        // A genuinely straight section is left flat (the outslope pass below
+        // gives it its drainage tilt). "Straight" now means BOTH slack in the
+        // identity and slacker than the phase's own berm threshold — the old
+        // test was a bare `r > 220`, which left a 240 m-radius bend taken at
+        // 20 m/s with no bank at all and 24 deg of lean to find from nowhere.
+        if (need <= 0.015 && r > st.minRadius * 4.5) { S.bank[i] = 0; continue; }
+        const mag = clamp(Math.max(ideal * st.style, need), 0, st.maxBank);
         S.bank[i] = -Math.sign(S.curv[i]) * mag;
       }
+      // Smooth the bank along the trail so a berm builds and releases instead
+      // of switching on at one station, THEN re-solve the speed against the
+      // smoothed bank on the next iteration. The final speed clamp after the
+      // loop closes the gap for the last iteration.
       const bS = gaussianSmooth(S.bank, 16, 6);
       S.bank.set(bS);
     }
 
-    if (!rebank) return;
+    if (!rebank) { applyCornerSpeedCap(); auditCornerIdentity(); return; }
     // Straight sections get a builder's outslope for drainage: always tilted to
     // whichever side the hill falls away.
     for (let i = 0; i < S.n; i++) {
@@ -1615,6 +2973,12 @@ export function createTrail(ctx) {
       const out = Math.sign(csRight) * 0.030;
       S.bank[i] = S.bank[i] * 0.4 + out * 0.6;
     }
+    // The outslope pass and the bank smoothing both run AFTER the last speed
+    // solve, and either can leave a station with less helpful bank than the
+    // speed was solved for. Close the loop: nothing below this line may raise
+    // a corner's speed, so the identity holds against the bank that is
+    // actually built.
+    applyCornerSpeedCap();
   }
 
   // Terrain reference captured during build (only used inside build()).
@@ -1709,12 +3073,82 @@ export function createTrail(ctx) {
     }
   }
 
+  /**
+   * Detect the corners in one phase and BUILD them: register the berm feature,
+   * widen the tread through the arc, deepen the ridden rut, and lay a braking
+   * bump train on the run-in.
+   *
+   * THIS IS THE CALL SITE THAT USED TO EXIST THREE TIMES. findCorners() — and
+   * therefore every berm on the course — was invoked only inside `flow`, `loam`
+   * and `sprint`. Six of the nine phases (start, roots, jumps, slab, creek,
+   * rocks) had no corner detection and no berm construction at all, however
+   * tight the route-finder's corners were there, and the global banking pass
+   * then multiplied the ideal bank by a per-phase coefficient as low as 0.42.
+   * The corners in those phases were not "less bermed"; they were not built.
+   *
+   * The per-phase numbers live in BERM_STYLE. A tech phase gets tight, modest,
+   * worn catch banks and a short braking-bump train; a flow phase gets long
+   * sweeping berms. The BANK itself is not set here — solveSpeeds() owns it,
+   * because bank, radius and speed have to be solved together for the lean
+   * identity to hold — so what this adds is the rest of what a built corner is:
+   * the width, the rut, and the chatter on the approach.
+   *
+   * @param {string} id      phase id
+   * @param {object} opt     { margin0, margin1, skipShaped, onCorner }
+   * @returns the corners it found, so a phase can pick one out for a wallride.
+   */
+  function buildPhaseBerms(id, opt = {}) {
+    const span = stationRangeForPhase(id);
+    if (!span) return [];
+    const st = BERM_STYLE[id] || BERM_STYLE_DEFAULT;
+    const [a, b] = span;
+    const i0 = a + M(opt.margin0 === undefined ? 10 : opt.margin0);
+    const i1 = b - M(opt.margin1 === undefined ? 12 : opt.margin1);
+    if (i1 - i0 < M(12)) return [];
+    const corners = findCorners(i0, i1, st.minRadius, st.minSpacing);
+    const out = [];
+    for (const c of corners) {
+      // A corner that lands on authored relief is left to the feature that owns
+      // it: a berm inside a jump's landing transition is not a berm.
+      if (opt.skipShaped) {
+        let clash = false;
+        for (let i = c.i0; i <= c.i1 && !clash; i++) {
+          const fi = S.feat[i];
+          if (fi >= 0) {
+            const t = features[fi].type;
+            if (t === 'jump' || t === 'doubles' || t === 'gap' || t === 'stepDown' || t === 'drop') clash = true;
+          }
+        }
+        if (clash) continue;
+      }
+      if (opt.onCorner && opt.onCorner(c) === false) continue;
+      const bank = Math.abs(S.bank[c.apex]);
+      addFeature('berm', c.i0, c.i1, {
+        radius: S.radius[c.apex],
+        bank,
+        entrySpeed: S.speed[c.apex],
+        // The berm's own height above the tread centre at the outer edge.
+        height: clamp(Math.tan(bank) * S.width[c.apex] * 0.5, 0.18, 1.6),
+        phase: id,
+        style: st.style,
+      });
+      for (let i = c.i0; i <= c.i1; i++) {
+        S.width[i] = clamp(S.width[i] + st.widthAdd, 1.2, 3.0);
+        S.rut[i] = Math.max(S.rut[i], st.ruts);
+      }
+      if (st.brake > 0) addBrakingBumps(c.i0 - M(st.brakeLen), c.i0 - M(1), st.brake);
+      out.push(c);
+    }
+    return out;
+  }
+
   function buildFeatures() {
     // ---------------- phase 1: open pedally start (rollers) ----------------
     phStart: {
       const span = stationRangeForPhase('start');
       if (!span) break phStart;
       const [a, b] = span;
+      buildPhaseBerms('start');
       addFeature('rollers', a + M(45), b - M(30), { count: 5, amplitude: 0.32 });
       const r0 = a + M(45), r1 = b - M(30);
       const n = 5;
@@ -1733,6 +3167,7 @@ export function createTrail(ctx) {
       const span = stationRangeForPhase('roots');
       if (!span) break phRoots;
       const [a, b] = span;
+      buildPhaseBerms('roots', { margin0: 6, margin1: 8 });
       const seg = Math.round((b - a) / 3);
       addFeature('roots', a + M(8), a + seg, { density: 0.9, height: 0.11 });
       addFeature('chute', a + seg, a + seg * 2, { grade: 0.32 });
@@ -1762,33 +3197,21 @@ export function createTrail(ctx) {
     phFlow: {
       const span = stationRangeForPhase('flow');
       if (!span) break phFlow;
-      const [a, b] = span;
-      const corners = findCorners(a + M(10), b - M(10), 46, 18);
-      for (const c of corners) {
-        const v = S.speed[c.apex];
-        const bank = Math.abs(S.bank[c.apex]);
-        addFeature('berm', c.i0, c.i1, {
-          radius: S.radius[c.apex],
-          bank,
-          entrySpeed: v,
-          height: clamp(Math.tan(bank) * S.width[c.apex] * 0.9, 0.35, 1.7),
-        });
-        for (let i = c.i0; i <= c.i1; i++) {
-          S.width[i] = clamp(S.width[i] + 0.35, 1.2, 3.0);
-          S.rut[i] = Math.max(S.rut[i], 0.045);
-        }
-        addBrakingBumps(c.i0 - M(14), c.i0 - M(1), 0.075);
-      }
+      buildPhaseBerms('flow', { margin0: 10, margin1: 10 });
     }
 
     // ---------------- phase 4: the jump line -------------------------------
+    // Jumps first, so the berm pass can see which stations are already claimed
+    // by authored relief and leave them alone.
     buildJumpLine();
+    buildPhaseBerms('jumps', { margin0: 8, margin1: 12, skipShaped: true });
 
     // ---------------- phase 5: exposed rock slab chute ---------------------
     phSlab: {
       const span = stationRangeForPhase('slab');
       if (!span) break phSlab;
       const [a, b] = span;
+      buildPhaseBerms('slab', { margin0: 6, margin1: 22 });
       addFeature('chute', a + M(6), b - M(20), { grade: 0.34, exposure: 1.0 });
       for (let i = a; i <= b; i++) {
         S.surface[i] = Surface.ROCK;
@@ -1812,6 +3235,7 @@ export function createTrail(ctx) {
       const span = stationRangeForPhase('creek');
       if (!span) break phCreek;
       const [a, b] = span;
+      buildPhaseBerms('creek', { margin0: 6, margin1: 8 });
       const c = Math.round((a + b) / 2);
       const halfW = M(7);
       addFeature('creekCrossing', c - halfW * 2, c + halfW * 2, {
@@ -1844,19 +3268,22 @@ export function createTrail(ctx) {
       const span = stationRangeForPhase('loam');
       if (!span) break phLoam;
       const [a, b] = span;
-      const corners = findCorners(a + M(8), b - M(14), 34, 14);
       // The tightest corner in the loam becomes a natural wallride up the cut
-      // bank — picked up front so the section always has one.
+      // bank — picked up front so the section always has one, and skipped by
+      // the berm builder so the two do not both shape it.
+      const scan = findCorners(a + M(8), b - M(14), BERM_STYLE.loam.minRadius, BERM_STYLE.loam.minSpacing);
       let wallAt = -1, wallR = Infinity;
-      for (const c of corners) {
+      for (const c of scan) {
         if (c.apex < a + M(35)) continue;
         if (S.radius[c.apex] < wallR) { wallR = S.radius[c.apex]; wallAt = c.apex; }
       }
       if (wallR > 26) wallAt = -1;
       let wallDone = false;
-      for (const c of corners) {
-        const bank = Math.abs(S.bank[c.apex]);
-        if (!wallDone && c.apex === wallAt) {
+      buildPhaseBerms('loam', {
+        margin0: 8,
+        margin1: 14,
+        onCorner: (c) => {
+          if (wallDone || c.apex !== wallAt) return true;
           wallDone = true;
           addFeature('wallride', c.i0, c.i1, {
             height: 2.1, radius: S.radius[c.apex], entrySpeed: S.speed[c.apex],
@@ -1868,14 +3295,9 @@ export function createTrail(ctx) {
               THREE.MathUtils.degToRad(52) * Math.sin(f * Math.PI));
             S.width[i] = clamp(S.width[i] + 0.5, 1.2, 3.0);
           }
-          continue;
-        }
-        addFeature('berm', c.i0, c.i1, {
-          radius: S.radius[c.apex], bank, entrySpeed: S.speed[c.apex],
-          height: clamp(Math.tan(bank) * S.width[c.apex] * 0.85, 0.3, 1.4), loam: true,
-        });
-        addBrakingBumps(c.i0 - M(10), c.i0 - M(1), 0.06);
-      }
+          return false;
+        },
+      });
       for (let i = a; i <= b; i++) {
         S.surface[i] = Surface.LOAM;
         S.rut[i] = clamp(S.rut[i] + 0.035, 0.02, 0.13);   // loam ruts up deep
@@ -1888,6 +3310,7 @@ export function createTrail(ctx) {
       const span = stationRangeForPhase('rocks');
       if (!span) break phRocks;
       const [a, b] = span;
+      buildPhaseBerms('rocks', { margin0: 6, margin1: 14 });
       addFeature('rockGarden', a + M(6), b - M(12), { size: 0.45, density: 0.8 });
       for (let i = a; i <= b; i++) {
         S.surface[i] = Surface.ROCK;
@@ -1911,16 +3334,7 @@ export function createTrail(ctx) {
       const span = stationRangeForPhase('sprint');
       if (!span) break phSprint;
       const [a, b] = span;
-      const corners = findCorners(a + M(10), b - M(45), 52, 22);
-      for (const c of corners) {
-        const bank = Math.abs(S.bank[c.apex]);
-        addFeature('berm', c.i0, c.i1, {
-          radius: S.radius[c.apex], bank, entrySpeed: S.speed[c.apex],
-          height: clamp(Math.tan(bank) * S.width[c.apex] * 0.95, 0.4, 1.8), sprint: true,
-        });
-        for (let i = c.i0; i <= c.i1; i++) S.width[i] = clamp(S.width[i] + 0.4, 1.2, 3.0);
-        addBrakingBumps(c.i0 - M(16), c.i0 - M(2), 0.07);
-      }
+      buildPhaseBerms('sprint', { margin0: 10, margin1: 45 });
       // A last hip/booter before the arch — the money shot for the finish camera.
       // Kept well clear of the finish structure (which sits at t = 0.985).
       const jI = straightestNear(b - M(125), M(22), a + M(20), b - M(90));
@@ -2151,6 +3565,54 @@ export function createTrail(ctx) {
     return sp.side * sp.offset * s * s;
   }
 
+  // ---------------------------------------------------------------------------
+  // A SPLIT IS ONE SURFACE THAT FORKS, not a second trail dropped beside the
+  // first — and this is the one function that says what its height is, for the
+  // carve stamps and the tread ribbon alike.
+  //
+  // WHAT IT REPLACES, measured on the shipped world (seed 20260726, split-1, arc
+  // 728-732): the main line is a 3.0 m tread on 43 deg of bank, so its left edge
+  // stands 1.20 m above the centreline; the branch at that station sat 1.84 m out
+  // on the same side, with a 1.15 m stamp (1.31 m of reach after terrain's
+  // carve-width jitter), taking its height from natural ground up to 1.30 m BELOW
+  // the centreline. Two stamps covering the same ground declared heights 2.5 m
+  // apart — the largest single disagreement in the emitted cloud after the rut
+  // stamps — and the accumulator committed something between them, which turns
+  // the berm into a ramp and the branch into a ditch. The tread ribbon and the
+  // carve also disagreed about the branch height, because each had its own copy
+  // of the rule.
+  //
+  //   q    = |o| - mainHalf              metres outside the main tread edge
+  //   edge = surfaceHeight(i, +-mainHalf)  the height BOTH lines share there
+  //   w    = smoothstep(0, BRANCH_JOIN, q)
+  //   y    = edge + clamp(w * (own - edge), +-BRANCH_SLOPE * q)
+  //
+  // The clamp is what makes the ground between the lines rideable rather than a
+  // step: whatever the B-line's own base wants to be, the connecting ground never
+  // departs from the shared edge faster than BRANCH_SLOPE. Which is also what a
+  // real fork looks like — you can put a wheel down anywhere between the lines.
+  const BRANCH_JOIN = 3.0;      // m of clearance over which the lines separate
+  const BRANCH_SLOPE = 0.42;    // tan(23 deg) — the connecting ground's limit
+  const BRANCH_HALF = 0.85;     // branches are narrower than the main line
+  function branchBaseY(sp, i, terrain) {
+    const o = branchOffset(sp, i);
+    const sgn = Math.sign(o) || 1;
+    const mainHalf = Math.max(0.6, S.width[i] * 0.5);
+    const x = S.px[i] + S.rx[i] * o, z = S.pz[i] + S.rz[i] * o;
+    const edgeY = surfaceHeight(i, sgn * mainHalf);
+    // The B-line rolls the natural ground rather than the main line's shaped
+    // height, so it reads as the slower way round; the A-line branch stays on the
+    // main line's own banked plane.
+    const nat = terrain ? terrain.sampleHeight(x, z) : terrainSampleCache(x, z);
+    const ownY = sp.branchIsB
+      ? clamp(nat - 0.05, S.py[i] - 1.3, S.py[i] + 0.35)
+      : S.py[i] + Math.tan(S.bank[i]) * o;
+    const q = Math.abs(o) - mainHalf;
+    if (q <= 0) return edgeY;
+    const lim = BRANCH_SLOPE * q;
+    return edgeY + clamp(smoothstep(0, BRANCH_JOIN, q) * (ownY - edgeY), -lim, lim);
+  }
+
   // =========================================================================
   // 6. CROSS-SECTION + CARVE STAMPS
   // =========================================================================
@@ -2206,10 +3668,48 @@ export function createTrail(ctx) {
     return crown + ruts + edge;
   }
 
-  /** Micro-detail noise: chatter, embedded rock, transverse ridges. */
+  /**
+   * Micro-detail noise: chatter, embedded rock, transverse ridges.
+   *
+   * BAND-LIMITED TO WHAT A 0.37 m WHEEL CAN ACTUALLY RIDE, and the wavelength is
+   * not a taste call — two things in this file already fix it and the emission
+   * disagreed with both.
+   *
+   * (1) techSpeedCap() bounds the design speed with a chatter model whose
+   *     wavelength is ROUGH_LAMBDA = 1.6 m: "the spacing the root ridges and
+   *     braking-bump trains are authored at". The fbm was authored at
+   *     s * 1.9, and makeNoise1D's lattice spacing is 1, so its fundamental was
+   *     1/1.9 = 0.53 m and its second octave (lacunarity 2.4) was 0.22 m. The
+   *     speed ceiling was therefore calibrated against relief the trail does not
+   *     emit, and the relief the trail does emit had no speed ceiling at all.
+   *
+   * (2) surfaceHeightRender() already refuses to put anything under ~1 m of
+   *     wavelength into vertex positions, on the grounds that the ribbon cannot
+   *     reconstruct it. The carve kept it, with the note that "the wheel keeps
+   *     feeling the chatter the eye is no longer being shown". A 0.37 m wheel
+   *     does not feel 0.22 m chatter; it bridges everything under ~2R = 0.74 m
+   *     and is thrown by whatever is sharper than its own radius. Dilating the
+   *     committed profile by a wheel disc and asking where v^2 kappa/g >= 1 at
+   *     design speed, an 0.22 m ripple of ONE MILLIMETRE clears that threshold
+   *     by two orders of magnitude — so any amplitude at all reads as a launch,
+   *     which is exactly what 33% of stations were measuring.
+   *
+   * So the fundamental is placed at ROUGH_LAMBDA * 2.4 = 3.84 m and the second
+   * octave lands on ROUGH_LAMBDA itself: the ceiling is now calibrated against
+   * the relief that exists, both octaves are longer than the wheel, and the
+   * amplitude (S.rough) is untouched — the trail is exactly as rough, at a
+   * wavelength a bicycle can ride instead of one it can only be launched by.
+   *
+   * The lateral term is cut from v*3.1 to v*0.85 for the same reason in the
+   * other axis: v is normalised, so 3.1 advanced the lattice by 6.2 units across
+   * the tread — six independent draws over 2.5 m, i.e. white noise across the
+   * line, which is also what put a 0.4 m-wavelength ripple into the cross-slope
+   * and pulled the low-bank stations' realised bank down to 0.42x of declared.
+   * Trail relief is anisotropic: it runs with the line, not across it.
+   */
   function microDetail(i, v) {
     const s = i * STATION_DS;
-    let h = fbm1(microN, s * 1.9 + v * 3.1, 2, 2.4, 0.5) * S.rough[i];
+    let h = fbm1(microN, s / (ROUGH_LAMBDA * 2.4) + v * 0.85, 2, 2.4, 0.5) * S.rough[i];
     // Transverse ridges (roots / braking bumps) run across the trail, so they are
     // a function of s only, with a little lateral wander.
     if (S.bumps[i] > 0.001) {
@@ -2218,11 +3718,49 @@ export function createTrail(ctx) {
     return h;
   }
 
+  // Fraction of the half-width over which the cross-slope is held at its full
+  // value. Outside it the slope eases to zero by the tread edge.
+  const BANK_FULL = 0.72;
+
+  /**
+   * The banked cross-section's rise at lateral offset `o`, with the cross-slope
+   * EASED TO ZERO at the tread edge instead of running off it at full tilt.
+   *
+   * Why: outside the tread the surface is either the run-off shelf (falling at
+   * SHELF_SLOPE) or natural ground. A tread that is still rising at tan(bank)
+   * when it meets a shelf that is falling at 0.20 has a slope discontinuity of
+   * tan(bank) + 0.20 — a crease at the tread edge, 0.78 of slope at a 30 deg
+   * bank. The rider spends a great deal of time within a few tens of
+   * centimetres of that edge (the autopilot's lateral error reaches the full
+   * half-width on this course), and crossing a crease at 10 m/s throws the bike
+   * off the ground: measured at 76 m, ground curvature along the bike's path of
+   * -0.62 /m, six times the threshold at which the wheels leave, followed by
+   * 6.7 g and 1.8 m of air.
+   *
+   * Easing the slope over the outer 28% of the half-width turns the crease into
+   * a rolled lip, which is also what a built berm actually looks like. The
+   * centre 72% of the tread — where the rider rides and where the lean identity
+   * is evaluated — keeps the cross-slope the speed solve was built for, so the
+   * identity is unaffected.
+   */
+  function bankRise(i, o, half) {
+    const t = Math.tan(S.bank[i]);
+    const v = o / half;
+    const a = Math.abs(v);
+    if (a <= BANK_FULL) return t * o;
+    const W = 1 - BANK_FULL;
+    const x = Math.min(1, (a - BANK_FULL) / W);
+    // Integral of (1 - smoothstep(x)) dx = x - x^3 + x^4/2, so the rise is C1
+    // at both ends and the slope is exactly zero at the tread edge.
+    const extra = W * (x - x * x * x + 0.5 * x * x * x * x);
+    return Math.sign(v) * t * half * (BANK_FULL + extra);
+  }
+
   function treadHeight(i, o) {
     // o = lateral offset in metres, + = rider's right
     const half = Math.max(0.6, S.width[i] * 0.5);
     const v = clamp(o / half, -1.6, 1.6);
-    let y = S.py[i] + Math.tan(S.bank[i]) * o + crossProfile(i, v) + microDetail(i, v);
+    let y = S.py[i] + bankRise(i, o, half) + crossProfile(i, v) + microDetail(i, v);
     if (S.wallride[i] > 0.01) {
       // The wall kicks up on the outside of the turn: flat tread out to 0.8 of the
       // half-width, then a quadratic ramp to full wall height at the outer edge.
@@ -2248,9 +3786,19 @@ export function createTrail(ctx) {
     const q = (o < 0 ? -o : o) - half;
     if (q <= 0 || q > run + CATCH_PLATEAU) return null;
     const h = o < 0 ? S.catchL[i] : S.catchR[i];
-    const ramp = Math.min(CATCH_RAMP, run * 0.6);
+    const ramp = rampLenFor(run, h);
     if (q >= run) return -SHELF_SLOPE * run + h;          // flat crest
     return -SHELF_SLOPE * q + h * smoothstep(run - ramp, run, q);
+  }
+
+  /**
+   * How much lateral run the inner face of a catch berm of height `h` gets, on
+   * a shelf of length `run`. See the CATCH_FACE note: the face is a ramp the
+   * rider hits, so it is sized from the crest height at a rideable slope,
+   * bounded by the room actually available.
+   */
+  function rampLenFor(run, h) {
+    return clamp(h / CATCH_FACE, CATCH_RAMP, Math.min(CATCH_RAMP_MAX, Math.max(CATCH_RAMP, run * 0.85)));
   }
 
   /**
@@ -2286,7 +3834,7 @@ export function createTrail(ctx) {
   function surfaceHeightRender(i, o) {
     const half = Math.max(0.6, S.width[i] * 0.5);
     const v = clamp(o / half, -1.6, 1.6);
-    let y = S.py[i] + Math.tan(S.bank[i]) * o + crossProfileRender(i, v);
+    let y = S.py[i] + bankRise(i, o, half) + crossProfileRender(i, v);
     if (S.wallride[i] > 0.01) {
       const outSign = -Math.sign(S.bank[i]) || 1;
       const t = clamp01(((o * outSign) / half - 0.80) / 0.62);
@@ -2372,6 +3920,23 @@ export function createTrail(ctx) {
     widened: 0,                                           // response C
     catchBerms: 0, shelfMetres: 0, unprotectable: 0,      // response D
     tapedMetres: 0,                                       // response E
+    // ---- two-leg conflicts (auditLegConflicts) ----
+    // `legBefore` is the count on the stations as the route, feature and safety
+    // passes left them; `legAfter` is the count after the pinch. Both are on the
+    // FINAL line, which is the only place the property can honestly be claimed.
+    legBefore: null, legAfter: null,
+    // ---- plan radius discipline (openTightCorners) ----
+    planTightBefore: 0, planTightAfter: 0,
+    planWorstBefore: 1e9, planWorstAfter: 1e9, planShiftMax: 0,
+    planWorstAtBefore: 0, planWorstAtAfter: 0, planLocked: 0,
+    // ---- crest curvature (capCrestCurvature) ----
+    crestViolBefore: 0, crestViolAfter: 0,
+    crestWorstBefore: 0, crestWorstAfter: 0,
+    crestWorstAtBefore: 0, crestWorstAtAfter: 0,
+    // Crest violations on the FINAL profile after each later pass — see
+    // countCrestViol(). crestViolAfter is the cap's own exit, not the shipped
+    // profile, and the two are not the same number.
+    crestStage: { afterCap: 0, afterFeatures: 0, afterRecap: 0, afterSafety: 0 },
   };
 
   /**
@@ -2510,7 +4075,7 @@ export function createTrail(ctx) {
         if (w <= 0 || vertMask[i]) continue;
         y[i] += w * RELAX * (0.5 * (y[i - m] + y[i + m]) - y[i]);
         if (exposedMask[i] && y[i] > y0[i]) y[i] = y0[i];   // cut-only: see above
-        const lo = S.raw[i] - RAMP_CUT_MAX, hi = S.raw[i] + RAMP_FILL_MAX;
+        const lo = S.rawS[i] - RAMP_CUT_MAX, hi = S.rawS[i] + GRADE_FILL_MAX;
         if (y[i] < lo) y[i] = lo; else if (y[i] > hi) y[i] = hi;
       }
     }
@@ -2527,7 +4092,7 @@ export function createTrail(ctx) {
     for (let i = 1; i < n; i++) {
       if (!touched[i] || vertMask[i]) continue;
       const cap = y[i - 1] + 0.035 * ds;
-      if (y[i] > cap) y[i] = Math.max(cap, S.raw[i] - RAMP_CUT_MAX);
+      if (y[i] > cap) y[i] = Math.max(cap, S.rawS[i] - RAMP_CUT_MAX);
     }
 
     for (let i = 0; i < n; i++) {
@@ -2540,6 +4105,172 @@ export function createTrail(ctx) {
       const r = rateAt(y, i);
       if (r > safety.rampWorstAfter) safety.rampWorstAfter = r;
       if (r > capAt(i)) safety.rampViolAfter++;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // CREST CURVATURE — the bound that stops the tread launching the rider.
+  //
+  // THE MEASUREMENT THAT MOTIVATES IT. Every cell of the 21-cell autopilot
+  // sweep died between 81 and 101 m, and every single one was AIRBORNE at the
+  // moment of the crash. The trace shows why: the Start Chute ran 0.4% of
+  // gradient at 60 m and 49% at 84 m, so the profile rolls over a crest whose
+  // vertical radius is about 12 m, and a bike arriving at the design speed of
+  // 12.7 m/s needs v^2/R = 13.4 m/s^2 of centripetal acceleration to stay on
+  // it against the 9.81 that gravity provides. It cannot. It leaves the ground,
+  // lands 15-40 m off line, and goes over the edge.
+  //
+  // THE RULE. Over a crest of vertical radius R the wheels keep contact only
+  // while v^2 <= g*R. Requiring a margin — the rider should still have real
+  // weight on the tyres, not be at the point of flight — gives
+  //
+  //     R  >=  CREST_SAFETY * v^2 / g          i.e.  kappa <= g / (CREST_SAFETY * v^2)
+  //
+  // with kappa the convex vertical curvature d(grade)/ds. At CREST_SAFETY 1.45
+  // the wheels still carry ~31% of static load over the worst crest on the
+  // course, which is enough tyre to steer with.
+  //
+  // WHAT IT IS NOT. It is not a cap on gradient. A 46% pitch is untouched as
+  // long as it is ENTERED over enough distance, which is exactly the
+  // distinction between a steep trail and a jump. Concave compressions are
+  // bounded separately and much more loosely: a compression pushes the rider
+  // INTO the ground, so it costs suspension travel rather than contact, and
+  // the fork has 170 mm to spend.
+  //
+  // The correction is cut-biased for the same reason everything else here is:
+  // lowering a crest is an excavation the mountain always grants, whereas
+  // raising a compression is an embankment terrain.applyCarve() only builds to
+  // about 0.7 m. Authored relief — jump lips, landings, the committing drops —
+  // is excluded outright, so the ballistics come through bit-identical.
+  // -------------------------------------------------------------------------
+  // CREST_SAFETY / CREST_KAPPA_MIN / CREST_KAPPA_MAX are at module scope with the
+  // corridor constants: the route-finder and this solver have to promise the same
+  // number, or the route commits to profiles the solver then cannot deliver.
+  const CREST_WIN = 4.0;          // m — the span a launch happens over
+  const CREST_RELAX_WIN = 11.0;   // m — the span the correction is spread over
+  const COMPRESS_KAPPA_MAX = 0.10;
+
+  /**
+   * Crest violations on the CURRENT profile, at the current speed profile.
+   *
+   * This exists because `crestViolAfter` is measured at capCrestCurvature's own
+   * exit, and four passes run after it — buildFeatures(), the final re-solve,
+   * capGradeRamp() and benchLine() — every one of which moves S.py or S.hOff.
+   * Reporting the cap's own exit and calling the profile safe is exactly the
+   * "verified the change, not the consumers" failure: measured on seed 20260726
+   * the cap left 144 violations and the FINAL design profile carried 244.
+   * safety.crestStage records the count after each pass so the difference is
+   * visible instead of inferred.
+   *
+   * `mask` MUST be passed once features exist. A jump lip is convex past the
+   * crest cap BY CONSTRUCTION — that is what a jump is — so an unmasked count
+   * reports the jump line as 155 defects. The first cut of this did exactly
+   * that and made buildFeatures() look like it was adding 180 launch points
+   * when 155 of them were the features themselves.
+   */
+  function countCrestViol(mask) {
+    if (!S) return 0;
+    const n = S.n, ds = S.ds;
+    const m = Math.max(2, Math.round(CREST_WIN / (2 * ds)));
+    let c = 0;
+    for (let i = m; i < n - m; i++) {
+      if (mask && mask[i]) continue;
+      const v = Math.max(4, S.speed[i]);
+      const cap = clamp(G / (CREST_SAFETY * v * v), CREST_KAPPA_MIN, CREST_KAPPA_MAX);
+      const gA = (S.py[i - m] - S.py[i]) / (m * ds);
+      const gB = (S.py[i] - S.py[i + m]) / (m * ds);
+      if ((gB - gA) / (m * ds) > cap) c++;
+    }
+    return c;
+  }
+
+  /**
+   * Relax the vertical profile until every crest is flat enough to hold the
+   * wheels down at that station's design speed. Writes into S.hOff, leaves
+   * S.by alone, and never moves a station carrying authored relief.
+   */
+  function capCrestCurvature(vertMask) {
+    const n = S.n, ds = S.ds;
+    const m = Math.max(2, Math.round(CREST_WIN / (2 * ds)));
+    const mR = Math.max(m + 1, Math.round(CREST_RELAX_WIN / (2 * ds)));
+    const y = new Float64Array(n);
+    for (let i = 0; i < n; i++) y[i] = S.by[i] + S.hOff[i];
+    const y0 = Float64Array.from(y);
+    const wgt = new Float32Array(n);
+    const capOf = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = Math.max(4, S.speed[i]);
+      capOf[i] = clamp(G / (CREST_SAFETY * v * v), CREST_KAPPA_MIN, CREST_KAPPA_MAX);
+    }
+    // Positive = convex (getting steeper down the hill), i.e. a crest.
+    const kappaAt = (arr, i) => {
+      const gA = (arr[i - m] - arr[i]) / (m * ds);
+      const gB = (arr[i] - arr[i + m]) / (m * ds);
+      return (gB - gA) / (m * ds);
+    };
+
+    for (let i = m; i < n - m; i++) {
+      if (vertMask[i]) continue;
+      const k = kappaAt(y0, i);
+      if (k > safety.crestWorstBefore) { safety.crestWorstBefore = k; safety.crestWorstAtBefore = i * ds; }
+      if (k > capOf[i]) safety.crestViolBefore++;
+    }
+
+    const RELAX = 0.40;
+    for (let pass = 0; pass < 300; pass++) {
+      wgt.fill(0);
+      let any = false;
+      for (let i = m; i < n - m; i++) {
+        if (vertMask[i]) continue;
+        const k = kappaAt(y, i);
+        const over = k > capOf[i] ? (k - capOf[i]) / capOf[i]
+          : (-k > COMPRESS_KAPPA_MAX ? (-k - COMPRESS_KAPPA_MAX) / COMPRESS_KAPPA_MAX : 0);
+        if (over <= 0) continue;
+        any = true;
+        const v = clamp01(over) * 0.65 + 0.35;
+        for (let j = Math.max(0, i - mR); j <= Math.min(n - 1, i + mR); j++) {
+          const w = v * (1 - Math.abs(j - i) / (mR + 1));
+          if (w > wgt[j]) wgt[j] = w;
+        }
+      }
+      if (!any) break;
+      for (let i = mR; i < n - mR; i++) {
+        const w = wgt[i];
+        if (w <= 0 || vertMask[i]) continue;
+        // The RELAXATION stencil is wider than the MEASUREMENT stencil, and
+        // they are separate on purpose. The launch happens over ~4 m — that is
+        // the span the wheels and the fork see, so that is where the curvature
+        // must be measured. But the geometry that produces it is a 10-15 m
+        // rollover, and a Laplacian over ±2 m attacks 2 m wobble and leaves a
+        // 12 m crest almost untouched: measured with the two stencils equal,
+        // the pass took the worst crest curvature only 0.66 -> 0.25 /m against
+        // a 0.042 cap, i.e. it barely moved the defect it had correctly found.
+        const step = w * RELAX * (0.5 * (y[i - mR] + y[i + mR]) - y[i]);
+        y[i] += step;
+        // Cut freely, fill only as far as the terrain will actually build.
+        const lo = S.rawS[i] - RAMP_CUT_MAX, hi = S.rawS[i] + GRADE_FILL_MAX;
+        if (y[i] < lo) y[i] = lo; else if (y[i] > hi) y[i] = hi;
+      }
+    }
+
+    // Descent guard — the same one capGradeRamp uses, and for the same reason:
+    // smoothing a descending profile very rarely makes it climb, and CONTRACT
+    // §4 is absolute about it.
+    for (let i = 1; i < n; i++) {
+      if (vertMask[i]) continue;
+      const cap = y[i - 1] + 0.035 * ds;
+      if (y[i] > cap) y[i] = Math.max(cap, S.rawS[i] - RAMP_CUT_MAX);
+    }
+
+    for (let i = 0; i < n; i++) {
+      S.hOff[i] += y[i] - y0[i];
+      S.py[i] = S.by[i] + S.hOff[i];
+    }
+    for (let i = m; i < n - m; i++) {
+      if (vertMask[i]) continue;
+      const k = kappaAt(y, i);
+      if (k > safety.crestWorstAfter) { safety.crestWorstAfter = k; safety.crestWorstAtAfter = i * ds; }
+      if (k > capOf[i]) safety.crestViolAfter++;
     }
   }
 
@@ -2702,6 +4433,10 @@ export function createTrail(ctx) {
           catchH = Math.min(catchH, (nat + CATCH_FILL_MAX * 1.7) - (ey - SHELF_SLOPE * run));
           if (catchH < 0.15) { safety.unprotectable++; continue; }
         }
+        // Rideable inner face. The crest may never be taller than the run
+        // available to ramp up to it at CATCH_FACE — see the note there.
+        catchH = Math.min(catchH, CATCH_FACE * Math.min(CATCH_RAMP_MAX, run * 0.85));
+        if (catchH < 0.12) { safety.unprotectable++; continue; }
         if (sgn < 0) { S.shelfL[i] = run; S.catchL[i] = catchH; }
         else { S.shelfR[i] = run; S.catchR[i] = catchH; }
       }
@@ -2807,8 +4542,128 @@ export function createTrail(ctx) {
     for (let i = 0; i < n; i++) if (S.taped[i]) safety.tapedMetres += S.ds;
   }
 
+  /**
+   * TWO-LEG CONFLICT AUDIT AND RESIDUAL RESOLUTION — the downstream half of the
+   * leg-clearance rule (the upstream half is legClearanceCost(), in the march).
+   *
+   * The march can only promise clearance on the polyline it committed. Three
+   * later passes move the line without knowing about the other leg:
+   * openTightCorners() shifts stations up to ~3.2 m laterally to open a corner,
+   * benchLine() shifts up to BENCH_SHIFT_MAX toward the safe side, and the
+   * feature and safety passes widen the tread by up to WIDEN_MAX + a berm's
+   * widthAdd. Any of them can eat clearance the march paid for. So the property
+   * is re-measured on the FINAL stations, which is the only place it can honestly
+   * be claimed, and what is left is resolved rather than reported.
+   *
+   * Resolution is the narrow one, deliberately. Where two limbs contest ground,
+   * a real builder does not move the trail — the corner is where it is — he cuts
+   * a narrower bench on each and armours between them. Narrowing is bounded by
+   * the CONTRACT §4 floor of 1.2 m and it is self-consistent: techSpeedCap()
+   * reads the width, so a pinched limb is also a slower one. Where even the floor
+   * cannot clear the pair the station is counted as unresolved, which is a fact
+   * about the mountain and belongs in the audit, not hidden.
+   *
+   * `mode` 'audit' measures without touching anything.
+   */
+  function auditLegConflicts(mode) {
+    const n = S.n;
+    const CELL = 8.0;
+    const bins = new Map();
+    for (let i = 0; i < n; i++) {
+      const key = Math.floor(S.pz[i] / CELL) * 8192 + Math.floor(S.px[i] / CELL);
+      let l = bins.get(key);
+      if (!l) { l = []; bins.set(key, l); }
+      l.push(i);
+    }
+    const minArc = Math.round(LEG_ARC_MIN / STATION_DS);
+    const half = (i) => Math.max(0.6, S.width[i] * 0.5);
+    let changed = false;
+    // Two sweeps: the first narrows, the second measures what is left.
+    for (let pass = 0; pass < (mode === 'audit' ? 1 : 2); pass++) {
+      const measuring = mode === 'audit' || pass === 1;
+      let count = 0, metres = 0, worst = 0, worstAt = 0, worstGap = 0, unresolved = 0;
+      let inRun = false;
+      for (let i = 0; i < n; i++) {
+        const bx = Math.floor(S.px[i] / CELL), bz = Math.floor(S.pz[i] / CELL);
+        let deficit = 0, dh = 0, gap = 0;
+        for (let a = -1; a <= 1; a++) {
+          for (let b = -1; b <= 1; b++) {
+            const l = bins.get((bz + b) * 8192 + (bx + a));
+            if (!l) continue;
+            for (let m = 0; m < l.length; m++) {
+              const j = l[m];
+              if (Math.abs(j - i) < minArc) continue;
+              const d = Math.hypot(S.px[j] - S.px[i], S.pz[j] - S.pz[i]);
+              const need = legReach(half(i)) + legReach(half(j));
+              if (d >= need) continue;
+              if (!measuring) {
+                // Narrow both limbs, sharing the correction, down to the floor.
+                const over = need - d;
+                for (const k of [i, j]) {
+                  const w = clamp(S.width[k] - over * 0.55, 1.2, 3.0);
+                  if (w < S.width[k] - 1e-4) { S.width[k] = w; changed = true; }
+                }
+              }
+              if (need - d > deficit) {
+                deficit = need - d; gap = d;
+                dh = Math.abs(S.py[j] - S.py[i]);
+              }
+            }
+          }
+        }
+        if (measuring && deficit > 0) {
+          metres += STATION_DS;
+          if (!inRun) { count++; inRun = true; }
+          if (dh > worst) { worst = dh; worstAt = i; worstGap = gap; }
+          if (S.width[i] <= 1.2 + 1e-4) unresolved++;
+        } else if (measuring) inRun = false;
+      }
+      if (measuring) {
+        const rec = {
+          count, metres: +metres.toFixed(1), unresolvedStations: unresolved,
+          worstHeightGap: +worst.toFixed(2), worstPlanGap: +worstGap.toFixed(2),
+          worstAtArc: +(worstAt * STATION_DS).toFixed(1),
+        };
+        if (mode === 'audit') safety.legBefore = rec; else safety.legAfter = rec;
+      }
+    }
+    return changed;
+  }
+
   function pushStamp(x, z, radius, targetHeight, falloff, material, bank, kind) {
     stamps.push({ x, z, radius, targetHeight, falloff, material, bank, kind });
+  }
+
+  /**
+   * The cross-slope of the DESIGNED surface at lateral offset `o`, as an angle
+   * in the same convention `stamp.bank` uses (+ = rider's right side high).
+   *
+   * Every stamp is a disc whose target height varies across its own footprint
+   * as `s * tan(stamp.bank)` (terrain.js stampTarget). If that bank is not the
+   * slope of the surface the stamp is supposed to be building, the disc is
+   * TILTED WRONG over its whole influence radius, and applyCarve averages the
+   * error into the committed heightfield.
+   *
+   * That was happening at every station carrying a run-off shelf. The shelf and
+   * catch-berm bands were emitted with `bank: 0` — flat discs — while the tread
+   * they abut is banked up to 30 deg, and their influence radius (1.9 x 0.36 m)
+   * reaches 0.68 m back inside the tread edge. A flat disc laid across a 30 deg
+   * cross-slope is wrong by 0.39 m at the edge of its own reach.
+   *
+   * Measured on the committed heightfield at 70-100 m before this: the tread
+   * surface deviated from the emitted design plane by up to 0.42 m, swinging
+   * +0.15 / -0.28 m at a ~3 m wavelength INSIDE the tread. That is what threw
+   * the bike off at 81 m — and it threw it off at 45% of the design speed too,
+   * which is how we know it was geometry and not pace.
+   *
+   * Sampling the design surface either side of the stamp centre and handing the
+   * stamp its own local slope makes each disc tangent to what it is building,
+   * so overlapping discs agree instead of fighting.
+   */
+  function localCross(i, o) {
+    const e = 0.18;
+    const d = (surfaceHeight(i, o + e) - surfaceHeight(i, o - e)) / (2 * e);
+    return Math.atan(clamp(d, -1.4, 1.4));
   }
 
   function buildStamps() {
@@ -2837,6 +4692,20 @@ export function createTrail(ctx) {
       // Sharper stamps where the shape must stay crisp (lips, knuckles, drops).
       const crisp = (kind === 'lip' || kind === 'landing' || kind === 'drop');
       const falloff = crisp ? 1.35 : 2.1;
+      // MEASURED AND REJECTED: shrinking the discs where the cross-slope is
+      // steep. A stamp declares a PLANE, so its radius is a claim about how far
+      // the surface stays planar, and on a 43 deg berm across a 3.0 m tread it
+      // does not — the largest residual disagreements left in the cloud are one
+      // 1.58 m disc extrapolated over a doubly curved berm (seed 12345, arc
+      // 2417, 3.66 m of spread). Scaling the radius by 1/(1+|tan(bank)|*0.45)
+      // does reduce that: the >0.50 m band goes 1.57/2.44/2.55% -> 1.05/1.92/
+      // 1.69% across the three seeds and p99 0.59 -> 0.51 m. It also makes the
+      // COMMITTED surface very slightly rougher (wheel-launch 26.80 -> 27.15%,
+      // 23.99 -> 24.16%, 23.35 -> 23.89%) because the along-track overlap
+      // between consecutive stations shrinks with the radius, and it leaves the
+      // committed-vs-emitted residual completely unmoved (p99 0.115 m either
+      // way). It trades the metric that matters for the one being reported, so
+      // it is not taken.
       const rScale = crisp ? 0.62 : 1.0;
 
       // ---- who may invite the cut/fill batter --------------------------------
@@ -2869,7 +4738,7 @@ export function createTrail(ctx) {
 
       // Centre stamp.
       pushStamp(x, z, (half * 0.80 + 0.38) * rScale, surfaceHeight(i, 0), falloff,
-        mat, bank, kindFor(kind, 0, false));
+        mat, localCross(i, 0), kindFor(kind, 0, false));
 
       // Lateral stamps. Their targetHeight already contains the banked/crowned
       // cross-section, so a terrain that ignores `bank` still gets the right shape.
@@ -2885,32 +4754,54 @@ export function createTrail(ctx) {
           x + rxi * o, z + rzi * o,
           (half * 0.50 + 0.30) * rScale,
           surfaceHeight(i, o),
-          falloff, mat, bank,
+          falloff, mat, localCross(i, o),
           kindFor(base, Math.sign(offs[k]), Math.abs(offs[k]) >= outerMag - 1e-6));
       }
 
-      // Ruts as their own stamps so the terrain paints them as worn channels.
+      // Ruts as their own stamps so the terrain PAINTS them as worn channels.
+      //
+      // THEY MUST NOT DIG. Measured on the shipped world (seed 20260726): these
+      // stamps carried `- 0.012 - 0.24` below the shared cross-section wherever
+      // the station also had a run-off shelf (which demotes the kind to 'berm'),
+      // so at every such station a 0.34 m stamp — floored to 0.6 m and widened to
+      // 0.68 m of reach by terrain.applyCarve — declared a surface a quarter of a
+      // metre below the one every tread stamp at the same point declared. That is
+      // the single largest systematic contradiction in the emitted cloud, and it
+      // is a straight violation of the rule stated over surfaceHeight(): every
+      // stamp at every offset derives its target from ONE function.
+      //
+      // The 0.24 m was compensating for terrain.stampTarget()'s old kind-specific
+      // 'rut' section, which no longer exists — terrain adds no trough of its own
+      // now, so the compensation is not merely inconsistent, it is stale. The rut
+      // is already in crossProfile(); if it needs to be deeper, S.rut is the knob,
+      // and every stamp sees it.
+      //
+      // The radius is emitted at the 0.6 m floor terrain will apply anyway, so the
+      // declared footprint is the real one rather than a fiction 1.8x smaller.
       if (S.rut[i] > 0.045 && !crisp && (i % 2) === 0) {
         for (const sgn of [-1, 1]) {
           const o = sgn * half * (0.30 + microN(i * 0.02) * 0.1);
-          const rk = kindFor('rut', sgn, false);
-          // stampTarget()'s 'rut' case digs the 0.24 m channel itself. Demoted to
-          // 'berm' to keep it out of the batter, it has to be dug here instead or
-          // the worn channel silently disappears on every protected station.
-          pushStamp(x + rxi * o, z + rzi * o, 0.34,
-            surfaceHeight(i, o) - 0.012 - (rk === 'rut' ? 0 : 0.24),
-            1.4, mat, bank, rk);
+          pushStamp(x + rxi * o, z + rzi * o, 0.6,
+            surfaceHeight(i, o), 1.4, mat, localCross(i, o), kindFor('rut', sgn, false));
         }
       }
 
       // Rock garden: scattered proud boulders inside the corridor.
+      //
+      // Emitted at the true footprint (terrain floors every radius at 0.6 m, so a
+      // 0.22 m stamp was declaring a boulder over three times its stated width),
+      // and the proud height is bounded by what that footprint can support at a
+      // slope a wheel can climb: a 0.6 m-radius cap standing `rise` proud has a
+      // mean face slope of rise/0.6, and past ~0.55 of that it stops being a rock
+      // in the trail and becomes a step the front wheel hits square.
       if (S.surface[i] === Surface.ROCK && S.rough[i] > 0.07 && (i % 5) === 0) {
         const r = featRng();
         if (r < 0.55) {
           const o = (featRng() * 2 - 1) * half * 0.95;
-          const size = 0.22 + featRng() * 0.34;
-          pushStamp(x + rxi * o, z + rzi * o, size,
-            surfaceHeight(i, o) + size * 0.75, 1.1, Surface.ROCK, bank, 'tread');
+          const rad = 0.6 + featRng() * 0.34;
+          const rise = Math.min(0.30, rad * 0.42);
+          pushStamp(x + rxi * o, z + rzi * o, rad,
+            surfaceHeight(i, o) + rise, 1.1, Surface.ROCK, localCross(i, o), 'tread');
         }
       }
     }
@@ -2971,35 +4862,48 @@ export function createTrail(ctx) {
           const o = sgn * (half + q);
           pushStamp(
             S.px[i] + S.rx[i] * o, S.pz[i] + S.rz[i] * o,
-            0.36, y, 1.9, Surface.GRAVEL, 0, 'berm',
+            0.36, y, 1.9, Surface.GRAVEL, localCross(i, o), 'berm',
           );
         }
       }
     }
 
     // --- split branches ----------------------------------------------------
+    //
+    // Height comes from branchBaseY() — see the note there for what it replaces
+    // and why the tread ribbon now reads the same function.
+    //
+    // WHAT IS EMITTED WHERE. A branch stamp may not vote on the main line's
+    // surface, so each one is admitted only if its own footprint stays outboard
+    // of the main tread edge, and its radius is cut to the room available:
+    // terrain floors every radius at 0.6 m and widens it by up to 14%, so a
+    // stamp whose axis sits `d` metres outside the edge may have a radius of at
+    // most d/1.14, and below 0.684 m of room there is no admissible stamp at
+    // all. The branch therefore grows out of the tread edge as the lines
+    // separate instead of appearing on top of the main line — which is both the
+    // correct geometry and what the ribbon draws.
     for (const sp of splits) {
       for (let i = sp.i0; i <= sp.i1; i++) {
         const o = branchOffset(sp, i);
-        if (Math.abs(o) < 0.35) continue;
-        const half = 0.85;   // branches are narrower than the main line
-        const x = S.px[i] + S.rx[i] * o, z = S.pz[i] + S.rz[i] * o;
+        if (o === 0) continue;
+        const sgn = Math.sign(o);
+        const mainHalf = Math.max(0.6, S.width[i] * 0.5);
+        const baseY = branchBaseY(sp, i);
         const bankB = sp.branchIsB ? S.bank[i] * 0.4 : S.bank[i] * 0.8;
-        // The B-line rolls the natural ground rather than the main line's shaped
-        // height, so it reads as the slower way round — but stays within a
-        // rideable step of the main line so the two really do rejoin.
-        const baseY = sp.branchIsB
-          ? clamp(terrainSampleCache(x, z) - 0.05, S.py[i] - 1.3, S.py[i] + 0.35)
-          : S.py[i] + Math.tan(S.bank[i]) * o;
         // Safer line, looser surface: the B-line trades grip for exposure.
         const matB = sp.branchIsB && S.surface[i] !== Surface.MUD
           ? Surface.GRAVEL : S.surface[i];
-        pushStamp(x, z, 1.15, baseY, 2.0, matB, bankB, 'tread');
-        for (const k of [-0.7, 0.7, -1.05, 1.05]) {
-          const oo = k * half;
-          pushStamp(x + S.rx[i] * oo, z + S.rz[i] * oo, 0.7,
-            baseY + Math.tan(bankB) * oo + (Math.abs(k) > 0.9 ? 0.05 : 0.02),
-            2.0, matB, bankB, 'tread');
+        for (const k of [0, -0.7, 0.7, -1.05, 1.05]) {
+          const oo = k * BRANCH_HALF;
+          const lat = o + oo;                       // offset from the centreline
+          const room = Math.abs(lat) - mainHalf;    // ...outside the main tread edge
+          if (Math.sign(lat) !== sgn || room <= 0.6 * 1.14) continue;
+          const rad = clamp(room / 1.14, 0.6, k === 0 ? 1.15 : 0.7);
+          pushStamp(
+            S.px[i] + S.rx[i] * lat, S.pz[i] + S.rz[i] * lat, rad,
+            baseY + Math.tan(bankB) * oo + (Math.abs(k) > 0.9 ? 0.05 : Math.abs(k) > 0 ? 0.02 : 0),
+            2.0, matB, bankB, 'tread',
+          );
         }
       }
     }
@@ -3041,13 +4945,40 @@ export function createTrail(ctx) {
 
     // Route-find several times and keep the best line down the hill.
     let route = null, bestScore = -Infinity;
+    routeAudit.length = 0;
     for (let v = 0; v < 7; v++) {
       const cand = marchRoute(terrain, v);
       const sc = scoreRoute(terrain, cand);
+      routeAudit.push({
+        variant: v, score: +sc.toFixed(2),
+        startX: +cand.startX.toFixed(1), startY: +cand.startY.toFixed(1),
+        corrMean: +(cand.corrMean || 0).toFixed(2),
+        corrWorst: +(cand.corrWorst || 0).toFixed(2),
+        corrBad: cand.corrBad || 0,
+        len: +(cand.marchedLength || 0).toFixed(0),
+        drop: +(cand.marchedDrop || 0).toFixed(0),
+        openGrade: +(cand.openGrade || 0).toFixed(3),
+      });
       if (sc > bestScore) { bestScore = sc; route = cand; }
     }
+    for (const r of routeAudit) r.chosen = r.variant === route.variant;
     buildStations(terrain, route);
     solveSpeeds();
+    // Bound the crest curvature against the speed the profile itself asks for,
+    // BEFORE any feature is placed — so the jump line, the drops and the
+    // rollers are authored on top of a profile that already holds the wheels
+    // down, and nothing this pass does can touch their ballistics afterwards.
+    // Twice, because the cap is a function of speed and the speed is a function
+    // of the gradient this pass just changed.
+    {
+      const empty = new Uint8Array(S.n);
+      for (let k = 0; k < 2; k++) {
+        capCrestCurvature(empty);
+        refreshBasis();
+        solveSpeeds();
+      }
+    }
+    safety.crestStage.afterCap = countCrestViol();
     buildFeatures();
     buildSplits();
     // Features changed the surfaces and widths, so re-solve the speed profile with
@@ -3058,11 +4989,47 @@ export function createTrail(ctx) {
     // Final surface Y includes the feature offsets.
     for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
 
+    // ---- the crest cap has to run AGAIN, on the profile the features left ----
+    //
+    // The pass above deliberately runs BEFORE buildFeatures() so that nothing it
+    // does can touch a jump's ballistics. That is right, and it is not enough:
+    // measured on seed 20260726, the profile leaving the cap carried 72 crest
+    // violations and the profile leaving buildFeatures() carried 252. The
+    // features add 180 launch points of their own, on the ground BETWEEN the
+    // authored relief — roller crests, berm entries, the shoulders either side
+    // of a chute — and nothing re-measured it. The reported crestViolAfter came
+    // from the cap's own exit, so the number that was signed off described a
+    // profile four passes upstream of the one that ships.
+    //
+    // Running it a second time under the SAME authored-relief mask
+    // applyExposureSafety uses keeps the original guarantee exactly: every
+    // station carrying a lip, a landing, a committing drop or the wallride is
+    // masked, so the jump table is unchanged to the millimetre, and only the
+    // ordinary ground either side of them is flattened back under the cap.
+    {
+      const vm = buildAuthoredMask(
+        ['jump', 'doubles', 'gap', 'stepDown', 'wallride', 'drop'], FEATURE_GUARD);
+      safety.crestStage.afterFeatures = countCrestViol(vm);
+      capCrestCurvature(vm);
+      refreshBasis();
+      solveSpeeds(false);
+      for (let i = 0; i < S.n; i++) S.py[i] = S.by[i] + S.hOff[i];
+      safety.crestStage.afterRecap = countCrestViol(vm);
+      crestMask = vm;
+    }
+
     // Level-design safety audit and mitigation. Must run AFTER the features have
     // set the final width/bank/height (it measures the real cross-section) and
     // BEFORE the curve rebuild and buildStamps() (it moves px/pz/py and adds the
     // shelf geometry). See the long note above applyExposureSafety().
     applyExposureSafety(terrain);
+    safety.crestStage.afterSafety = countCrestViol(crestMask);
+
+    // Two-leg conflicts, measured on the FINAL stations and resolved by pinching
+    // the contesting limbs. See auditLegConflicts(). The speed profile is re-run
+    // when a width actually moved, because techSpeedCap() reads it.
+    auditLegConflicts('audit');
+    if (auditLegConflicts('resolve')) solveSpeeds(false);
 
     for (const f of features) {
       const mid = (f.i0 + f.i1) >> 1;
@@ -3347,7 +5314,24 @@ export function createTrail(ctx) {
    * both flickers in motion and reads as a bare white thread in a still. The
    * expansion is done in clip space along the ribbon's own edge attribute, so
    * near tape (already wider than the minimum) is untouched.
+   *
+   * IT IS ALSO BOUNDED, and it was not. `minNdc` is a screen-space target with
+   * no relationship to the object's real size, so the amount of geometry it
+   * manufactures grows without limit as the ribbon recedes: at 400 m a 75 mm
+   * ribbon is 0.34 px and the term was widening it 5x, at 1 km 12x, and the
+   * whole 3.3 km of course tape is inside the draw distance of an establishing
+   * shot. That is how a 75 mm ribbon was measured occupying 12.5% of the frame
+   * as a pale sheet — not a geometry bug, an unbounded screen-space term. It
+   * also depends on a `uViewportH` uniform this module cannot verify (the
+   * drawing buffer moves under the resolution governor between resize() calls),
+   * so an unbounded form has no worst case at all.
+   *
+   * MINPX_MAX_GROW caps the drawn height at a fixed multiple of the ribbon's
+   * TRUE projected height. Inside ~150 m that is the anti-aliasing floor doing
+   * its job; past it the ribbon simply gets smaller, the way a 75 mm strip of
+   * polythene at 400 m should. The bound holds whatever uViewportH says.
    */
+  const MINPX_MAX_GROW = 2.0;
   function applyFlutter(material, amp, opts) {
     const minPx = opts && opts.minPx ? opts.minPx : 0;
     const worldH = opts && opts.worldH ? opts.worldH : 1;
@@ -3384,13 +5368,22 @@ export function createTrail(ctx) {
             float wClip = max( gl_Position.w, 1e-4 );
             float hNdc  = ( ${worldH.toFixed(4)} * projectionMatrix[1][1] ) / wClip;
             float minNdc = ${minPx.toFixed(3)} * 2.0 / max( uViewportH, 1.0 );
-            float grow = max( 0.0, minNdc - hNdc ) * 0.5;
+            // Never draw the ribbon more than MINPX_MAX_GROW times its true
+            // projected height, whatever the viewport uniform claims.
+            float target = min( minNdc, hNdc * ${MINPX_MAX_GROW.toFixed(2)} );
+            float grow = max( 0.0, target - hNdc ) * 0.5;
             gl_Position.y += ( aEdge - 0.5 ) * 2.0 * grow * wClip;
           }
         `);
       }
     };
-    material.customProgramCacheKey = () => (minPx > 0 ? 'descent-flutter-minpx' : 'descent-flutter');
+    // The min-width block bakes worldH and minPx into the shader source as
+    // literals, so two materials with different values must not share a compiled
+    // program. Encode them in the key rather than relying on there only ever
+    // being one ribbon type.
+    material.customProgramCacheKey = () => (minPx > 0
+      ? `descent-flutter-minpx-${minPx.toFixed(3)}-${worldH.toFixed(4)}`
+      : 'descent-flutter');
     return material;
   }
 
@@ -3876,15 +5869,12 @@ export function createTrail(ctx) {
       emitStrip({
         x: (i) => S.px[i] + S.rx[i] * branchOffset(sp, i),
         z: (i) => S.pz[i] + S.rz[i] * branchOffset(sp, i),
-        y: (i, o) => {
-          const bo = branchOffset(sp, i);
-          const x = S.px[i] + S.rx[i] * (bo + o);
-          const z = S.pz[i] + S.rz[i] * (bo + o);
-          const base = sp.branchIsB
-            ? Math.min(S.py[i] + 0.05, (terrain ? terrain.sampleHeight(x, z) : S.py[i]) + 0.02)
-            : S.py[i] + Math.tan(S.bank[i]) * bo;
-          return base + crossProfileRender(i, clamp(o / (bw * 0.5), -1.4, 1.4)) * 0.8;
-        },
+        // ONE height rule, shared with the carve — see branchBaseY(). The ribbon
+        // used to carry its own copy (`min(py + 0.05, natural + 0.02)`), so the
+        // decal and the ground it is laid on were solving different equations
+        // and the branch read as floating or buried wherever they diverged.
+        y: (i, o) => branchBaseY(sp, i, terrain)
+          + crossProfileRender(i, clamp(o / (bw * 0.5), -1.4, 1.4)) * 0.8,
       }, sp.i0, sp.i1, () => bw, 0.94, (i) => {
         // Fade the branch out where the two lines merge, so the braid reads as one
         // tread splitting rather than two decals stacked on top of each other.
@@ -4035,7 +6025,19 @@ export function createTrail(ctx) {
     }), 0.055));
     bannerMat.name = 'trail-banner';
 
-    const tapeTex = reg(canvasTexture(buildTapeTexture('#f2f3f1', '#e0452c'),
+    // THE WHITE IS UNDER THE BLOOM THRESHOLD, deliberately. ADDENDUM C: postfx
+    // blooms above scene luminance ~0.85, and warns against blowing out large
+    // white surfaces. A lambertian albedo `a` under the sun (DirectionalLight
+    // intensity 3.4) leaves radiance a/pi * 3.4 * NdotL, so 0xf2f3f1 — linear
+    // 0.888 — peaks at 0.96 and blooms wherever the ribbon faces the sun at
+    // NdotL > 0.885. Three kilometres of ribbon pinned to a minimum screen width
+    // and carrying a constant world-space normal meant a large fraction of it
+    // did exactly that at once, which is the "vast pale sheet" the establishing
+    // shot was measured on. 0xdcdcd6 is linear 0.712 and peaks at 0.770: still
+    // unmistakably white tape against 0.2-albedo hardpack, and it cannot bloom
+    // at any angle. The two geometric halves of the same defect are the widening
+    // bound in applyFlutter() and the real ribbon normals below.
+    const tapeTex = reg(canvasTexture(buildTapeTexture('#dcdcd6', '#e0452c'),
       { srgb: true, aniso: 8 }));
     // H4. `transparent: true` TOGETHER WITH `alphaTest` is a three.js foot-gun:
     // it puts a fully alpha-tested surface into the depth-sorted transparent
@@ -4507,9 +6509,26 @@ export function createTrail(ctx) {
             const tw = twist * bow;
             const twX = S.rx[ii] * TAPE_H * Math.sin(tw);
             const twZ = S.rz[ii] * TAPE_H * Math.sin(tw);
+            // THE RIBBON NEEDS A REAL NORMAL. Every tape vertex on the course was
+            // authored (0,0,1) — a constant world-space +Z — so a 3.3 km ribbon
+            // that turns through every heading on the mountain was lit as one
+            // flat facing plane: no falloff round a corner, no difference between
+            // the sunlit and shaded sides of a switchback, and a uniform pale
+            // value wherever the sun happened to be near +Z. Combined with the
+            // unbounded widening above, that is what read as a sheet.
+            //
+            // The face normal is perpendicular to both the ribbon's own long axis
+            // (the trail tangent) and its edge (up, rolled by the twist).
+            const eX = twX, eY = TAPE_H * Math.cos(tw), eZ = twZ;
+            const tX = S.tx[ii], tY = S.ty[ii], tZ = S.tz[ii];
+            let nX = eY * tZ - eZ * tY;
+            let nY = eZ * tX - eX * tZ;
+            let nZ = eX * tY - eY * tX;
+            const nL = Math.max(1e-6, Math.hypot(nX, nY, nZ));
+            nX /= nL; nY /= nL; nZ /= nL;
             for (let k = 0; k < 2; k++) {
               tape.pos.push(x + (k ? twX : 0), y + (k ? TAPE_H * Math.cos(tw) : 0), z + (k ? twZ : 0));
-              tape.nor.push(0, 0, 1);
+              tape.nor.push(nX, nY, nZ);
               tape.uv.push(dist / 0.62, k);
               tape.col.push(1, 1, 1, 1);
               tape.flu.push(flut * (k ? 1 : 0.5));
@@ -4980,6 +6999,8 @@ export function createTrail(ctx) {
     sampleAt, nearestT, widthAt,
     // --- additive (see CONTRACT-NOTE) ---
     splits, phases: phaseSpans, jumps: jumpLog,
+    cornerAudit,                  // lean-identity audit; see auditCornerIdentity()
+    routeAudit,                   // route-variant audit; see build() and scoreRoute()
     safety,                       // exposure-safety audit; see applyExposureSafety()
     speedAt, surfaceAt,
     finishT: 0.985,

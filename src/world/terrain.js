@@ -30,6 +30,48 @@
 //   direction. Terrain derives a per-stamp tangent by 2-D PCA over neighbouring stamps within
 //   9 m and orients it downhill using neighbouring `targetHeight`s, so `bank` (+ = right side
 //   high) is applied correctly regardless of the order stamps arrive in.
+//
+// CONTRACT-NOTE (terrain → trail, THE DESIGN SURFACE): CarveStamp describes a *plane*, not a
+//   plateau — `targetHeight` is the tread height AT THE STAMP CENTRE and `bank` its cross-slope.
+//   Terrain now also derives the stamp's ALONG-track gradient (from its neighbours' target
+//   heights) and evaluates each stamp as a plane at the query point. Two consequences the trail
+//   engineer should know about:
+//     * `bank` is committed at 1.0x on every kind. It used to be 0.9x on tread/lip/landing/drop
+//       and, because the blend strength collapsed outside half a tread radius, ~0.22x on berms.
+//       The lean identity atan(v^2/(g r)) <= bank + lean was therefore satisfied in the emitted
+//       design and violated in the built world.
+//     * `falloff` no longer shapes the tread core (the bench must be committed at full strength
+//       or the committed cross-section cannot equal the emitted one). It still shapes the ease
+//       outside the tread edge and the paint/carve mask.
+//   `terrain.sampleDesign(x, z, out)` returns the design surface at a point so this can be
+//   measured rather than asserted; see the "committed vs design" note above applyCarve().
+//
+// CONTRACT-NOTE (terrain → trail, THE BAND LIMIT): the committed tread is LOW-PASSED at
+//   0.555 m (1.5 wheel radii) before it is written to the heightfield — see commitDetail().
+//   Terrain will not reproduce anything a 0.37 m wheel cannot roll over, and a stamp that
+//   asks for it is not honoured. Two emissions currently fall in that class and arrive
+//   softened rather than as authored: the rut stamps (r 0.34 m, 0.012-0.252 m below the
+//   tread, alternate stations) and the rock-garden boulder stamps (r 0.22-0.56 m, 0.17-0.42 m
+//   proud). WHY: at the p50 design speed of 12.9 m/s a wheel leaves the ground above
+//   kappa = g/v^2 = 0.059 /m, which a 1 m-wavelength ripple reaches at an amplitude of
+//   1.5 mm. Committing the emitted cloud exactly threw the wheel off the ground at 37% of
+//   stations against 4% for the trail's own centreline; low-passing it gives 3.9%. If a
+//   feature is meant to be ridden over rather than filtered, trail.js must emit it at a
+//   scale a wheel can follow — the place to do that is the stamp radius and station
+//   spacing, not a deeper targetHeight on a small stamp.
+//   The consequence for `sampleDesign`: |sampleHeight - sampleDesign| at the emitted stamps
+//   is now p50 0.031 / p99 0.267 m where it was p50 0.007 / p99 0.090. That residual is the
+//   band limit doing its job, not the accumulator failing; it is measured at the stamps,
+//   which are exactly the points a low-pass is expected to miss.
+//
+// CONTRACT-NOTE (terrain → everyone, DETERMINISM): world generation is a pure function of
+//   `ctx.seed` and the quality settings. It used to size the hydraulic-erosion droplet budget
+//   from a wall-clock projection and silently drop to 50%/25% under machine load, so the same
+//   seed produced different mountains on different boots (measured: 2712.72 m vs 2694.02 m of
+//   trail, 13.4% vs 42.2% grade at the same arc length, from an unchanged tree). That is gone.
+//   `terrain.fingerprint()` hashes every generated field so determinism can be asserted rather
+//   than assumed. Nothing that feeds the world may read a clock — `Date.now()` appears in this
+//   file only to fill `timings`, which no generator reads.
 
 import * as THREE from 'three';
 import { createNoise2D } from 'simplex-noise';
@@ -178,10 +220,26 @@ const DF_CELL = 8;
 const DFN = Math.floor(WORLD / DF_CELL) + 1;
 const DF_FAR = 4096;
 
-// Erosion
+// ---------------------------------------------------------------------------
+// Erosion budget — a function of the quality tier, never of the clock
+//
+// passC() used to project elapsed wall-clock time at droplet 20 000 and, if the
+// machine looked slow, silently cut the budget to 50% or 25%. World generation
+// was therefore a function of MACHINE LOAD, in direct contradiction of CONTRACT
+// §0. Three boots of an unchanged tree produced 2712.72 m and 2694.02 m trails
+// and 13.4% vs 42.2% grade at the same arc length; every measurement taken
+// against this generator was taken against a world that moved underneath it.
+//
+// The budget is now chosen from the quality tier alone, and `high` — the
+// default — is the FULL budget, so the default world is the one the tuning was
+// meant to be measured against. If a machine genuinely cannot afford the pass
+// that is now an explicit, logged, opt-in setting (`settings.erosionDroplets`),
+// identical on every boot of that machine, rather than an implicit race.
+// ---------------------------------------------------------------------------
 const DROPLETS = 135000;
 const DROPLET_LIFE = 42;
-const EROSION_BUDGET_MS = 2000;
+// Fraction of DROPLETS by quality tier. Unknown tiers fall back to 'high'.
+const DROPLET_TIER = { low: 0.35, medium: 0.65, high: 1.0, ultra: 1.0 };
 
 // ---------------------------------------------------------------------------
 // Colour — everything authored sRGB, stored linear (CONTRACT §0)
@@ -296,6 +354,26 @@ export function createTerrain(ctx) {
   const settings = (ctx && ctx.settings) || {};
   const lodScale = typeof settings.terrainLOD === 'number' ? settings.terrainLOD : 1.0;
   const lowSpec = lodScale < 0.75;
+
+  // ---- droplet budget: seed + quality ONLY (see the DROPLET_TIER block) ----
+  // The tier key is `ctx.quality` when it names a known tier, otherwise it is
+  // derived from `terrainLOD` so a hand-rolled settings object still gets a
+  // stable, documented answer. Both are settings. Neither is a clock.
+  const dropletTier = (typeof ctx.quality === 'string' && DROPLET_TIER[ctx.quality] !== undefined)
+    ? ctx.quality
+    : (lodScale < 0.6 ? 'low' : lodScale < 0.9 ? 'medium' : 'high');
+  const dropletDefault = Math.round(DROPLETS * DROPLET_TIER[dropletTier]);
+  const dropletOverride = settings.erosionDroplets;
+  const dropletBudget = (typeof dropletOverride === 'number'
+    && isFinite(dropletOverride) && dropletOverride > 0)
+    ? Math.max(2000, Math.round(dropletOverride))
+    : dropletDefault;
+  if (dropletBudget !== dropletDefault) {
+    // Explicit and logged, per CONTRACT §0. A quiet degradation is exactly the
+    // failure this replaced.
+    console.info('[terrain] erosion droplet budget overridden by settings.erosionDroplets:',
+      dropletBudget, '(quality tier', dropletTier, 'default', dropletDefault + ')');
+  }
 
   // Independent noise fields. Order of construction is part of the seed contract.
   const nWarpA = createNoise2D(makeRng(subSeed(ctx.seed, 'terr-warpA')));
@@ -576,23 +654,11 @@ export function createTerrain(ctx) {
     const bn = bw.length;
     for (let b = 0; b < bn; b++) bw[b] /= wsum;
 
-    let total = Math.round(DROPLETS * (lowSpec ? 0.45 : 1));
-    const t0 = Date.now();
-    let checked = false;
+    // Fixed budget. Resolved once in createTerrain from the seed's quality tier
+    // and an explicit opt-in override — no wall-clock term anywhere in this loop.
+    const total = dropletBudget;
 
     for (let d = 0; d < total; d++) {
-      // Deterministic time guard: if this machine is far slower than expected we
-      // drop to a fixed fraction of the droplet budget rather than an arbitrary
-      // count, so the result stays reproducible in tiers.
-      if (!checked && d === 20000) {
-        checked = true;
-        const projected = (Date.now() - t0) * (total / 20000);
-        if (projected > EROSION_BUDGET_MS) {
-          total = projected > EROSION_BUDGET_MS * 2 ? Math.round(total * 0.25) : Math.round(total * 0.5);
-          if (total < 20000) total = 20000;
-        }
-      }
-
       let px = 2 + dropRng() * (RES - 5);
       let pz = 2 + dropRng() * (RES - 5);
       let dx = 0, dz = 0, speed = 1, water = 1, sed = 0;
@@ -659,6 +725,7 @@ export function createTerrain(ctx) {
       }
     }
     timings.droplets = total;
+    timings.dropletTier = dropletTier;
   }
 
   // -------------------------------------------------------------------------
@@ -1044,6 +1111,18 @@ export function createTerrain(ctx) {
   // Corridor distance field (metres to the trail centreline), 8 m grid.
   let corridorDF = null;
 
+  // ---- design-surface lookup ----------------------------------------------
+  // The stamp list and its prepared per-stamp data, kept after applyCarve so
+  // sampleDesign() can answer "what did the trail actually ask for here?".
+  // A CSR bin index over an 8 m grid keeps the lookup O(stamps in a few bins).
+  const DB_CELL = 8;
+  const DBN = Math.floor(WORLD / DB_CELL) + 1;
+  let designStamps = null;
+  let designPrep = null;
+  let designBinStart = null;
+  let designBinItem = null;
+  let designBinRing = 1;
+
   // -------------------------------------------------------------------------
   // Sampling — allocation-free. sampleField() writes _fh/_fgx/_fgz.
   //
@@ -1274,44 +1353,50 @@ export function createTerrain(ctx) {
   }
 
   /**
-   * Cross-section of a stamp at lateral offset `s` (metres, + = rider's right).
-   * `bank` is the cross-slope in radians; berms additionally get a parabolic outer
-   * wall so the section is genuinely banked and supportive, not a tilted plane.
+   * The DESIGN SURFACE one stamp declares at a point: a PLANE through the stamp,
+   * plus whatever section its `kind` adds.
+   *
+   *   `sRaw`   lateral offset, metres, + = rider's right
+   *   `along`  along-track offset, metres, + = downhill (the stamp's own tangent)
+   *   `gA`     along-track gradient of the tread, dY per metre along +tangent
+   *
+   * The per-kind section extras this function used to add are GONE, and their
+   * removal is load-bearing rather than a simplification. trail.js emits five
+   * stamps per station spanning the tread, so the cloud already describes the
+   * section it wants — including a berm's. Adding a berm parabola, or a rut
+   * trough, about EACH sample's own centre superimposed five offset copies of
+   * the feature and guaranteed that the five stamps of one station contradicted
+   * each other about the height at any given point. That contradiction is not
+   * resolvable downstream by any weighting, which is why attacking this from
+   * the stamp side did not close it. If a berm needs more support than the
+   * trail emitted, that belongs in trail.js's `targetHeight`, not bolted on
+   * here where terrain cannot know where the centreline is.
+   *
+   * MEASURED DEFECT this fixes: the stamp used to be a horizontal PLATEAU —
+   * `targetHeight` with no along-track term at all. A stamp asserts its section
+   * over +/-1.9 of its along-track reach, so on a 20% grade a single stamp was
+   * declaring a surface up to ~0.5 m off the trail's own descent at the ends of
+   * its own footprint. The accumulator then averaged a window of those plateaux,
+   * which low-passes the descent and leaves a ripple at the stamp spacing —
+   * the ~3 m wavelength measured inside the tread. With the along-track term
+   * present, every stamp that reaches a cell evaluates to (very nearly) the SAME
+   * height there, and a weighted mean of equal values is exact whatever the
+   * weights are. That is what makes the accumulator reproduce the section.
+   *
+   * Two authored terms were removed for the same reason. Bank was applied at
+   * 0.9x on tread/lip/landing/drop, and a -0.022*|s| outslope was subtracted:
+   * together ~0.11 m of systematic error at the edge of a banked 1.5 m tread,
+   * i.e. over the acceptance threshold on its own, and a silent contradiction of
+   * the bank the trail's lean identity was proved against. Water shedding is now
+   * carried by the ruts and the windrow, which are real ridden geometry.
    */
-  function stampTarget(st, sRaw, r) {
-    // Clamp just outside the tread: past that the shoulder term is easing the bench
-    // into the hillside, and a berm's parabola must not keep climbing out there.
+  function stampTarget(st, sRaw, r, along, gA, gL) {
+    // Clamp just outside the tread: past that the batter and the shoulder are
+    // easing the bench into the hillside, and the plane must not keep climbing
+    // out there.
     const lim = r * 1.15;
     const s = sRaw > lim ? lim : (sRaw < -lim ? -lim : sRaw);
-    const bank = st.bank || 0;
-    const tb = Math.tan(bank);
-    let y = st.targetHeight;
-    switch (st.kind) {
-      case 'berm': {
-        y += s * tb;
-        const outside = bank >= 0 ? (s > 0 ? s : 0) : (s < 0 ? s : 0);
-        // Rise curves up toward the outside; scaled by how hard the turn is banked.
-        y += outside * outside * 0.085 * clamp01(Math.abs(bank) * 3.2);
-        break;
-      }
-      case 'rut':
-        y += s * tb;
-        y -= 0.24 * Math.exp(-(s * s) / 0.55);
-        break;
-      case 'wallride':
-        y += s * tb;
-        y += Math.max(0, s) * Math.max(0, s) * 0.22;
-        break;
-      case 'lip':
-      case 'landing':
-      case 'drop':
-      case 'tread':
-      default:
-        y += s * tb * 0.9;
-        y -= Math.abs(s) * 0.022;   // slight outslope so the tread sheds water
-        break;
-    }
-    return y;
+    return st.targetHeight + gA * along + gL * s;
   }
 
   // ---- lateral noise on the carve width -----------------------------------
@@ -1350,12 +1435,6 @@ export function createTerrain(ctx) {
   const FILL_MAX = 0.7;          // max metres of fill before a bench goes full-cut
   const BATTER_RUN = 4.0;        // metres of cut/fill slope beyond the tread edge
   const BATTER_RELEASE = 2.8;    // metres over which it eases into the hillside
-  // The batter's weight in the target MEAN. The blend STRENGTH out on the batter
-  // has to reach 1 (see batterWeight), but if it also carried weight 1 in the
-  // mean then a stamp battering across a switchback's other leg would out-vote
-  // that leg's own tread. 0.12 lets the batter own cells no tread stamp reaches
-  // while leaving a real tread stamp an ~8:1 majority wherever they overlap.
-  const BATTER_MEAN_W = 0.12;
 
   /**
    * Batter the carve target outside the tread edge.
@@ -1393,16 +1472,18 @@ export function createTerrain(ctx) {
 
   /**
    * Blend strength for the batter region, as a function of metres outside the
-   * tread edge and the stamp's own along-track coordinate.
+   * tread edge. (The along-track release used to live in here as a second
+   * argument; it is now `alongGate`, applied by the caller, so that one function
+   * owns the along-track behaviour of every term.)
    *
    * The batter target is clamped against the natural ground, so applying it at
    * full strength is self-limiting: where the cut has already daylighted, the
    * target IS the natural ground and full strength changes nothing. That is what
-   * makes it safe to override `carveShape`'s outer ramp here — and it has to be
-   * overridden, because that ramp is what produced the wall. carveShape hands
-   * the shoulder only 0.28 of the way to its target at one radius and 0.08 at
-   * 1.5, so with the old flat target the ground out there stayed within a few
-   * percent of the untouched hillside and the bench simply ended in a face.
+   * makes it safe to override the outer cross-track ease here — and it has to be
+   * overridden, because that ease is what produced the wall: it handed the
+   * shoulder only a fraction of the way to its target, so with a flat target the
+   * ground out there stayed within a few percent of the untouched hillside and
+   * the bench simply ended in a face.
    *
    * The release is deliberately wide (2.8 m of a 4.0 m run): it is a lerp toward
    * the natural ground, so whatever cut has not daylighted by then is spread
@@ -1413,37 +1494,209 @@ export function createTerrain(ctx) {
    * Extending BATTER_RUN further is a straight trade against carve build time:
    * the stamp loop's footprint grows with its square.
    */
-  function batterWeight(over, uaAbs) {
-    if (over > BATTER_RUN || uaAbs >= 1.9) return 0;
+  function batterWeight(over) {
+    if (over > BATTER_RUN) return 0;
     let t = over <= BATTER_RUN - BATTER_RELEASE ? 1 : (BATTER_RUN - over) / BATTER_RELEASE;
-    const a = (1.9 - uaAbs) / 0.55;
-    if (a < t) t = a;
     if (t <= 0) return 0;
     if (t > 1) t = 1;
     return t * t * (3 - 2 * t);
   }
 
+  // -------------------------------------------------------------------------
+  // Committed vs design: the accumulator, and why it used to launch the bike
+  //
+  // MEASURED: the committed tread deviated from the emitted design surface by
+  // up to 0.4 m at a ~3 m wavelength, INSIDE the tread. Nineteen of twenty-one
+  // autopilot runs were airborne at the moment of their first crash.
+  //
+  // The accumulator used ONE radial falloff — carveShape(sqrt(ul^2 + ua^2)) —
+  // as both the along-track interpolation weight AND the strength with which
+  // the design surface replaces the natural hillside. Those are different jobs
+  // and the coupling is fatal. Take a cell at 70% of the tread half-width:
+  //
+  //     directly abeam a stamp   ua = 0     -> dn = 0.70 -> strength 0.65
+  //     halfway between two      ua = 0.59  -> dn = 0.91 -> strength 0.07
+  //
+  // (ua = 0.59 is the midpoint at the usual rl = 0.85 * spacing.) So the
+  // committed tread oscillated between 65% and 7% of the way from the hillside
+  // to the design surface, with a period equal to the stamp spacing — a
+  // scalloped ramp, in phase across the whole tread width, sitting under a bike
+  // doing 12 m/s. That is the ~3 m ripple, and the same collapse is why berms
+  // were built at roughly 22% of their authored height: a berm's outer wall is
+  // authored at 1.0-1.15 tread radii, where the radial falloff had nothing left.
+  //
+  // A tread is a RIBBON, not a disc. So:
+  //
+  //   crossStrength(t)      how far this cell is pulled to the design surface.
+  //                         Cross-track ONLY. 1 across the whole bench, easing
+  //                         off between the tread edge and 1.9 radii. Combined
+  //                         across stamps with max(), so overlapping stamps
+  //                         cannot dilute each other.
+  //   alongGate(u)          1 out to one along-track reach, released by 1.45.
+  //                         Multiplies the strength so the trail's two ends
+  //                         daylight, and does nothing in between — consecutive
+  //                         stamps' full-strength spans always overlap
+  //                         (see stampReach()).
+  //   alongKernel(u) *      weight in the target MEAN. Interpolation only; it
+  //   lateralMeanWeight(t)  can never reduce strength. Because every stamp now
+  //                         evaluates its plane AT THE CELL, the values being
+  //                         averaged agree, so the mean is exact regardless of
+  //                         the weights — the kernel only has to be smooth.
+  //
+  // `falloff` no longer shapes the tread core: a bench committed at anything
+  // less than full strength cannot equal the emitted section by construction.
+  // It shapes the ease outside the tread edge instead. See the CONTRACT-NOTE.
+  // -------------------------------------------------------------------------
+
+  const UA_FULL = 1.0;    // |along|/rl inside which a stamp asserts full strength
+  const UA_MAX = 1.45;    // ... and beyond which it asserts nothing
+  const CS_OUT = 1.9;     // |lat|/rw at which the cross-track ease reaches zero
+
+  /** Height blend strength across the section. t = |lat| / rw. */
+  function crossStrength(t, falloff) {
+    if (t >= CS_OUT) return 0;
+    if (t <= 1) return 1;
+    const a = (CS_OUT - t) / (CS_OUT - 1);
+    const s = a * a * (3 - 2 * a);
+    // falloff only shapes the ease outside the bench (see the note above).
+    const f = (falloff > 0.05 && falloff < 8) ? falloff : 1;
+    return f === 1 ? s : Math.pow(s, f);
+  }
+
+  /** Along-track gate on the strength. Flat inside UA_FULL, released by UA_MAX. */
+  function alongGate(u) {
+    if (u <= UA_FULL) return 1;
+    if (u >= UA_MAX) return 0;
+    const a = (UA_MAX - u) / (UA_MAX - UA_FULL);
+    return a * a * (3 - 2 * a);
+  }
+
+  /** Along-track interpolation kernel for the target MEAN. */
+  function alongKernel(u) {
+    if (u >= UA_MAX) return 0;
+    const a = 1 - u / UA_MAX;
+    return a * a * (3 - 2 * a);
+  }
+
+  // ---- the target mean is an INTERPOLANT, not a smoother -------------------
+  //
+  // With the plane fit in place the accumulator is doing scattered-data
+  // reconstruction of a point cloud, so the mean weight has to be peaked at the
+  // sample. A broad kernel — which is what a flat "weight 1 across the whole
+  // bench" is — box-filters the cloud over its entire support: measured on seed
+  // 1337, a ~2.7 x 2.0 m patch, which smoothed the emitted tread's own
+  // curvature into a p90 residual of 0.166 m even after every stamp had been
+  // made to agree about the plane.
+  //
+  // This is Shepard weighting over the per-stamp planes — equivalently a moving
+  // least-squares reconstruction with precomputed local fits. It is singular at
+  // the sample, so the committed surface passes through every emitted stamp
+  // height exactly, and it is smooth between samples because the things being
+  // blended are planes rather than constants (plain Shepard over values would
+  // put a flat spot at every node; Shepard over planes does not).
+  //
+  // The cap bounds the dynamic range. Targets are accumulated as OFFSETS from
+  // the natural ground rather than as absolute elevations (see applyCarve), so
+  // the largest single product is ~1.6e3 against a Float32 mantissa good to one
+  // part in 1e7 — i.e. sub-millimetre, where accumulating 1700 m elevations at
+  // weight 160 would have been good to about 10 cm.
+  // SHEP_POWER note. The kernel is the square of the usual Franke-Little form,
+  // i.e. ((1-r)^2 / r^2)^2. The unsquared kernel leaves the nearest emitted
+  // sample only ~50% of the total weight at a cell halfway between samples, so
+  // the committed surface is a genuine blend of three or four neighbouring
+  // planes and inherits their disagreement. Measured on the self-consistent
+  // 90% of the tread, seed 1337:
+  //     unsquared   p50 0.029  p90 0.129  p99 0.270  max 0.727
+  //     squared     see the residual report in the QA notes
+  // Squaring raises the nearest sample to ~85% and is still C1 in rho.
+  // Measured, self-consistent tread (covering stamps agreeing within 0.5 m),
+  // seed 1337, before and after squaring — the two are not directly comparable
+  // because aligning sampleDesign's own nearest-stamp test to the same rho
+  // landed in between, so the honest summary is the final matrix in the QA
+  // notes: p50 0.014, p90 0.062, p95 0.094, p99 0.214 over the whole tread, and
+  // p99 0.077 wherever the emitted stamps agree with each other to 0.15 m.
+  const MEAN_CAP = 2000;
+  const SHEP_EPS = 1 / 45;   // softens the singularity at the sample itself
+  const RHO_MAX = 1.25;      // normalised radius at which a stamp stops voting
+  // A floor, so cells reached only by the shoulder or by the batter — where no
+  // stamp is anywhere near — still have a target to be pulled toward.
+  //
+  // It has to be SMALL, and the reason is a counting argument rather than a
+  // taste one. A battered tread stamp reaches ~5.7 m laterally, so where a
+  // switchback folds back on itself, thirty-odd stamps of the OTHER leg reach a
+  // cell on this leg's tread and each casts a floor-weight vote for a surface
+  // metres away. The legitimate near stamp carries a Shepard weight of ~6 at a
+  // typical tread cell (the nearest emitted sample is ~0.3 m away). At a floor
+  // of 0.012 those thirty votes summed to ~0.42 — 7% of the total — which on a
+  // 5 m height difference between the legs is 0.35 m of committed error, and it
+  // was the largest single term left in the residual. 5e-4 puts it at 0.3%.
+  const MEAN_FLOOR = 5e-4;
+
+  function shepard(rho) {
+    if (rho >= 1) return 0;
+    const g = 1 - rho;
+    const w = (g * g) / (rho * rho + SHEP_EPS);
+    const w4 = w * w;                     // sharpened — see SHEP_POWER note
+    return w4 > MEAN_CAP ? MEAN_CAP : w4;
+  }
+
+  /**
+   * Along-track reach of a stamp, in metres.
+   *
+   * The full-strength spans of consecutive stamps must overlap or the tread
+   * develops a strength notch between every pair, which is the defect this file
+   * is fixing. That needs `rl >= spacing / 2` unconditionally, so the third term
+   * is a floor and not, as before, a term inside a min().
+   */
+  function stampReach(r, spacing) {
+    const sp = spacing > 0 ? spacing : 0;
+    let rl = r;
+    const a = Math.min(r * 3, sp * 0.85);
+    if (a > rl) rl = a;
+    const b = Math.min(r * 8, sp * 0.55);
+    if (b > rl) rl = b;
+    return rl;
+  }
+
+  /**
+   * Tread half-width at a point, including the world-space lateral jitter.
+   * A function of world position only, so every stamp agrees on it and the
+   * accumulator stays independent of the order stamps arrive in.
+   */
+  function jitterRadius(r, latAbs, x, z) {
+    if (latAbs >= r * 2.2) return r;
+    const jf = latAbs < r * 1.4 ? 1 : (r * 2.2 - latAbs) / (r * 0.8);
+    return r * (1 + (carveWidth(x, z) - 1) * jf);
+  }
+
   // Per-cell stamp evaluation, shared by the global and detail carve loops so
   // the two fields cannot drift apart. Results go into module-scope scalars —
   // this runs tens of millions of times and must not allocate.
-  let _scTarget = 0, _scW = 0, _scWH = 0, _scWM = 0, _scRW = 0;
+  let _scTarget = 0, _scW = 0, _scWH = 0, _scWM = 0, _scInner = 0, _scAg = 0;
+  let _scLatCL = 0;
 
   /**
    * Evaluate one stamp at one cell. Returns false if the cell is outside this
-   * stamp's influence, otherwise writes _scTarget / _scW / _scWH / _scWM / _scRW.
-   *   _scW  — carve shape weight: material paint, carveU8, micro-relief gates
-   *   _scWM — weight in the height target MEAN
-   *   _scWH — blend STRENGTH (max over stamps)
+   * stamp's influence, otherwise writes the module-scope scalars:
+   *   _scTarget — the design height this stamp declares here
+   *   _scW      — paint/carve MASK (material, carveU8, splat, vegetation
+   *               exclusion). Deliberately still the old radial carveShape, so
+   *               nothing downstream of the paint changes behaviour.
+   *   _scWH     — height blend STRENGTH, combined across stamps with max()
+   *   _scWM     — weight in the height target MEAN
+   *   _scInner  — ridden-microrelief gate (cross-track only, x along-track gate)
+   *   _scAg     — the along-track gate on its own
+   *   _scLatCL  — lateral offset from the ribbon CENTRELINE (not this stamp's
+   *               axis); the coordinate the microrelief is keyed on
    */
-  function stampCell(st, lat, along, r, rl, x, z, batterKind, hNat) {
+  function stampCell(st, lat, along, r, rl, x, z, batterKind, hNat, gA, gL, latOff, halfW) {
     const uaAbs = (along < 0 ? -along : along) / rl;
-    if (uaAbs >= 1.9) return false;
+    if (uaAbs >= UA_MAX) return false;
     const latAbs = lat < 0 ? -lat : lat;
     const rMax = r * RW_MAX;
-    const ur = lat / rMax;
-    // Cheap reject. `ur` uses the widest the jittered tread can be, so
-    // ur^2 + ua^2 >= 3.61 implies dn >= 1.9 and cannot false-reject.
-    if (ur * ur + uaAbs * uaAbs >= 3.61
+    // Cheap reject. `rMax` is the widest the jittered tread can be, so
+    // latAbs >= rMax * CS_OUT implies t >= CS_OUT and cannot false-reject.
+    if (latAbs >= rMax * CS_OUT
         && !(batterKind && latAbs <= rMax + BATTER_RUN)) return false;
 
     // Lateral noise on the cut width: the carve radius was a constant per stamp,
@@ -1452,25 +1705,41 @@ export function createTerrain(ctx) {
     // run so the batter geometry cannot inherit a step where the fade ends, and
     // a function of world position only, so overlapping stamps agree on it and
     // the accumulator stays independent of the order stamps arrive in.
-    let rw = r;
-    if (latAbs < r * 2.2) {
-      const jf = latAbs < r * 1.4 ? 1 : (r * 2.2 - latAbs) / (r * 0.8);
-      rw = r * (1 + (carveWidth(x, z) - 1) * jf);
-    }
+    const rw = jitterRadius(r, latAbs, x, z);
 
     const ul = lat / rw, ua = along / rl;
-    const dn = Math.sqrt(ul * ul + ua * ua);
-    const w = carveShape(dn, st.falloff);
-    let target = stampTarget(st, lat, rw);
-    let wh = w, wm = w;
+    const t = ul < 0 ? -ul : ul;
+    const ag = alongGate(uaAbs);
+
+    let target = stampTarget(st, lat, rw, along, gA, gL);
+    let wh = crossStrength(t, st.falloff) * ag;
+    let wm = shepard(Math.sqrt(t * t + uaAbs * uaAbs) / RHO_MAX);
+    const wFloor = MEAN_FLOOR * alongKernel(uaAbs);
+    if (wFloor > wm) wm = wFloor;
     if (batterKind) {
       target = batter(target, hNat, latAbs - rw);
-      const bw = batterWeight(latAbs - rw, uaAbs);
+      const bw = batterWeight(latAbs - rw) * ag;
       if (bw > wh) wh = bw;
-      wm += bw * BATTER_MEAN_W;
     }
+    // wm can only be large where wh is 1 (a large Shepard weight needs both a
+    // small cross-track and a small along-track offset, which is exactly where
+    // crossStrength and alongGate are both saturated), so this one test is
+    // enough — there is no case where a stamp has a real vote and no strength.
     if (wh <= 0.002) return false;
-    _scTarget = target; _scW = w; _scWH = wh; _scWM = wm; _scRW = rw;
+
+    // Paint mask keeps the old radial shape — see the field list above.
+    _scW = carveShape(Math.sqrt(ul * ul + ua * ua), st.falloff);
+    // The ridden microrelief belongs to the bench and is measured from the
+    // ribbon CENTRELINE, not from this stamp's own axis (see the CENTRELINE
+    // COORDINATE note). It is also gated across the track rather than
+    // radially: gating it on the radial mask made the ruts and braking bumps
+    // fade out between every pair of stamps, which is another (smaller)
+    // along-track ripple at exactly the stamp spacing.
+    _scLatCL = lat + latOff;
+    const tc = (_scLatCL < 0 ? -_scLatCL : _scLatCL) / halfW;
+    _scInner = (1 - smoothstep(0.72, 1.0, tc)) * ag;
+    _scAg = ag;
+    _scTarget = target; _scWH = wh; _scWM = wm;
     return true;
   }
 
@@ -1480,6 +1749,22 @@ export function createTerrain(ctx) {
   // they ever reached a vertex. The r3 review measured the tread varying LESS
   // across the track than down it (0.57-0.99, where a ridden line reads
   // 1.5-2.5), i.e. isotropic noise rather than a line.
+  //
+  // WHAT SURVIVES THE LOW-PASS. commitDetail() low-passes the committed target
+  // at TREAD_LP_SIGMA = 0.555 m, so every term here is authored on the far side
+  // of a filter. A Gaussian feature of width sigma_f survives at
+  // sigma_f / sqrt(sigma_f^2 + sigma_lp^2) of its authored amplitude:
+  //     ruts    sigma_f 0.33 -> 0.51   committed ~0.056 m, widened to sigma 0.64
+  //     windrow sigma_f 0.22 -> 0.37   committed ~0.028 m
+  // PRE-EMPHASIS WAS TRIED AND REJECTED. Authoring 0.215 / 0.20 to commit the
+  // asked-for 0.11 / 0.075 works — the committed depth comes back — but the
+  // deeper trough moves the CENTRELINE down by an extra 37 mm, modulated by the
+  // rut wander (74 m) and the tread half-width, and that lands in the long
+  // bands: 6-20 m spurious/design went 0.07 -> 0.11 and 20-60 m 0.04 -> 0.06,
+  // i.e. straight through the ceiling this file is held to. The wheel test also
+  // went 3.87% -> 4.95%. A shallower, wider ridden channel is the cheaper trade.
+  // The braking bumps and the loose-rock chatter are filtered away outright —
+  // see the note on each.
   const RUT_DEPTH = 0.11;        // metres (work order: 0.08-0.15)
   // sigma 0.33 m rather than the work order's 0.35: FWHM 0.78 m is 2.2 detail
   // samples and 1.6 render vertices, still comfortably reconstructable, and the
@@ -1490,7 +1775,68 @@ export function createTerrain(ctx) {
   const RUT_HALF = 0.62;         // half the track separation: 1.24 m apart
   const WINDROW = 0.075;         // berm of displaced material at the tread margin
   const WINDROW_SIG2 = 2 * 0.22 * 0.22;
+  // Braking bumps: 0.085 m at a 1.15 m period is kappa = 2.5 /m, forty times the
+  // 0.059 /m a wheel can hold at the p50 design speed. They are a launcher by
+  // construction and the low-pass removes 99% of them (transfer exp(-2 pi^2
+  // sigma^2 / L^2) = 0.011 at L = 1.15 m). The constant is left at its authored
+  // value rather than zeroed so that the term reappears intact if the filter is
+  // ever narrowed; nothing here is tuned to a filtered amplitude.
   const BRAKE_BUMP = 0.085;      // metres (work order: 0.06-0.12)
+
+  /**
+   * The ridden-tread microrelief, as a height DELTA on the design plane.
+   *
+   * Shared by the detail-overlay accumulator and by sampleDesign(), so the
+   * reference surface a QA pass measures against is literally the same code the
+   * carve commits — a residual measured against a re-implementation would only
+   * be measuring the re-implementation.
+   *
+   * Every term is a function of the point and the arc coordinate, never of
+   * *which* stamp is asking. The two noise fields used to take `st.x` as their
+   * second coordinate, so consecutive stamps drew slightly different rut wander
+   * and braking-bump phase at the same cell and the accumulator averaged the
+   * difference away — one more source of stamp-spacing ripple.
+   */
+  function treadMicro(st, isTread, latCL, halfW, sArc, inner, brake, x, z, ag) {
+    let d = 0;
+    // Windrow — the material the tyres have pushed out, sitting as a low berm
+    // along both tread margins. Nothing was producing this at all, and it is
+    // the single largest across-track gradient on a ridden trail. It sits at
+    // the tread MARGIN, so it must not be gated on an inside-the-tread term.
+    if (isTread) {
+      const e = (latCL < 0 ? -latCL : latCL) - halfW * 1.05;
+      d += WINDROW * Math.exp(-(e * e) / WINDROW_SIG2) * ag;
+    }
+    if (inner <= 0) return d;
+    // Two tyre ruts. Amplitude 0.028 -> 0.11 m and sigma 0.13 -> 0.33 m: below
+    // that the feature is one detail sample wide and is filtered away before it
+    // reaches a vertex, which is why the tread measured as isotropic noise
+    // (across/along gradient 0.57-0.99 where a ridden line reads 1.5-2.5). The
+    // pair is 1.24 m apart so the crown between them survives the wider sigma,
+    // and the line wanders +/-0.22 m over a ~74 m wavelength so it is a ridden
+    // line and not a machined groove.
+    if (isTread) {
+      const wander = nMicro(sArc * 0.085, 311.0) * 0.22;
+      const dl = latCL - (RUT_HALF + wander);
+      const dr = latCL + (RUT_HALF - wander);
+      d -= RUT_DEPTH * (Math.exp(-(dl * dl) / RUT_SIG2) + Math.exp(-(dr * dr) / RUT_SIG2)) * inner;
+    }
+    // Braking bumps: transverse ripples that build on steep entries.
+    if (brake > 0) {
+      const jitter = nMicro(sArc * 0.09, 57.0) * 0.5;
+      const ripple = Math.sin((sArc / 1.15 + jitter) * Math.PI * 2) * 0.5 + 0.5;
+      const across = 1 - clamp01((latCL < 0 ? -latCL : latCL) / (halfW * 0.8));
+      d -= BRAKE_BUMP * brake * ripple * across * inner;
+    }
+    // Loose rock / roots keep their chatter even after the cut.
+    const mm = st.material;
+    if (mm === Surface.ROCK || mm === Surface.GRAVEL || mm === Surface.ROOT) {
+      const chat = nMicro(x * 1.9 + 3.0, z * 1.9 - 6.0) * 0.6
+                 + nMicro(x * 5.3 - 12.0, z * 5.3 + 8.0) * 0.4;
+      d += chat * (mm === Surface.ROCK ? 0.075 : 0.045) * inner;
+    }
+    return d;
+  }
 
   /** Per-stamp working data: unit tangent (downhill), arc length, local grade. */
   function prepareStamps(stamps) {
@@ -1500,15 +1846,41 @@ export function createTerrain(ctx) {
     const arc = new Float32Array(n);
     const grade = new Float32Array(n);
     const spacing = new Float32Array(n);
+    // Along-track gradient of the tread (dY per metre along +tangent). See
+    // stampTarget(): without this every stamp declares a horizontal plateau.
+    const slope = new Float32Array(n);
 
-    // Spatial bins so the PCA neighbourhood search stays O(n). The trail can hand
-    // us tens of thousands of stamps, so the per-stamp neighbourhood is also capped:
-    // 20 samples is far more than a principal axis needs, and without the cap a
-    // densely-stamped trail turns this into an O(n * density) blow-up.
-    const MAXN = 20;
-    const nbX = new Float64Array(MAXN);
-    const nbZ = new Float64Array(MAXN);
-    const nbH = new Float64Array(MAXN);
+    // Cross-track gradient of the tread (dY per metre to the rider's right),
+    // fitted from the emitted stamp heights rather than taken from `bank` —
+    // see the PLANE FIT note below.
+    const cross = new Float32Array(n);
+    // -----------------------------------------------------------------------
+    // CENTRELINE COORDINATE — why the ridden microrelief needs one
+    //
+    // trail.js emits five stamps per station, offset roughly 0, +/-0.87 and
+    // +/-1.49 m across the tread. Every stamp measures `lat` from ITS OWN axis,
+    // so a rut pair authored at +/-0.62 m lands at +/-0.62 m from the CENTRE
+    // stamp, at +0.25/+1.49 m from the first lateral, at +0.87/+2.11 m from the
+    // second, and so on: ten rut lines across a three-metre tread, from a
+    // feature that is supposed to be two. The windrow, which sits at 1.05 tread
+    // radii, was scattered the same way. The accumulator then averaged the
+    // disagreement, which both erased the feature and left the residue as
+    // across-track error — measured 0.257 m at p90 in the outer quarter of the
+    // tread against 0.067 m at the centre.
+    //
+    // `latOff` is each stamp's own lateral offset from the local ribbon
+    // centroid, so `lat + latOff` is a coordinate every stamp of a station
+    // agrees on. `halfW` is the widest carve radius at the station, which is
+    // the ribbon half-width the microrelief should be scaled against. The
+    // centroid is accumulated in world space and so needs no tangent, which
+    // keeps it in the same single traversal as everything else.
+    // -----------------------------------------------------------------------
+    const latOff = new Float32Array(n);
+    const halfW = new Float32Array(n);
+    const CEN_R2 = 1.8 * 1.8;
+    const CEN_K = 1 / (2 * 1.1 * 1.1);
+
+    // Spatial bins so the neighbourhood search stays O(n).
     const BIN = 8;
     const bins = new Map();
     const binKey = (x, z) => (Math.floor((z - minZ) / BIN) * 4096 + Math.floor((x - minX) / BIN));
@@ -1520,40 +1892,118 @@ export function createTerrain(ctx) {
       list.push(i);
     }
 
-    // 6.5 m: wide enough to fix a tangent, tight enough that a switchback's other
-    // leg does not contaminate the principal axis.
-    const R2 = 6.5 * 6.5;
+    // -----------------------------------------------------------------------
+    // THE PLANE FIT — what "the cross-section the trail emits" actually is
+    //
+    // trail.js emits FIVE stamps per station: a centre at r ~1.6 and four
+    // laterals at r ~1.05, offset roughly +/-0.87 and +/-1.49 m, each with its
+    // own `targetHeight` sampled on the tread at ITS OWN position and its own
+    // `bank`. Stations are ~0.40 m apart. Measured on seed 1337: 58 173 stamps,
+    // 36 797 of them 'berm'.
+    //
+    // Two facts about that emission decide how the accumulator has to work.
+    //
+    // 1. The stamps are SAMPLES of one ribbon, not five independent sections.
+    //    A stamp's `targetHeight` is the tread height at its own position, so
+    //    the surface the trail is asking for is the surface THROUGH THE POINT
+    //    CLOUD. Treating each stamp as an authority over its whole footprint
+    //    and averaging the results is the wrong operation on a point cloud.
+    //
+    // 2. The `bank` field does not agree with the cloud. Fitting the cloud's
+    //    own cross-slope and comparing it against tan(bank), over 1 557 banked
+    //    stamps on seed 1337:
+    //
+    //      |tan(bank)|   fitted cross-slope / tan(bank), p50
+    //        0.05-0.15                    0.62
+    //        0.15-0.30                    0.38
+    //        0.30-0.60                    0.58
+    //        0.60-2.00                    0.59
+    //
+    //    i.e. the emitted heights carry roughly HALF the declared bank, and the
+    //    disagreement reaches 0.34 m of height at the tread edge (p50) and
+    //    0.80 m (p90) on the hardest-banked stamps. Applying `s * tan(bank)`
+    //    about each stamp's own centre — which is what this file used to do —
+    //    therefore made every stamp declare a different height at the same
+    //    point, up to 0.67 m apart, and the accumulator averaged the argument.
+    //    That is the bulk of the measured 0.4 m tread deviation, and it is why
+    //    attacking it from the stamp side did not close it: no per-stamp offset
+    //    can reconcile stamps that contradict each other.
+    //
+    // So the plane is FITTED, not declared: for each stamp, a weighted
+    // least-squares fit of its neighbours' emitted heights against their world
+    // offsets, anchored to pass exactly through the stamp's own emitted point.
+    // The fit is done in world (x, z) — a plane is axis-independent — and then
+    // projected onto the tangent/right frame, so the tangent estimate cannot
+    // contaminate the gradient. `bank` still shapes the berm's outer wall and
+    // still decides which side of the tread is the outside; it no longer sets
+    // the base plane.
+    //
+    // Result: every stamp within a station, and consecutive stations, evaluate
+    // to very nearly the SAME height at any given cell. A weighted mean of
+    // equal values is exact whatever the weights are — which is what finally
+    // lets the accumulator reproduce the emitted section.
+    //
+    // FIT_R / FIT_SIG: 2.2 m of support with a 1.05 m Gaussian. Wide enough to
+    // span the full 3 m lateral spread of a station and ~5 stations along, tight
+    // enough that a jump lip's curvature is not fitted away (a 4+ m support
+    // measured a 0.30 m p90 disagreement between the fitted intercept and the
+    // stamp's own height; anchoring plus a tight support removes that question).
+    // -----------------------------------------------------------------------
+    const R2 = 6.5 * 6.5;          // tangent support (principal axis)
+    const FIT_R2 = 2.2 * 2.2;      // plane-fit support
+    const FIT_K = 1 / (2 * 1.05 * 1.05);
     for (let i = 0; i < n; i++) {
       const st = stamps[i];
       const bx = Math.floor((st.x - minX) / BIN);
       const bz = Math.floor((st.z - minZ) / BIN);
       let sxx = 0, sxz = 0, szz = 0, count = 0;
-      let gLo = st.targetHeight, gHi = st.targetHeight, gDist = 1;
+      let ox = 0, oz = 0;                       // orientation sums
+      let fxx = 0, fxz = 0, fzz = 0, fxh = 0, fzh = 0, fitN = 0;
+      let cw = 1, cwx = 0, cwz = 0;             // ribbon centroid (self weighted 1)
+      let wide = Math.max(0.6, st.radius || 2);  // widest carve at this station
       let nearest2 = Infinity;
+      const h0 = st.targetHeight;
 
-      outer:
-      for (let oz = -1; oz <= 1; oz++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const list = bins.get((bz + oz) * 4096 + (bx + ox));
+      for (let bjo = -1; bjo <= 1; bjo++) {
+        for (let bio = -1; bio <= 1; bio++) {
+          const list = bins.get((bz + bjo) * 4096 + (bx + bio));
           if (!list) continue;
-          // Stride rather than truncate: bin lists are in stamp order, so an evenly
-          // spread sample spans the trail segment in that bin and gives a stable
-          // principal axis. Taking the first N would bias the axis to one side.
-          const stride = list.length > 7 ? Math.ceil(list.length / 7) : 1;
-          for (let m = 0; m < list.length; m += stride) {
+          for (let m = 0; m < list.length; m++) {
             const jj = list[m];
             if (jj === i) continue;
             const o = stamps[jj];
             const dx = o.x - st.x, dz = o.z - st.z;
             const d2 = dx * dx + dz * dz;
-            if (d2 > R2 || d2 < 1e-6) continue;
+            if (d2 > R2 || d2 < 1e-8) continue;
+            const dh = o.targetHeight - h0;
+            // Height-plausibility gate. Where a switchback folds back on itself
+            // the two legs pass within a couple of metres in plan and several
+            // metres apart in height, and everything below — the tangent, the
+            // plane fit and the ribbon centroid — would otherwise be computed
+            // across BOTH legs. Measured consequence before this gate: fitted
+            // cross-slopes pinned at the 58 deg clamp, and a 2.35 m committed
+            // error at the two switchbacks on seed 1337 (x ~ -78 z ~ -472 and
+            // x ~ 5 z ~ -341), which were the largest residuals in the run.
+            // 0.8 * distance + 0.3 m admits a 40% grade and a 45 deg berm over
+            // the whole support and rejects a leg 3 m below this one.
+            const dhAbs = dh < 0 ? -dh : dh;
+            if (dhAbs > 0.8 * Math.sqrt(d2) + 0.3) continue;
             if (d2 < nearest2) nearest2 = d2;
             sxx += dx * dx; sxz += dx * dz; szz += dz * dz;
-            nbX[count] = dx; nbZ[count] = dz; nbH[count] = o.targetHeight;
+            ox -= dh * dx; oz -= dh * dz;
             count++;
-            if (o.targetHeight < gLo) { gLo = o.targetHeight; gDist = Math.sqrt(d2); }
-            if (o.targetHeight > gHi) gHi = o.targetHeight;
-            if (count >= MAXN) break outer;
+            if (d2 <= FIT_R2) {
+              const w = Math.exp(-d2 * FIT_K);
+              fxx += w * dx * dx; fxz += w * dx * dz; fzz += w * dz * dz;
+              fxh += w * dx * dh; fzh += w * dz * dh;
+              fitN++;
+            }
+            if (d2 <= CEN_R2) {
+              const w = Math.exp(-d2 * CEN_K);
+              cw += w; cwx += w * dx; cwz += w * dz;
+              const rj = Math.max(0.6, o.radius || 2);
+              if (rj > wide) wide = rj;
+            }
           }
         }
       }
@@ -1564,11 +2014,7 @@ export function createTerrain(ctx) {
         const theta = 0.5 * Math.atan2(2 * sxz, sxx - szz);
         tx = Math.cos(theta); tz = Math.sin(theta);
         // Orient downhill: sum of (this - neighbour height) * (offset . tangent).
-        let orient = 0;
-        for (let m = 0; m < count; m++) {
-          orient += (st.targetHeight - nbH[m]) * (nbX[m] * tx + nbZ[m] * tz);
-        }
-        if (orient < 0) { tx = -tx; tz = -tz; }
+        if (ox * tx + oz * tz < 0) { tx = -tx; tz = -tz; }
       } else {
         // Isolated stamp: fall back to the local fall line.
         sampleField(st.x, st.z);
@@ -1576,13 +2022,47 @@ export function createTerrain(ctx) {
         if (gl > 1e-4) { tx = -_fgx / gl; tz = -_fgz / gl; } else { tx = 0; tz = -1; }
       }
       tanX[i] = tx; tanZ[i] = tz;
-      grade[i] = clamp01((gHi - gLo) / Math.max(1, gDist));
+
+      // Solve the anchored 2x2 normal equations for the world-space gradient.
+      // `det` is the neighbourhood's weighted second-moment determinant; a
+      // near-singular one means the neighbours are collinear (a station with no
+      // along-track partners, or a lone lateral), in which case the gradient in
+      // the unobserved direction is not recoverable and the declared bank is the
+      // only information there is.
+      let gA = 0, gL = Math.tan(st.bank || 0);
+      const det = fxx * fzz - fxz * fxz;
+      if (fitN >= 3 && det > 1e-4) {
+        const b = (fzz * fxh - fxz * fzh) / det;
+        const c = (fxx * fzh - fxz * fxh) / det;
+        gA = b * tx + c * tz;
+        gL = b * -tz + c * tx;
+      }
+      // Bounds. 45 deg along track (the steepest authored chute is ~35% and a
+      // jump lip steeper still) and 50 deg across it (a steep berm). Past those
+      // the estimator is reading a switchback, not a section.
+      if (gA > 1.0) gA = 1.0; else if (gA < -1.0) gA = -1.0;
+      if (gL > 1.2) gL = 1.2; else if (gL < -1.2) gL = -1.2;
+      slope[i] = gA;
+      cross[i] = gL;
+      // Offset of this stamp from the local ribbon centroid, measured to the
+      // rider's right. `lat + latOff` is then a coordinate every stamp of a
+      // station agrees on; see the CENTRELINE COORDINATE note above.
+      const cnx = cwx / cw, cnz = cwz / cw;
+      let lo = -(cnx * -tz + cnz * tx);
+      // A centroid is only meaningful if it is drawn from a laterally spread
+      // neighbourhood. Bound it at one station half-width so a degenerate
+      // neighbourhood cannot throw the microrelief metres off the tread.
+      if (lo > wide) lo = wide; else if (lo < -wide) lo = -wide;
+      latOff[i] = lo;
+      halfW[i] = wide;
+      // Local steepness, for the braking bumps. The fitted along-track gradient
+      // is a direct and much less noisy answer than the old (max - min) / range
+      // over the neighbourhood, which a single outlying stamp could dominate.
+      grade[i] = clamp01(gA < 0 ? -gA : gA);
       // Along-trail reach. If the trail hands us stamps further apart than their
       // radius, circular stamps would leave a plateau-and-riser staircase in the
       // tread; stretching each stamp along its tangent to cover the gap makes
       // consecutive targets blend into a continuous ramp instead.
-      // Array-order neighbours give the exact gap for sequentially-emitted stamps;
-      // the (strided, so approximate) spatial nearest is only the fallback.
       let gap = Infinity;
       if (i > 0) {
         const d = Math.hypot(stamps[i - 1].x - st.x, stamps[i - 1].z - st.z);
@@ -1597,17 +2077,26 @@ export function createTerrain(ctx) {
     }
 
     // Arc length by array order, restarting whenever the trail jumps.
+    //
+    // Advanced by the ALONG-TRACK component only. trail.js emits several stamps
+    // per station (a centre plus laterals), and counting their lateral
+    // separation as arc length made `sArc` disagree by up to a metre between
+    // stamps that share a station — which put the rut wander and the
+    // braking-bump phase out of step from one stamp to the next, so the
+    // accumulator averaged them towards nothing and left a ripple at the stamp
+    // spacing. The braking-bump period is 1.15 m, so a 0.5 m disagreement is
+    // very nearly antiphase.
     let a = 0;
     for (let i = 0; i < n; i++) {
       if (i > 0) {
         const dx = stamps[i].x - stamps[i - 1].x;
         const dz = stamps[i].z - stamps[i - 1].z;
         const d = Math.sqrt(dx * dx + dz * dz);
-        a = d < 30 ? a + d : 0;
+        a = d < 30 ? a + (dx * tanX[i] + dz * tanZ[i]) : 0;
       }
       arc[i] = a;
     }
-    return { tanX, tanZ, arc, grade, spacing };
+    return { tanX, tanZ, arc, grade, spacing, slope, cross, latOff, halfW };
   }
 
   /** Chamfer distance transform → metres from the trail centreline, on an 8 m grid. */
@@ -1807,6 +2296,310 @@ export function createTerrain(ctx) {
     }
   }
 
+  /**
+   * CSR bin index over the stamp list, so sampleDesign() does not have to scan
+   * tens of thousands of stamps per query.
+   */
+  function buildDesignIndex(list, prep) {
+    const cells = DBN * DBN;
+    const start = new Int32Array(cells + 1);
+    const cellOf = new Int32Array(list.length);
+    let maxReach = DB_CELL;
+    for (let s = 0; s < list.length; s++) {
+      const st = list[s];
+      let i = Math.floor((st.x - minX) / DB_CELL);
+      let j = Math.floor((st.z - minZ) / DB_CELL);
+      if (i < 0) i = 0; else if (i > DBN - 1) i = DBN - 1;
+      if (j < 0) j = 0; else if (j > DBN - 1) j = DBN - 1;
+      const c = j * DBN + i;
+      cellOf[s] = c;
+      start[c + 1]++;
+      const r = Math.max(0.6, st.radius || 2);
+      const reach = Math.max(r * RW_MAX, stampReach(r, prep.spacing[s]) * UA_FULL);
+      if (reach > maxReach) maxReach = reach;
+    }
+    for (let c = 0; c < cells; c++) start[c + 1] += start[c];
+    const item = new Int32Array(list.length);
+    const cursor = new Int32Array(cells);
+    for (let s = 0; s < list.length; s++) {
+      const c = cellOf[s];
+      item[start[c] + cursor[c]] = s;
+      cursor[c]++;
+    }
+    designBinStart = start;
+    designBinItem = item;
+    designBinRing = Math.max(1, Math.ceil(maxReach / DB_CELL));
+    designStamps = list;
+    designPrep = prep;
+  }
+
+  // Stable result object so sampleDesign() allocates nothing when reused.
+  const _designOut = {
+    ok: false, height: 0, plane: 0, micro: 0, lateral: 0, treadFrac: 0, along: 0,
+    width: 0, stamp: -1, kind: null, bank: 0, material: -1, spread: 0,
+  };
+
+  /**
+   * The design surface the trail emitted at (x, z) — the reference the
+   * committed heightfield is measured against.
+   *
+   * Returns `out.ok === false` for any point that is not inside some stamp's
+   * tread (|lat| <= the jittered half-width, |along| within one along-track
+   * reach). Where it is true, `out.height` is the design tread height there:
+   * the emitting stamp's plane, its kind's section, and the ridden microrelief
+   * — produced by exactly the same functions the accumulator commits, so a
+   * residual measured against it is a measurement of the ACCUMULATOR and not of
+   * a re-implementation of the design.
+   *
+   * Nearest-station selection: on a self-consistent trail every stamp covering
+   * a cell evaluates to the same height there, so which one answers matters
+   * only to the extent that the trail disagrees with itself — which is a useful
+   * thing for a residual to expose rather than to hide.
+   */
+  function sampleDesign(x, z, out) {
+    const o = out || _designOut;
+    o.ok = false; o.height = 0; o.plane = 0; o.micro = 0;
+    o.lateral = 0; o.treadFrac = 0; o.along = 0;
+    o.width = 0; o.stamp = -1; o.kind = null; o.bank = 0; o.material = -1;
+    o.spread = 0;
+    if (!designStamps || designStamps.length === 0 || !designBinStart) return o;
+
+    const bi = Math.floor((x - minX) / DB_CELL);
+    const bj = Math.floor((z - minZ) / DB_CELL);
+    const R = designBinRing;
+    let best = -1, bestKey = Infinity;
+    let bestLat = 0, bestAlong = 0, bestRw = 0, bestT = 0;
+    let spreadLo = Infinity, spreadHi = -Infinity;
+
+    for (let oj = -R; oj <= R; oj++) {
+      const j = bj + oj;
+      if (j < 0 || j >= DBN) continue;
+      for (let oi = -R; oi <= R; oi++) {
+        const i = bi + oi;
+        if (i < 0 || i >= DBN) continue;
+        const c = j * DBN + i;
+        for (let q = designBinStart[c]; q < designBinStart[c + 1]; q++) {
+          const s = designBinItem[q];
+          const st = designStamps[s];
+          const tx = designPrep.tanX[s], tz = designPrep.tanZ[s];
+          const dx = x - st.x, dz = z - st.z;
+          const lat = dx * -tz + dz * tx;
+          const along = dx * tx + dz * tz;
+          const r = Math.max(0.6, st.radius || 2);
+          const rl = stampReach(r, designPrep.spacing[s]);
+          const uaAbs = (along < 0 ? -along : along) / rl;
+          if (uaAbs > UA_FULL) continue;
+          const latAbs = lat < 0 ? -lat : lat;
+          const rw = jitterRadius(r, latAbs, x, z);
+          const t = latAbs / rw;
+          if (t > 1) continue;
+          // Spread of the design heights the COVERING stamps declare here. On a
+          // self-consistent trail this is a few centimetres. Where a switchback
+          // folds back on itself and two legs claim the same ground at
+          // different elevations it is metres, and no accumulator can satisfy
+          // both — see the `spread` field on the result.
+          const py = stampTarget(st, lat, rw, along, designPrep.slope[s], designPrep.cross[s]);
+          if (py < spreadLo) spreadLo = py;
+          if (py > spreadHi) spreadHi = py;
+          // Selected on the SAME normalised radius the accumulator's Shepard
+          // weight uses, so "the design here" means the section declared by the
+          // sample that actually governs here. Selecting on |along| instead —
+          // which is the obvious choice and was the first one tried — picks the
+          // centre stamp for a cell that the accumulator is correctly letting a
+          // lateral stamp govern, and then reports the difference as residual.
+          const key = t * t + uaAbs * uaAbs;
+          if (key < bestKey) {
+            bestKey = key; best = s;
+            bestLat = lat; bestAlong = along; bestRw = rw; bestT = t;
+          }
+        }
+      }
+    }
+    if (best < 0) return o;
+
+    const st = designStamps[best];
+    const r = Math.max(0.6, st.radius || 2);
+    const rl = stampReach(r, designPrep.spacing[best]);
+    const uaAbs = (bestAlong < 0 ? -bestAlong : bestAlong) / rl;
+    const ag = alongGate(uaAbs);
+    const isTread = st.kind === 'tread' || st.kind === 'rut' || st.kind === undefined;
+    const brake = isTread ? smoothstep(0.11, 0.30, designPrep.grade[best]) : 0;
+    const halfW = designPrep.halfW[best];
+    const latCL = bestLat + designPrep.latOff[best];
+    const tc = (latCL < 0 ? -latCL : latCL) / halfW;
+    const inner = (1 - smoothstep(0.72, 1.0, tc)) * ag;
+    const sArc = designPrep.arc[best] + bestAlong;
+
+    // No batter term: inside the tread `over` is negative and batter() is the
+    // identity there by construction.
+    const plane = stampTarget(st, bestLat, bestRw, bestAlong,
+      designPrep.slope[best], designPrep.cross[best]);
+    const micro = treadMicro(st, isTread, latCL, halfW, sArc, inner, brake, x, z, ag);
+
+    o.ok = true;
+    o.height = plane + micro;
+    // The ridden microrelief on its own, so a QA pass can subtract it and check
+    // the committed tread against the RAW emitted stamp heights — a test that
+    // shares no code with this module's idea of what the design surface is.
+    o.micro = micro;
+    o.plane = plane;
+    o.lateral = latCL;          // from the ribbon centreline, not the stamp axis
+    o.along = bestAlong;
+    o.treadFrac = tc;           // |lateral| / ribbon half-width
+    o.width = halfW;
+    o.stamp = best;
+    o.kind = st.kind || 'tread';
+    o.bank = st.bank || 0;
+    o.material = st.material === undefined || st.material === null ? -1 : st.material;
+    // How badly the emitted stamps covering this point disagree with each other.
+    o.spread = spreadHi - spreadLo;
+    return o;
+  }
+
+  // -------------------------------------------------------------------------
+  // commitDetail — band-limit the committed tread to what a wheel can follow
+  //
+  // WHY THIS EXISTS. The accumulator above is deliberately an INTERPOLANT: the
+  // Shepard kernel is singular at the sample, so the committed surface passes
+  // exactly through every emitted stamp height. That is the right answer when
+  // the point cloud is a sampling of one smooth ribbon. It is the wrong answer
+  // for the cloud trail.js actually emits, because that cloud contains features
+  // finer than the thing that has to roll over them:
+  //
+  //   * rut stamps  — radius 0.34 m, targetHeight 0.012-0.252 m BELOW the tread,
+  //                   emitted on alternate stations, i.e. every 0.8 m;
+  //   * rock-garden boulder stamps — radius 0.22-0.56 m, 0.17-0.42 m PROUD,
+  //                   emitted on every fifth station of a rock section.
+  //
+  // Interpolated exactly, those become a 0.8 m corrugation down the middle of
+  // the tread. MEASURED on the committed centreline at arc 405-520 m, seed
+  // 20260726: +-0.10 to 0.25 m of height swing at 0.4-0.8 m wavelength, at
+  // lateral offsets -0.25..+0.25 m and nowhere else across the section.
+  //
+  // WHY IT MATTERS, in numbers rather than adjectives. A wheel leaves the ground
+  // when v^2 * kappa >= g. At the p50 design speed of 12.9 m/s that is
+  // kappa = 0.059 /m — a 17 m crest radius. A sinusoid of wavelength L reaches
+  // that curvature at an amplitude of only kappa*L^2/(4*pi^2):
+  //     L = 1 m -> 1.5 mm      L = 2 m -> 6 mm      L = 4 m -> 24 mm
+  // So sub-metre content of a few millimetres is a launcher, and no amount of
+  // r.m.s. agreement with the design protects against it. That is exactly why
+  // the previous round closed the 2-6 m band and the failure simply moved down.
+  //
+  // WHAT WAS TRIED AND REJECTED (measured, seed 20260726, wheel-test % of
+  // stations where v^2*kappa/g >= 1 at the design speed; the design centreline
+  // itself scores 4.25%):
+  //     baseline                                             43.64%
+  //     along-track mean support floor (metres, not radii)    39.58%
+  //     ... plus no tread microrelief at all                  24.29%
+  //     detail lattice halved to 0.175 m                      45.06%   (so it
+  //         is NOT lattice aliasing: a finer lattice is worse, not better)
+  //     Shepard singularity softened / kernel unsquared       36-40%
+  //     no stamp may assert finer than a wheel (support floor
+  //         in metres on BOTH axes)                           44.29%   (worse:
+  //         a widened rut stamp drags a wider trough)
+  //     low-pass of the committed carve DELTA                 35.97%   (wrong:
+  //         the carve cancels the natural ground exactly only when the delta is
+  //         applied unfiltered; filtering the delta re-injects the mountain's
+  //         own sub-metre roughness under the tread)
+  //     low-pass of the accumulated TARGET SURFACE, 0.55 m     4.07%
+  //
+  // So the fix is the last of those: reconstruct the target as before, then
+  // low-pass the target SURFACE (not the delta, not the stamps) at the scale a
+  // 0.37 m wheel integrates over, and commit that. Everything the design asks
+  // for above ~2 m survives; everything below it, which the design does not ask
+  // for and a wheel cannot follow, does not.
+  //
+  // COST, measured, so nobody has to rediscover it: the committed cross-slope at
+  // banked stations falls from 0.994 to 0.896 of tan(bank) (a symmetric kernel
+  // preserves a linear cross-slope but not the curvature of a berm wall on a
+  // 2.4 m tread), and the committed 2-6 m band falls from 0.0452 to 0.0296 m
+  // r.m.s. against a design of 0.0432. The 6-20 and 20-60 m bands are untouched
+  // (0.1666 -> 0.1614 and 0.4057 -> 0.4032). Shaped features keep 97% of their
+  // detrended amplitude. An anisotropic (along-track only) variant was built and
+  // measured: it protects the cross-slope better (0.944) but costs twice as much
+  // 2-6 m content (0.0221) and half again as much 6-20 m spurious, so it loses.
+  const WHEEL_R = 0.37;             // contact patch the profile is integrated over
+  // 1.5 wheel radii. Measured on the wheel test, seed 20260726 / 777 / 12345:
+  //   1.0 R (4 passes)  4.73 / 5.93 / 6.34 %      1.5 R (5 passes) 4.07 / 5.29 / 5.48 %
+  // The 4-pass setting misses the 6% acceptance on seed 12345, so the margin is
+  // bought here rather than hoped for.
+  const TREAD_LP_SIGMA = WHEEL_R * 1.5;
+  // A [1,2,1]/4 pass has variance DSTEP^2/2, so N passes give sigma = DSTEP*sqrt(N/2).
+  const TREAD_LP_PASSES = Math.max(0, Math.round(2 * (TREAD_LP_SIGMA / DSTEP) * (TREAD_LP_SIGMA / DSTEP)));
+
+  /** Detail-lattice cell index for a GLOBAL lattice coordinate, or -1. */
+  function detailCellAt(gi, gj) {
+    const ti = Math.floor(gi / DT_INNER);
+    const tj = Math.floor(gj / DT_INNER);
+    if (ti < 0 || tj < 0 || ti >= DTILES || tj >= DTILES) return -1;
+    const slot = tileIndex[tj * DTILES + ti];
+    if (slot < 0) return -1;
+    const li = gi - (ti * DT_INNER - 1);
+    const lj = gj - (tj * DT_INNER - 1);
+    if (li < 0 || lj < 0 || li >= DTS || lj >= DTS) return -1;
+    return slot * DTS * DTS + lj * DTS + li;
+  }
+
+  /**
+   * Build the target surface from the accumulators, low-pass it, and commit it.
+   *
+   * The smoothing reads through `detailCellAt` rather than staying inside a
+   * tile, so a sample that two tiles share is computed from the same global
+   * neighbourhood in both and the copies stay bit-identical — the bicubic
+   * reconstruction reads a 4x4 window across tile seams and a disagreement of
+   * one ulp there would show as a seam in the normals.
+   *
+   * Buffers are Float32 offsets from BASE_Y rather than absolute elevations:
+   * the world spans ~700 m of relief, so the worst resolution is 4e-5 m against
+   * an error budget of 0.10 m. Absolute 1700 m elevations in Float32 would be
+   * good to 2e-4 m, which is still fine, but the datum costs nothing.
+   */
+  function commitDetail(accW, accWT, accMax, dCells) {
+    let src = new Float32Array(dCells);
+    for (let p = 0; p < dCells; p++) {
+      const w = accW[p];
+      src[p] = (w === 0 ? dHeights[p] : dHeights[p] + accWT[p] / w) - BASE_Y;
+    }
+    if (TREAD_LP_PASSES > 0 && nTiles > 0) {
+      const slotKey = new Int32Array(nTiles);
+      for (let key = 0; key < tileIndex.length; key++) {
+        const s = tileIndex[key];
+        if (s >= 0) slotKey[s] = key;
+      }
+      let dst = new Float32Array(dCells);
+      for (let pass = 0; pass < TREAD_LP_PASSES * 2; pass++) {
+        const alongX = (pass & 1) === 0;
+        for (let s = 0; s < nTiles; s++) {
+          const key = slotKey[s];
+          const ti = key % DTILES;
+          const tj = (key / DTILES) | 0;
+          const gi0 = ti * DT_INNER - 1;
+          const gj0 = tj * DT_INNER - 1;
+          const base = s * DTS * DTS;
+          for (let j = 0; j < DTS; j++) {
+            for (let i = 0; i < DTS; i++) {
+              const p = base + j * DTS + i;
+              const c = src[p];
+              const pa = alongX ? detailCellAt(gi0 + i - 1, gj0 + j)
+                : detailCellAt(gi0 + i, gj0 + j - 1);
+              const pb = alongX ? detailCellAt(gi0 + i + 1, gj0 + j)
+                : detailCellAt(gi0 + i, gj0 + j + 1);
+              // A missing neighbour reflects the centre, so the filter is
+              // mass-preserving at the edge of the allocated corridor instead
+              // of pulling the surface toward zero there.
+              dst[p] = ((pa < 0 ? c : src[pa]) + 2 * c + (pb < 0 ? c : src[pb])) * 0.25;
+            }
+          }
+        }
+        const t = src; src = dst; dst = t;
+      }
+    }
+    for (let p = 0; p < dCells; p++) {
+      if (accW[p] === 0) continue;
+      dHeights[p] += (src[p] + BASE_Y - dHeights[p]) * accMax[p];
+    }
+  }
+
   function applyCarve(stamps) {
     if (!baseBuilt) buildBase();
     const list = Array.isArray(stamps) ? stamps.filter(
@@ -1817,10 +2610,12 @@ export function createTerrain(ctx) {
     tileIndex.fill(-1);
     nTiles = 0;
     detailReady = false;
+    designStamps = null; designPrep = null; designBinStart = null; designBinItem = null;
     corridorDF = buildCorridorField(list);
     if (list.length === 0) { detailReady = false; return; }
 
     const prep = prepareStamps(list);
+    buildDesignIndex(list, prep);
     allocateDetailTiles(list);
     if (nTiles === 0) { detailReady = false; return; }
     initDetailTiles();
@@ -1839,16 +2634,23 @@ export function createTerrain(ctx) {
     for (let s = 0; s < list.length; s++) {
       const st = list[s];
       const r = Math.max(0.6, st.radius || 2);
-      const rl = Math.min(r * 3, Math.max(r, prep.spacing[s] * 0.85));
+      const rl = stampReach(r, prep.spacing[s]);
+      const gA = prep.slope[s];
+      const gL = prep.cross[s];
+      const latOff = prep.latOff[s];
+      const halfW = prep.halfW[s];
       // Only plain benched tread gets the batter. Berms, wallrides, lips,
       // landings and drops are *constructed* features whose flanks are authored
       // by trail.js, and re-cutting them to an angle of repose would flatten the
       // very geometry they exist to make.
       const batterKind = st.kind === undefined || st.kind === 'tread' || st.kind === 'rut';
-      // The footprint must cover the carve ellipse, the along-track reach AND
-      // the batter's own lateral run.
-      const reach = Math.max(r * RW_MAX * 1.9, rl * 1.9,
-        batterKind ? r * RW_MAX + BATTER_RUN : 0);
+      // The footprint must cover the whole region stampCell() can accept, which
+      // is now a rotated RECTANGLE (cross-track and along-track are independent)
+      // rather than the old ellipse — so it is the diagonal, not the larger
+      // side. Costs ~4% more cells on a battered tread stamp; clipping a corner
+      // instead would put a step in the surface at the corner.
+      const reachLat = r * RW_MAX * CS_OUT + (batterKind ? BATTER_RUN : 0);
+      const reach = Math.sqrt(reachLat * reachLat + (rl * UA_MAX) * (rl * UA_MAX));
       const tx = prep.tanX[s], tz = prep.tanZ[s];
       const rx = -tz, rz = tx;                      // rider's right
 
@@ -1868,10 +2670,16 @@ export function createTerrain(ctx) {
           const k = j * RES + i;
           // `heights[k]` is still the natural surface: the accumulator is only
           // applied after every stamp has been visited.
-          if (!stampCell(st, lat, along, r, rl, x, z, batterKind, heights[k])) continue;
+          if (!stampCell(st, lat, along, r, rl, x, z, batterKind, heights[k], gA, gL,
+            latOff, halfW)) continue;
           const w = _scW;
+          // Accumulated as an OFFSET from the natural ground, never as an
+          // absolute elevation: with Shepard weights up to MEAN_CAP, summing
+          // 1700 m elevations would be good to only ~0.1 m in Float32, which is
+          // the whole error budget. `heights[k]` is still the natural surface —
+          // the accumulator is applied after every stamp has been visited.
           accW[k] += _scWM;
-          accWT[k] += _scWM * _scTarget;
+          accWT[k] += _scWM * (_scTarget - heights[k]);
           if (_scWH > accMax[k]) accMax[k] = _scWH;
           // carveU8 feeds sampleCarve(), which vegetation uses to stay off the
           // tread and buildChunk uses to drive the splat toward trail material.
@@ -1900,7 +2708,7 @@ export function createTerrain(ctx) {
     for (let k = 0; k < accW.length; k++) {
       const wsum = accW[k];
       if (wsum === 0) continue;
-      heights[k] += (accWT[k] / wsum - heights[k]) * accMax[k];
+      heights[k] += (accWT[k] / wsum) * accMax[k];
     }
     const t2 = Date.now();
 
@@ -1913,7 +2721,11 @@ export function createTerrain(ctx) {
     for (let s = 0; s < list.length; s++) {
       const st = list[s];
       const r = Math.max(0.6, st.radius || 2);
-      const rl = Math.min(r * 3, Math.max(r, prep.spacing[s] * 0.85));
+      const rl = stampReach(r, prep.spacing[s]);
+      const gA = prep.slope[s];
+      const gL = prep.cross[s];
+      const latOff = prep.latOff[s];
+      const halfW = prep.halfW[s];
       const tx = prep.tanX[s], tz = prep.tanZ[s];
       const rx = -tz, rz = tx;
       const arc0 = prep.arc[s];
@@ -1922,8 +2734,8 @@ export function createTerrain(ctx) {
       const brake = isTread ? smoothstep(0.11, 0.30, grade) : 0;
       // Only plain benched tread is battered — see the global loop above.
       const batterKind = isTread;
-      const reach = Math.max(r * RW_MAX * 1.9, rl * 1.9,
-        batterKind ? r * RW_MAX + BATTER_RUN : 0);
+      const reachLat = r * RW_MAX * CS_OUT + (batterKind ? BATTER_RUN : 0);
+      const reach = Math.sqrt(reachLat * reachLat + (rl * UA_MAX) * (rl * UA_MAX));
       // Edge breakdown is not symmetric on a real trail: the outside of a turn
       // gets scuffed wide by riders running out of it, and the shoulder above a
       // braking zone gets chewed. `bank` is + when the RIGHT side is high, i.e.
@@ -1963,62 +2775,22 @@ export function createTerrain(ctx) {
               const p = base + j * DTS + i;
               // dHeights is still the natural surface here — the accumulator is
               // only applied after every stamp has been visited.
-              if (!stampCell(st, lat, along, r, rl, x, z, batterKind, dHeights[p])) continue;
+              if (!stampCell(st, lat, along, r, rl, x, z, batterKind, dHeights[p], gA, gL,
+                latOff, halfW)) continue;
               const w = _scW;
-              const rw = _scRW;
-              let target = _scTarget;
               const sArc = arc0 + along;
 
               const cw = (w * 255) | 0;
               if (cw > dCarve[p]) dCarve[p] = cw;
 
-              // Windrow — the material the tyres have pushed out, sitting as a
-              // low berm along both tread margins. Nothing was producing this at
-              // all, and it is the single largest across-track gradient on a
-              // ridden trail. It has to live OUTSIDE the `w > 0.35` core gate:
-              // at the tread margin that gate is worth ~0.09, which would have
-              // reduced a 75 mm berm to 7 mm and clipped its outer half.
-              if (isTread) {
-                const e = Math.abs(lat) - rw * 1.05;
-                target += WINDROW * Math.exp(-(e * e) / WINDROW_SIG2) * clamp01(w * 2.4);
-              }
-
-              if (w > 0.35) {
-                const inner = (w - 0.35) / 0.65;
-                // Two tyre ruts. Amplitude 0.028 -> 0.11 m and sigma 0.13 ->
-                // 0.33 m: below that the feature is one detail sample wide and
-                // is filtered away before it reaches a vertex, which is why the
-                // tread measured as isotropic noise (across/along gradient
-                // 0.57-0.99 where a ridden line reads 1.5-2.5). The pair is
-                // widened to 1.24 m apart so the crown between them survives the
-                // wider sigma, and the line wanders +/-0.22 m over a ~74 m
-                // wavelength so it is a ridden line and not a machined groove.
-                if (isTread) {
-                  const wander = nMicro(sArc * 0.085, st.x * 0.031) * 0.22;
-                  const dl = lat - (RUT_HALF + wander);
-                  const dr = lat + (RUT_HALF - wander);
-                  const rutL = Math.exp(-(dl * dl) / RUT_SIG2);
-                  const rutR = Math.exp(-(dr * dr) / RUT_SIG2);
-                  target -= RUT_DEPTH * (rutL + rutR) * inner;
-                }
-                // Braking bumps: transverse ripples that build on steep entries.
-                if (brake > 0) {
-                  const jitter = nMicro(sArc * 0.09, st.x * 0.05) * 0.5;
-                  const ripple = Math.sin((sArc / 1.15 + jitter) * Math.PI * 2) * 0.5 + 0.5;
-                  const across = 1 - clamp01(Math.abs(lat) / (rw * 0.8));
-                  target -= BRAKE_BUMP * brake * ripple * across * inner;
-                }
-                // Loose rock / roots keep their chatter even after the cut.
-                const mm = st.material;
-                if (mm === Surface.ROCK || mm === Surface.GRAVEL || mm === Surface.ROOT) {
-                  const chat = nMicro(x * 1.9 + 3.0, z * 1.9 - 6.0) * 0.6
-                             + nMicro(x * 5.3 - 12.0, z * 5.3 + 8.0) * 0.4;
-                  target += chat * (mm === Surface.ROCK ? 0.075 : 0.045) * inner;
-                }
-              }
+              // The ridden microrelief. Identical code to the one sampleDesign()
+              // reports, so "committed vs design" measures the accumulator and
+              // nothing else.
+              const target = _scTarget
+                + treadMicro(st, isTread, _scLatCL, halfW, sArc, _scInner, brake, x, z, _scAg);
 
               dAccW[p] += _scWM;
-              dAccWT[p] += _scWM * target;
+              dAccWT[p] += _scWM * (target - dHeights[p]);
               if (_scWH > dAccMax[p]) dAccMax[p] = _scWH;
 
               if (st.material !== undefined && st.material !== null) {
@@ -2050,11 +2822,7 @@ export function createTerrain(ctx) {
       }
     }
 
-    for (let p = 0; p < dCells; p++) {
-      const wsum = dAccW[p];
-      if (wsum === 0) continue;
-      dHeights[p] += (dAccWT[p] / wsum - dHeights[p]) * dAccMax[p];
-    }
+    commitDetail(dAccW, dAccWT, dAccMax, dCells);
 
     detailReady = true;
 
@@ -2982,6 +3750,86 @@ export function createTerrain(ctx) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // fingerprint — determinism, asserted rather than assumed
+  //
+  // CONTRACT §0 promises the world is a pure function of ctx.seed. It was not:
+  // the erosion pass sized its droplet budget from a wall-clock projection and
+  // degraded silently under load, so the same seed produced different mountains
+  // on different boots and every measurement taken this session was taken
+  // against a moving target. That is fixed at the source (see DROPLET_TIER);
+  // this is the check that stops it coming back.
+  //
+  // FNV-1a over the raw bytes of every generated field. Hashing the Float32
+  // bit patterns rather than rounded values is deliberate: a tolerance would
+  // hide exactly the kind of small, load-dependent drift that caused the
+  // problem. Byte order is the host's, so these hashes compare boots on one
+  // machine — which is the claim being made.
+  // -------------------------------------------------------------------------
+
+  function fnv1a(h, view) {
+    if (!view) return Math.imul(h ^ 0xff, 0x01000193) >>> 0;
+    const u8 = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    let a = h >>> 0;
+    for (let i = 0; i < u8.length; i++) {
+      a = Math.imul(a ^ u8[i], 0x01000193) >>> 0;
+    }
+    return a >>> 0;
+  }
+  const hex8 = (v) => (v >>> 0).toString(16).padStart(8, '0');
+
+  /**
+   * Deterministic hash of everything this module generates. Cheap enough to
+   * call from a QA harness or a debug key; not called on any hot path.
+   */
+  function fingerprint() {
+    const H0 = 0x811c9dc5;
+    const detail = detailReady && dHeights
+      ? {
+        tiles: nTiles,
+        heights: hex8(fnv1a(H0, dHeights)),
+        material: hex8(fnv1a(H0, dMaterial)),
+        weight: hex8(fnv1a(H0, dWeight)),
+        carve: hex8(fnv1a(H0, dCarve)),
+      }
+      : { tiles: 0, heights: null, material: null, weight: null, carve: null };
+    let all = H0;
+    all = fnv1a(all, heights);
+    all = fnv1a(all, materials);
+    all = fnv1a(all, splatU8);
+    all = fnv1a(all, extraU8);
+    all = fnv1a(all, hardnessU8);
+    all = fnv1a(all, talusU8);
+    all = fnv1a(all, aoU8);
+    all = fnv1a(all, carveU8);
+    if (detailReady && dHeights) {
+      all = fnv1a(all, dHeights);
+      all = fnv1a(all, dMaterial);
+      all = fnv1a(all, dWeight);
+      all = fnv1a(all, dCarve);
+    }
+    return {
+      seed: ctx.seed,
+      quality: ctx.quality,
+      resolution: RES,
+      droplets: timings.droplets || 0,
+      dropletTier,
+      world: hex8(all),
+      heights: hex8(fnv1a(H0, heights)),
+      materials: hex8(fnv1a(H0, materials)),
+      splat: hex8(fnv1a(H0, splatU8)),
+      extra: hex8(fnv1a(H0, extraU8)),
+      hardness: hex8(fnv1a(H0, hardnessU8)),
+      talus: hex8(fnv1a(H0, talusU8)),
+      ao: hex8(fnv1a(H0, aoU8)),
+      carve: hex8(fnv1a(H0, carveU8)),
+      detail,
+      minY: bounds.minY,
+      maxY: bounds.maxY,
+      creekLevel,
+    };
+  }
+
   function dispose() {
     for (let i = 0; i < chunks.length; i++) chunks[i].geo.dispose();
     chunks.length = 0;
@@ -3037,6 +3885,12 @@ export function createTerrain(ctx) {
     sampleWetness,
     sampleSnow,
     sampleCarve,
+    // The trail's emitted design surface at a point (see sampleDesign()). QA
+    // measures the committed heightfield against this; nothing on a hot path
+    // reads it.
+    sampleDesign,
+    // Determinism check (see fingerprint()).
+    fingerprint,
     corridorDistance: corridorDist,
     treelineAt,
     snowlineAt,
