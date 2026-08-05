@@ -56,17 +56,23 @@ function createEvents() {
   };
 }
 
+// Defaults are a power budget, not a taste call. Measured on an M5 with a GPU power
+// counter, at a near-fullscreen window: high/100%/120 drew 17.3 W with the GPU pinned
+// at 92% residency, medium/100%/120 drew 11 W, and the combination below lands around
+// 5 W — quiet enough that the fans stay down over a long session. Anyone who wants the
+// look back has Quality, Render resolution and Frame rate cap in the settings panel,
+// and their choice persists. `?quality=` still overrides for profiling runs.
 export function createContext(container, options = {}) {
-  const quality = options.quality || 'high';
+  const quality = options.quality || 'medium';
   const settings = {
     ...QUALITY_PRESETS[quality],
-    // 1.5 is the sweet spot on retina: ~25% cheaper frames than native 2.0, and the
-    // difference is hidden behind SMAA + film grain. The engine's per-tier pixel
-    // budget and frame-time governor still trim this further on huge displays.
-    pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
+    // 1 device pixel per CSS pixel: retina buys nothing here that SMAA and film grain
+    // do not already hide, and it doubles the fill cost of a chain that is fill-bound.
+    // The engine's per-tier pixel budget and frame-time governor trim from here.
+    pixelRatio: Math.min(window.devicePixelRatio || 1, 1),
     // Render-loop frame cap (frames per second, 0 = uncapped). Enforced by main.js.
-    // Without it the game runs at display refresh — 120 Hz on ProMotion — and the GPU
-    // burns twice the power for no perceptible gain on a 60 fps-class game.
+    // Without it the game runs at display refresh — 120 Hz on ProMotion — and every
+    // frame's cost is paid twice as often for no perceptible gain on a 60 fps game.
     fpsCap: 60,
   };
 

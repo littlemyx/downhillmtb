@@ -762,7 +762,7 @@ export function createMenu(ctx) {
   // Persisted settings
   // -------------------------------------------------------------------------
   const settings = {
-    quality: (ctx && ctx.quality) || 'high',
+    quality: (ctx && ctx.quality) || 'medium',
     camera: 'chase',
     invertLook: false,
     fov: 62,
@@ -770,7 +770,7 @@ export function createMenu(ctx) {
     fpsCap: (ctx && ctx.settings && typeof ctx.settings.fpsCap === 'number') ? ctx.settings.fpsCap : 60,
     renderScale: (() => {
       const pr = ctx && ctx.settings && ctx.settings.pixelRatio;
-      return RES_OPTIONS.some((o) => o.value === pr) ? pr : 1.5;
+      return RES_OPTIONS.some((o) => o.value === pr) ? pr : 1;
     })(),
     photoMode: false,
   };

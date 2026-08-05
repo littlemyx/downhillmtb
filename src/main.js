@@ -56,7 +56,7 @@ async function boot() {
   const params = new URLSearchParams(location.search);
   const ctx = createContext(container, {
     seed: params.has('seed') ? Number(params.get('seed')) : undefined,
-    quality: params.get('quality') || 'high',
+    quality: params.get('quality') || 'medium',
   });
   window.__DESCENT__ = ctx;
   window.__DESCENT_ERRORS__ = [];
