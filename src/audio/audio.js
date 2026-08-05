@@ -22,6 +22,11 @@
 // audio.setMasterVolume(0..1) / audio.setMuted(bool); both are safe before the
 // graph exists.
 //
+// CONTRACT-NOTE: additive `setExternalMute(bool)` silences the master for the
+// host platform (a fullscreen ad is up). It is a separate flag from `muted` and
+// is never persisted, so releasing it restores whatever the player had chosen
+// rather than un-muting them.
+//
 // CONTRACT-NOTE: this module reads several additive fields that bike.js
 // publishes beyond CONTRACT §5 (state.skid, state.roughness, state.yawRate,
 // state.lastLanding) and the additive events 'bike:landed' / 'bike:crash'.
@@ -395,6 +400,9 @@ export function createAudio(ctx) {
   let failed = false;
   let windowBlurred = false;
   let docHidden = false;
+  // Silenced by the host platform (an ad is on screen). Deliberately separate
+  // from `muted`, which is the player's own setting and is persisted.
+  let externalMuted = false;
 
   const rng = makeRng(subSeed((ctx && ctx.seed) || 1, 'audio'));
   const erng = makeRng(subSeed((ctx && ctx.seed) || 1, 'audio:events'));
@@ -1544,7 +1552,7 @@ export function createAudio(ctx) {
   document.addEventListener('visibilitychange', onVisibility);
 
   function targetMaster() {
-    if (muted || windowBlurred || docHidden) return 0.0;
+    if (muted || externalMuted || windowBlurred || docHidden) return 0.0;
     // Perceptual curve — a linear slider on a linear gain feels wrong at the top.
     return Math.pow(masterVolume, 1.6) * 0.9 * S.pauseGain;
   }
@@ -1991,6 +1999,16 @@ export function createAudio(ctx) {
       applyMaster();
     },
     toggleMute() { api.setMuted(!muted); return muted; },
+
+    /**
+     * Silence for something outside the game — a fullscreen ad. Not persisted and
+     * does not touch the player's own mute setting, so restoring it cannot
+     * un-mute someone who chose silence.
+     */
+    setExternalMute(m) {
+      externalMuted = !!m;
+      applyMaster();
+    },
 
     /**
      * Fire a named sound directly. Used by the UI and available for debugging.

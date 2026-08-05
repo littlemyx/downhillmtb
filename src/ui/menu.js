@@ -52,55 +52,76 @@
 // =============================================================================
 
 import * as InputModule from '../game/input.js';
+import { t } from '../i18n/i18n.js';
 
 // ---------------------------------------------------------------------------
 // Bindings (see CONTRACT-NOTE above). Shape:
 //   [{ group, items: [{ action, note, keys: [[cap, ...], ...], pad }] }]
 // where `keys` is a list of alternative chord-groups: [['A','D'], ['←','→']]
 // renders as   A / D   or   ← / →.
+//
+// These tables are built at import time, before the language is known, so they
+// carry i18n keys rather than text; every consumer resolves them through t().
 // ---------------------------------------------------------------------------
 const KEYMAP = [
   {
-    group: 'Riding',
+    group: 'controls.group.riding',
     items: [
-      { action: 'Steer', note: 'lean the bike into the turn', keys: [['A', 'D'], ['←', '→']], pad: 'Left stick ←→' },
-      { action: 'Weight fore / aft', note: 'attack position, manual, air pitch', keys: [['W', 'S'], ['↑', '↓']], pad: 'Left stick ↑↓' },
-      { action: 'Roll / whip', note: 'in the air only', keys: [['Q', 'E']], pad: 'Right stick ←→' },
-      { action: 'Pump', note: 'hold through the compression, release over the crest', keys: [['Space']], pad: 'A / ✕' },
-      { action: 'Manual', note: 'hold to find the balance point', keys: [['M']], pad: 'X / ▢' },
+      { action: 'controls.steer', note: 'controls.steerNote', keys: [['A', 'D'], ['←', '→']], pad: 'controls.padLeftX' },
+      { action: 'controls.weight', note: 'controls.weightNote', keys: [['W', 'S'], ['↑', '↓']], pad: 'controls.padLeftY' },
+      { action: 'controls.roll', note: 'controls.rollNote', keys: [['Q', 'E']], pad: 'controls.padRightX' },
+      { action: 'controls.pump', note: 'controls.pumpNote', keys: [['Space']], pad: 'A / ✕' },
+      { action: 'controls.manual', note: 'controls.manualNote', keys: [['M']], pad: 'X / ▢' },
     ],
   },
   {
-    group: 'Bike',
+    group: 'controls.group.bike',
     items: [
-      { action: 'Front brake', note: 'analogue — modulate it', keys: [['J']], pad: 'L2 (analogue)' },
-      { action: 'Rear brake', note: 'lock it up to scrub or drift', keys: [['K']], pad: 'R2 (analogue)' },
-      { action: 'Pedal', note: 'sprint out of the flat corners', keys: [['Shift']], pad: 'R1' },
-      { action: 'Reset to checkpoint', keys: [['R']], pad: 'B / ○' },
+      { action: 'controls.frontBrake', note: 'controls.frontBrakeNote', keys: [['J']], pad: 'controls.padTriggerL' },
+      { action: 'controls.rearBrake', note: 'controls.rearBrakeNote', keys: [['K']], pad: 'controls.padTriggerR' },
+      { action: 'controls.pedal', note: 'controls.pedalNote', keys: [['Shift']], pad: 'R1' },
+      { action: 'controls.reset', keys: [['R']], pad: 'B / ○' },
     ],
   },
   {
-    group: 'System',
+    group: 'controls.group.system',
     items: [
-      { action: 'Pause', keys: [['Esc'], ['P']], pad: 'Start' },
-      { action: 'Cycle camera', note: 'chase · wide · first person · cinematic', keys: [['C']], pad: 'Y / △' },
-      { action: 'Photo mode', note: 'hides all interface', keys: [['F']], pad: 'Select / Share' },
+      { action: 'controls.pause', keys: [['Esc'], ['P']], pad: 'controls.padStart' },
+      { action: 'controls.cycleCamera', note: 'controls.cycleCameraNote', keys: [['C']], pad: 'Y / △' },
+      { action: 'controls.photo', note: 'controls.photoNote', keys: [['F']], pad: 'controls.padSelect' },
     ],
   },
 ];
 
 const QUALITY_OPTIONS = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'ultra', label: 'Ultra' },
+  { value: 'low', key: 'quality.low' },
+  { value: 'medium', key: 'quality.medium' },
+  { value: 'high', key: 'quality.high' },
+  { value: 'ultra', key: 'quality.ultra' },
 ];
 
 const CAMERA_OPTIONS = [
-  { value: 'chase', label: 'Chase' },
-  { value: 'chaseFar', label: 'Wide' },
-  { value: 'firstPerson', label: 'First person' },
-  { value: 'cinematic', label: 'Cinematic' },
+  { value: 'chase', key: 'camera.chase' },
+  { value: 'chaseFar', key: 'camera.chaseFar' },
+  { value: 'firstPerson', key: 'camera.firstPerson' },
+  { value: 'cinematic', key: 'camera.cinematic' },
+];
+
+// 0 = uncapped (display refresh). Values, not labels — labels come from i18n.
+const FPS_OPTIONS = [
+  { value: 30, key: 'fps.30' },
+  { value: 60, key: 'fps.60' },
+  { value: 120, key: 'fps.120' },
+  { value: 0, key: 'fps.off' },
+];
+
+// Device pixels per CSS pixel (ctx.settings.pixelRatio). 200% = native retina; the
+// engine clamps to the display's real DPR, so 150%+ on a 1x monitor is a no-op.
+const RES_OPTIONS = [
+  { value: 0.75, key: 'res.75' },
+  { value: 1, key: 'res.100' },
+  { value: 1.5, key: 'res.150' },
+  { value: 2, key: 'res.200' },
 ];
 
 const ROMAN = [null, 'I', 'II', 'III', 'IV', 'V'];
@@ -746,6 +767,11 @@ export function createMenu(ctx) {
     invertLook: false,
     fov: 62,
     volume: 0.8,
+    fpsCap: (ctx && ctx.settings && typeof ctx.settings.fpsCap === 'number') ? ctx.settings.fpsCap : 60,
+    renderScale: (() => {
+      const pr = ctx && ctx.settings && ctx.settings.pixelRatio;
+      return RES_OPTIONS.some((o) => o.value === pr) ? pr : 1.5;
+    })(),
     photoMode: false,
   };
   try {
@@ -758,15 +784,25 @@ export function createMenu(ctx) {
         if (typeof saved.invertLook === 'boolean') settings.invertLook = saved.invertLook;
         if (typeof saved.fov === 'number') settings.fov = clamp(saved.fov, 55, 95);
         if (typeof saved.volume === 'number') settings.volume = clamp(saved.volume, 0, 1);
+        if (FPS_OPTIONS.some((o) => o.value === saved.fpsCap)) settings.fpsCap = saved.fpsCap;
+        if (RES_OPTIONS.some((o) => o.value === saved.renderScale)) settings.renderScale = saved.renderScale;
       }
     }
   } catch (e) { /* private mode / storage disabled — defaults are fine */ }
+  // Both have to reach the engine before the first frame, not on the first visit to
+  // the settings panel: the cap is read by the render loop directly, and the ratio is
+  // picked up by main.js's boot-time onResize(), which runs after the menu is built.
+  if (ctx && ctx.settings) {
+    ctx.settings.fpsCap = settings.fpsCap;
+    ctx.settings.pixelRatio = settings.renderScale;
+  }
 
   function saveSettings() {
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({
         quality: settings.quality, camera: settings.camera,
         invertLook: settings.invertLook, fov: settings.fov, volume: settings.volume,
+        fpsCap: settings.fpsCap, renderScale: settings.renderScale,
       }));
     } catch (e) { /* ignore */ }
   }
@@ -787,6 +823,20 @@ export function createMenu(ctx) {
         break;
       case 'invertLook':
         if (ctx && ctx.settings) ctx.settings.invertLook = value;
+        break;
+      case 'fpsCap':
+        if (ctx && ctx.settings) ctx.settings.fpsCap = value;
+        break;
+      case 'renderScale':
+        if (ctx && ctx.settings) ctx.settings.pixelRatio = value;
+        // engine.resize() with no args keeps the viewport and just re-evaluates the
+        // ratio; postfx then reallocates its render targets at the new buffer size.
+        if (ctx && ctx.engine && typeof ctx.engine.resize === 'function') {
+          ctx.engine.resize();
+          if (ctx.postfx && typeof ctx.postfx.resize === 'function') {
+            ctx.postfx.resize(ctx.engine.width, ctx.engine.height);
+          }
+        }
         break;
       case 'fov':
         if (ctx && ctx.settings) { ctx.settings.fov = value; ctx.settings.fovBase = value; }
@@ -983,7 +1033,26 @@ export function createMenu(ctx) {
     try { g.state = 'menu'; } catch (e) { /* read-only implementation — fine */ }
   }
 
+  /**
+   * Hand a transition to the host platform, which may slot a fullscreen ad in
+   * front of it. `next` always runs — off-platform, on a cooldown, or on an ad
+   * error — so a break can never swallow the action.
+   */
+  function atBreak(next) {
+    const p = ctx && ctx.platform;
+    if (p && typeof p.maybeShowInterstitial === 'function') p.maybeShowInterstitial(next);
+    else next();
+  }
+
+  /**
+   * Starting a run is never held up by anything: the ad break lives at the finish,
+   * where the player is reading a result rather than waiting to ride.
+   */
   function beginRun(mode) {
+    startRun(mode);
+  }
+
+  function startRun(mode) {
     const g = gp();
     resetTelemetry();
     emit('run:mode', { mode });
@@ -1013,10 +1082,12 @@ export function createMenu(ctx) {
   }
 
   function quitToTitle() {
-    wantPaused = false;
-    enterMenuState();
-    setCameraMode('cinematic');
-    showTitle();
+    atBreak(() => {
+      wantPaused = false;
+      enterMenuState();
+      setCameraMode('cinematic');
+      showTitle();
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1032,19 +1103,19 @@ export function createMenu(ctx) {
     const mark = el('div', 'dm-mark dm-fade');
     mark.style.setProperty('--i', '0');
     mark.appendChild(el('div', 'dm-mark-glyph'));
-    mark.appendChild(el('div', 'dm-eyebrow', 'Descent'));
+    mark.appendChild(el('div', 'dm-eyebrow', t('title.brand')));
     const meta = el('div', 'dm-meta dm-fade');
     meta.style.setProperty('--i', '0');
     seedLine = el('span', 'dm-num');
     meta.appendChild(seedLine);
-    meta.appendChild(el('span', null, 'Alpine massif · golden hour'));
+    meta.appendChild(el('span', null, t('title.place')));
     top.appendChild(mark);
     top.appendChild(meta);
 
     // wordmark -------------------------------------------------------------
     const main = el('div', 'dm-title-main');
     const wm = el('h1', 'dm-wordmark');
-    wm.setAttribute('aria-label', 'Descent');
+    wm.setAttribute('aria-label', t('title.brand'));
     const WORD = 'DESCENT';
     for (let i = 0; i < WORD.length; i++) {
       const s = el('span', 'dm-wm-l', WORD[i]);
@@ -1056,7 +1127,7 @@ export function createMenu(ctx) {
 
     const sub = el('div', 'dm-sub');
     sub.appendChild(el('div', 'dm-sub-rule'));
-    const subText = el('div', 'dm-sub-text dm-fade', 'Two point six kilometres · four hundred metres of fall line');
+    const subText = el('div', 'dm-sub-text dm-fade', t('title.tagline'));
     subText.style.setProperty('--i', '1');
     sub.appendChild(subText);
     main.appendChild(sub);
@@ -1065,10 +1136,10 @@ export function createMenu(ctx) {
     const list = el('ul', 'dm-list');
     list.setAttribute('role', 'menu');
     const TITLE_ITEMS = [
-      { label: 'Start Run', desc: 'Timed descent. Eight splits, one clock, your personal best on the line.', run: () => beginRun('timed') },
-      { label: 'Free Ride', desc: 'No clock, no gates. Session the jump line until it is dialled.', run: () => beginRun('free') },
-      { label: 'Settings', desc: 'Quality, camera, field of view, volume, photo mode.', run: () => setView('settings') },
-      { label: 'Controls', desc: 'Keyboard and gamepad reference.', run: () => setView('controls') },
+      { label: t('title.start'), desc: t('title.startDesc'), run: () => beginRun('timed') },
+      { label: t('title.free'), desc: t('title.freeDesc'), run: () => beginRun('free') },
+      { label: t('title.settings'), desc: t('title.settingsDesc'), run: () => setView('settings') },
+      { label: t('title.controls'), desc: t('title.controlsDesc'), run: () => setView('controls') },
     ];
     TITLE_ITEMS.forEach((entry, i) => {
       const li = el('li');
@@ -1094,9 +1165,9 @@ export function createMenu(ctx) {
     foot.style.setProperty('--i', '6');
     const hint = el('div', 'dm-hint');
     const hintSpecs = [
-      { keys: ['↑', '↓'], text: 'Navigate' },
-      { keys: ['⏎'], text: 'Select' },
-      { keys: ['Esc'], text: 'Back' },
+      { keys: ['↑', '↓'], text: t('title.navigate') },
+      { keys: ['⏎'], text: t('title.select') },
+      { keys: ['Esc'], text: t('title.hintBack') },
     ];
     for (const h of hintSpecs) {
       const i = el('span', 'dm-hint-i');
@@ -1105,11 +1176,11 @@ export function createMenu(ctx) {
       hint.appendChild(i);
     }
     const padHint = el('span', 'dm-hint-i');
-    padHint.appendChild(el('kbd', 'dm-key', 'Pad'));
-    padHint.appendChild(document.createTextNode('Supported'));
+    padHint.appendChild(el('kbd', 'dm-key', t('title.pad')));
+    padHint.appendChild(document.createTextNode(t('title.padSupported')));
     hint.appendChild(padHint);
     foot.appendChild(hint);
-    foot.appendChild(el('div', 'dm-eyebrow', 'Pre-release build'));
+    foot.appendChild(el('div', 'dm-eyebrow', t('title.build')));
 
     wrap.appendChild(top);
     wrap.appendChild(main);
@@ -1118,7 +1189,7 @@ export function createMenu(ctx) {
 
     titleView.onEnter = () => {
       setCameraMode('cinematic');
-      seedLine.textContent = `Seed ${(ctx && ctx.seed != null) ? ctx.seed : 0}`;
+      seedLine.textContent = t('common.seed', (ctx && ctx.seed != null) ? ctx.seed : 0);
       // Replay the intro sequence every time the title is shown.
       if (!reduced) {
         const animated = titleView.el.querySelectorAll('.dm-wm-l, .dm-fade, .dm-sub-rule');
@@ -1190,7 +1261,7 @@ export function createMenu(ctx) {
   const settingsView = registerView('settings', el('div'));
   const settingsSync = [];   // functions that push model → DOM
   {
-    const P = buildPanel(settingsView, { eyebrow: 'Configuration', title: 'Settings' });
+    const P = buildPanel(settingsView, { eyebrow: t('settings.eyebrow'), title: t('settings.title') });
     const rows = el('div', 'dm-rows');
     P.body.appendChild(rows);
 
@@ -1228,7 +1299,7 @@ export function createMenu(ctx) {
           for (let i = 0; i < options.length; i++) btns[i].classList.toggle('dm-sel', options[i].value === cur);
         };
         options.forEach((opt) => {
-          const b = el('button', 'dm-seg-o', opt.label);
+          const b = el('button', 'dm-seg-o', t(opt.key));
           b.type = 'button';
           b.tabIndex = -1;
           b.addEventListener('click', (e) => { e.stopPropagation(); set(opt.value); sync(); });
@@ -1255,14 +1326,14 @@ export function createMenu(ctx) {
     // -- toggle ------------------------------------------------------------
     function addToggle(label, note, get, set) {
       addRow(label, note, (ctl, row, nav) => {
-        const txt = el('span', 'dm-tog-txt', 'Off');
+        const txt = el('span', 'dm-tog-txt', t('common.off'));
         const tog = el('span', 'dm-tog');
         ctl.appendChild(txt);
         ctl.appendChild(tog);
         const sync = () => {
           const on = !!get();
           tog.classList.toggle('dm-sel', on);
-          txt.textContent = on ? 'On' : 'Off';
+          txt.textContent = on ? t('common.on') : t('common.off');
           row.setAttribute('aria-pressed', on ? 'true' : 'false');
         };
         settingsSync.push(sync);
@@ -1339,27 +1410,33 @@ export function createMenu(ctx) {
       });
     }
 
-    addSegmented('Quality', 'Shadows, ambient occlusion, cloud and the post chain.',
+    addSegmented(t('settings.quality'), t('settings.qualityNote'),
       QUALITY_OPTIONS, () => settings.quality, (v) => applySetting('quality', v));
 
-    addSegmented('Camera', 'Also cycles in-game with C or triangle.',
+    addSegmented(t('settings.camera'), t('settings.cameraNote'),
       CAMERA_OPTIONS, () => settings.camera, (v) => applySetting('camera', v));
 
-    addToggle('Invert look', 'Flips fore/aft weight shift and air pitch.',
+    addToggle(t('settings.invert'), t('settings.invertNote'),
       () => settings.invertLook, (v) => applySetting('invertLook', v));
 
-    addSlider('Field of view', 'Base FOV. The camera still adds its speed kick on top.',
+    addSlider(t('settings.fov'), t('settings.fovNote'),
       55, 95, 1, () => settings.fov, (v) => applySetting('fov', Math.round(v)), (v) => `${Math.round(v)}°`);
 
-    addSlider('Master volume', 'Tyre roll, suspension, chain, wind and ambience.',
+    addSlider(t('settings.volume'), t('settings.volumeNote'),
       0, 1, 0.05, () => settings.volume, (v) => applySetting('volume', v), (v) => `${Math.round(v * 100)}%`);
 
-    addToggle('Photo mode', 'Hides the interface. F or Select brings it back.',
+    addSegmented(t('settings.fps'), t('settings.fpsNote'),
+      FPS_OPTIONS, () => settings.fpsCap, (v) => applySetting('fpsCap', v));
+
+    addSegmented(t('settings.res'), t('settings.resNote'),
+      RES_OPTIONS, () => settings.renderScale, (v) => applySetting('renderScale', v));
+
+    addToggle(t('settings.photo'), t('settings.photoNote'),
       () => settings.photoMode, (v) => setPhotoMode(v));
 
-    P.foot.appendChild(el('div', 'dm-eyebrow', '← → adjust · ⏎ toggle'));
+    P.foot.appendChild(el('div', 'dm-eyebrow', t('settings.foot')));
     const sFoot = el('div', 'dm-btns');
-    sFoot.appendChild(makeButton(settingsView, 'Back', () => back(), { keyHint: 'Esc' }));
+    sFoot.appendChild(makeButton(settingsView, t('common.back'), () => back(), { keyHint: 'Esc' }));
     P.foot.appendChild(sFoot);
 
     settingsView.onEnter = () => {
@@ -1383,14 +1460,14 @@ export function createMenu(ctx) {
     const fromModule = InputModule && (InputModule.BINDINGS || InputModule.KEY_BINDINGS || InputModule.bindings);
     const raw = fromInstance || fromModule;
     if (Array.isArray(raw) && raw.length && raw[0] && Array.isArray(raw[0].items)) {
-      return { groups: raw, source: 'from input.js' };
+      return { groups: raw, source: t('controls.fromInput') };
     }
-    return { groups: KEYMAP, source: 'mirrors input.js' };
+    return { groups: KEYMAP, source: t('controls.mirrors') };
   }
 
   const controlsView = registerView('controls', el('div'));
   {
-    const P = buildPanel(controlsView, { eyebrow: 'Reference', title: 'Controls' });
+    const P = buildPanel(controlsView, { eyebrow: t('controls.eyebrow'), title: t('controls.title') });
     const srcEl = el('div', 'dm-ctl-src');
     P.headR.appendChild(srcEl);
 
@@ -1399,7 +1476,7 @@ export function createMenu(ctx) {
 
     function renderKeys(target, groups) {
       for (let g = 0; g < groups.length; g++) {
-        if (g > 0) target.appendChild(el('span', 'dm-ctl-or', 'or'));
+        if (g > 0) target.appendChild(el('span', 'dm-ctl-or', t('common.or')));
         const chord = groups[g];
         for (let k = 0; k < chord.length; k++) {
           if (k > 0) target.appendChild(el('span', 'dm-key-sep', '/'));
@@ -1417,36 +1494,38 @@ export function createMenu(ctx) {
         const sect = el('div', 'dm-ctl-grp dm-stagger');
         sect.style.setProperty('--i', String(stagger++));
         const h = el('div', 'dm-ctl-grp-h');
-        h.appendChild(el('div', 'dm-eyebrow', grp.group || ''));
+        h.appendChild(el('div', 'dm-eyebrow', grp.group ? t(grp.group) : ''));
         h.appendChild(el('div', 'dm-rule'));
         sect.appendChild(h);
 
         const head = el('div', 'dm-ctl-head');
-        head.appendChild(el('span', null, 'Action'));
-        head.appendChild(el('span', null, 'Keyboard'));
-        head.appendChild(el('span', null, 'Gamepad'));
+        head.appendChild(el('span', null, t('controls.action')));
+        head.appendChild(el('span', null, t('controls.keyboard')));
+        head.appendChild(el('span', null, t('controls.gamepad')));
         sect.appendChild(head);
 
         const items = grp.items || [];
         for (const item of items) {
           const row = el('div', 'dm-ctl-row');
           const a = el('div');
-          a.appendChild(el('div', 'dm-ctl-a', item.action || ''));
-          if (item.note) a.appendChild(el('div', 'dm-ctl-n', item.note));
+          // Bindings coming from input.js carry plain text; t() passes those
+          // through untouched, so both sources render correctly.
+          a.appendChild(el('div', 'dm-ctl-a', item.action ? t(item.action) : ''));
+          if (item.note) a.appendChild(el('div', 'dm-ctl-n', t(item.note)));
           const kc = el('div', 'dm-ctl-k');
           renderKeys(kc, item.keys || []);
           row.appendChild(a);
           row.appendChild(kc);
-          row.appendChild(el('div', 'dm-ctl-p', item.pad || '—'));
+          row.appendChild(el('div', 'dm-ctl-p', item.pad ? t(item.pad) : '—'));
           sect.appendChild(row);
         }
         listHost.appendChild(sect);
       }
     }
 
-    P.foot.appendChild(el('div', 'dm-eyebrow', 'Brakes and triggers are analogue'));
+    P.foot.appendChild(el('div', 'dm-eyebrow', t('controls.foot')));
     const cFoot = el('div', 'dm-btns');
-    cFoot.appendChild(makeButton(controlsView, 'Back', () => back(), { keyHint: 'Esc' }));
+    cFoot.appendChild(makeButton(controlsView, t('common.back'), () => back(), { keyHint: 'Esc' }));
     P.foot.appendChild(cFoot);
 
     controlsView.onEnter = build;
@@ -1463,8 +1542,8 @@ export function createMenu(ctx) {
     const wrap = el('div', 'dm-pause-wrap');
     const inner = el('div', 'dm-pause-inner');
 
-    inner.appendChild(el('div', 'dm-eyebrow', 'Run held'));
-    inner.appendChild(el('h2', 'dm-pause-h', 'Paused'));
+    inner.appendChild(el('div', 'dm-eyebrow', t('pause.eyebrow')));
+    inner.appendChild(el('h2', 'dm-pause-h', t('pause.title')));
 
     const meta = el('div', 'dm-pause-meta');
     function metaItem(label, mono) {
@@ -1475,17 +1554,17 @@ export function createMenu(ctx) {
       meta.appendChild(i);
       return v;
     }
-    pauseTimeEl = metaItem('Elapsed', true);
-    pauseSectionEl = metaItem('Section', false);
-    pauseProgressEl = metaItem('Descended', true);
+    pauseTimeEl = metaItem(t('pause.elapsed'), true);
+    pauseSectionEl = metaItem(t('pause.section'), false);
+    pauseProgressEl = metaItem(t('pause.descended'), true);
     inner.appendChild(meta);
 
     const btns = el('div', 'dm-btns');
-    btns.appendChild(makeButton(pauseView, 'Resume', resumeRun, { primary: true, keyHint: 'Esc' }));
-    btns.appendChild(makeButton(pauseView, 'Restart', () => beginRun(currentMode()), { keyHint: 'R' }));
-    btns.appendChild(makeButton(pauseView, 'Settings', () => setView('settings')));
-    btns.appendChild(makeButton(pauseView, 'Controls', () => setView('controls')));
-    btns.appendChild(makeButton(pauseView, 'Quit to title', quitToTitle));
+    btns.appendChild(makeButton(pauseView, t('pause.resume'), resumeRun, { primary: true, keyHint: 'Esc' }));
+    btns.appendChild(makeButton(pauseView, t('pause.restart'), () => beginRun(currentMode()), { keyHint: 'R' }));
+    btns.appendChild(makeButton(pauseView, t('pause.settings'), () => setView('settings')));
+    btns.appendChild(makeButton(pauseView, t('pause.controls'), () => setView('controls')));
+    btns.appendChild(makeButton(pauseView, t('pause.quit'), quitToTitle));
     inner.appendChild(btns);
 
     wrap.appendChild(inner);
@@ -1503,30 +1582,44 @@ export function createMenu(ctx) {
     const g = gp();
     if (pauseTimeEl) pauseTimeEl.textContent = (g && typeof g.time === 'number') ? fmtTime(g.time) : '—';
     const bs = ctx && ctx.bike && ctx.bike.state;
-    const t = bs && typeof bs.trailT === 'number' ? bs.trailT : null;
-    if (pauseSectionEl) pauseSectionEl.textContent = t == null ? '—' : sectionNameAt(t);
+    const tt = bs && typeof bs.trailT === 'number' ? bs.trailT : null;
+    if (pauseSectionEl) pauseSectionEl.textContent = tt == null ? '—' : sectionNameAt(tt);
     if (pauseProgressEl) {
       let dist = bs && typeof bs.distance === 'number' ? bs.distance : null;
-      if (dist == null && t != null && ctx && ctx.trail && typeof ctx.trail.length === 'number') {
-        dist = t * ctx.trail.length;
+      if (dist == null && tt != null && ctx && ctx.trail && typeof ctx.trail.length === 'number') {
+        dist = tt * ctx.trail.length;
       }
-      pauseProgressEl.textContent = dist == null ? '—' : `${Math.round(dist)} m`;
+      pauseProgressEl.textContent = dist == null ? '—' : t('common.metres', Math.round(dist));
     }
   }
 
-  /** Name of the trail phase containing t — used for split labels. */
-  function sectionNameAt(t) {
+  /**
+   * Translate a trail phase. trail.js owns the English names; we key off its
+   * stable `id` and fall back to the name it shipped if there is no translation.
+   */
+  function phaseName(p) {
+    if (!p) return t('summary.section');
+    if (p.id) {
+      const key = `section.${p.id}`;
+      const s = t(key);
+      if (s !== key) return s;
+    }
+    return p.name || p.id || t('summary.section');
+  }
+
+  /** Name of the trail phase containing tt — used for split labels. */
+  function sectionNameAt(tt) {
     const phases = ctx && ctx.trail && ctx.trail.phases;
     if (Array.isArray(phases) && phases.length) {
       for (let i = 0; i < phases.length; i++) {
         const p = phases[i];
-        if (t >= p.tStart && t <= p.tEnd) return p.name || p.id || 'Section';
+        if (tt >= p.tStart && tt <= p.tEnd) return phaseName(p);
       }
       const last = phases[phases.length - 1];
-      if (t > last.tEnd) return last.name || last.id || 'Section';
-      return phases[0].name || phases[0].id || 'Section';
+      if (tt > last.tEnd) return phaseName(last);
+      return phaseName(phases[0]);
     }
-    return 'Section';
+    return t('summary.section');
   }
 
   // -------------------------------------------------------------------------
@@ -1536,7 +1629,7 @@ export function createMenu(ctx) {
   let sumEyebrow = null, sumTitle = null, sumTimeEl = null, sumDeltaEl = null, sumDeltaNote = null;
   let sumPanel = null, sumSplitsHost = null, sumStatsHost = null, sumBadgeHost = null, sumMetaEl = null;
   {
-    const P = buildPanel(summaryView, { eyebrow: 'Run complete', title: 'Summary', wide: true });
+    const P = buildPanel(summaryView, { eyebrow: t('summary.eyebrow'), title: t('summary.title'), wide: true });
     sumPanel = P.panel;
     sumEyebrow = P.eyeEl;
     sumTitle = P.titleEl;
@@ -1563,10 +1656,10 @@ export function createMenu(ctx) {
     grid.appendChild(sumStatsHost);
     P.body.appendChild(grid);
 
-    P.foot.appendChild(el('div', 'dm-eyebrow', '⏎ retry · Esc menu'));
+    P.foot.appendChild(el('div', 'dm-eyebrow', t('summary.foot')));
     const fbtns = el('div', 'dm-btns');
-    fbtns.appendChild(makeButton(summaryView, 'Retry', () => beginRun(currentMode()), { primary: true, keyHint: 'R' }));
-    fbtns.appendChild(makeButton(summaryView, 'Menu', quitToTitle, { keyHint: 'Esc' }));
+    fbtns.appendChild(makeButton(summaryView, t('summary.retry'), () => beginRun(currentMode()), { primary: true, keyHint: 'R' }));
+    fbtns.appendChild(makeButton(summaryView, t('summary.menu'), quitToTitle, { keyHint: 'Esc' }));
     P.foot.appendChild(fbtns);
   }
 
@@ -1644,21 +1737,21 @@ export function createMenu(ctx) {
     const splits = [];
     for (let i = 0; i < rawSplits.length; i++) {
       const s = rawSplits[i];
-      let st = null, delta = null, t = null, name = null;
+      let st = null, delta = null, tt = null, name = null;
       if (typeof s === 'number') {
         st = s;
       } else if (s && typeof s === 'object') {
         st = num(s.time, s.total, s.cumulative, s.at, s.elapsed);
         delta = num(s.delta, s.diff);
-        t = num(s.t, s.trailT);
+        tt = num(s.t, s.trailT);
         name = typeof s.name === 'string' ? s.name : (typeof s.label === 'string' ? s.label : null);
       }
       if (delta == null) {
         const b = bestSplitTime(i);
         if (b != null && st != null) delta = st - b;
       }
-      if (t == null && cps[i] && typeof cps[i].t === 'number') t = cps[i].t;
-      if (!name) name = (t != null) ? sectionNameAt(t) : `Split ${i + 1}`;
+      if (tt == null && cps[i] && typeof cps[i].t === 'number') tt = cps[i].t;
+      if (!name) name = (tt != null) ? sectionNameAt(tt) : t('summary.split', i + 1);
       splits.push({ index: i, time: st, delta, name });
     }
 
@@ -1692,14 +1785,14 @@ export function createMenu(ctx) {
   }
 
   function statTile(label, value, unit, sub, hot) {
-    const t = el('div', 'dm-stat' + (hot ? ' dm-hot' : ''));
-    t.appendChild(el('div', 'dm-eyebrow', label));
+    const tile = el('div', 'dm-stat' + (hot ? ' dm-hot' : ''));
+    tile.appendChild(el('div', 'dm-eyebrow', label));
     const v = el('div', 'dm-stat-v dm-num');
     v.appendChild(document.createTextNode(value));
     if (unit) v.appendChild(el('span', 'dm-stat-u', unit));
-    t.appendChild(v);
-    t.appendChild(el('div', 'dm-stat-sub', sub || ''));
-    return t;
+    tile.appendChild(v);
+    tile.appendChild(el('div', 'dm-stat-sub', sub || ''));
+    return tile;
   }
 
   function showSummary(payload) {
@@ -1708,28 +1801,30 @@ export function createMenu(ctx) {
 
     // --- header ------------------------------------------------------------
     sumPanel.classList.toggle('dm-pb', !!r.isPB && !free);
-    sumEyebrow.textContent = free ? 'Session ended' : 'Run complete';
-    sumTitle.textContent = free ? 'Free ride' : 'Summary';
+    sumEyebrow.textContent = free ? t('summary.freeEyebrow') : t('summary.eyebrow');
+    sumTitle.textContent = free ? t('summary.freeTitle') : t('summary.title');
 
     const oldBadge = sumBadgeHost.querySelector('.dm-pb-badge');
     if (oldBadge) sumBadgeHost.removeChild(oldBadge);
     if (r.isPB && !free) {
       const badge = el('div', 'dm-pb-badge');
       badge.appendChild(el('span', 'dm-pb-dot'));
-      badge.appendChild(document.createTextNode('Personal best'));
+      badge.appendChild(document.createTextNode(t('summary.pb')));
       sumBadgeHost.appendChild(badge);
     }
-    sumMetaEl.textContent = `Seed ${(ctx && ctx.seed != null) ? ctx.seed : '—'}`;
+    sumMetaEl.textContent = t('common.seed', (ctx && ctx.seed != null) ? ctx.seed : '—');
 
     sumTimeEl.textContent = free ? '—' : fmtTime(r.time);
     if (!free && r.deltaTotal != null) {
       sumDeltaEl.textContent = fmtDelta(r.deltaTotal);
       sumDeltaEl.className = 'dm-delta dm-num ' + deltaClass(r.deltaTotal);
-      sumDeltaNote.textContent = (r.isPB ? 'previous best ' : 'against best ') + fmtTime(r.bestTime);
+      sumDeltaNote.textContent = r.isPB
+        ? t('summary.prevBest', fmtTime(r.bestTime))
+        : t('summary.againstBest', fmtTime(r.bestTime));
     } else if (!free && r.isPB && r.time != null) {
-      sumDeltaEl.textContent = 'First run';
+      sumDeltaEl.textContent = t('summary.firstRun');
       sumDeltaEl.className = 'dm-delta dm-num dm-up';
-      sumDeltaNote.textContent = 'benchmark set';
+      sumDeltaNote.textContent = t('summary.benchmark');
     } else {
       sumDeltaEl.textContent = '';
       sumDeltaEl.className = 'dm-delta dm-num dm-flat';
@@ -1740,9 +1835,9 @@ export function createMenu(ctx) {
     clear(sumSplitsHost);
     const head = el('div', 'dm-split-head');
     head.appendChild(el('span', null, '#'));
-    head.appendChild(el('span', null, 'Section'));
-    head.appendChild(el('span', null, 'Split'));
-    head.appendChild(el('span', null, 'Delta'));
+    head.appendChild(el('span', null, t('summary.colSection')));
+    head.appendChild(el('span', null, t('summary.colSplit')));
+    head.appendChild(el('span', null, t('summary.colDelta')));
     sumSplitsHost.appendChild(head);
 
     let rowI = 0;
@@ -1755,7 +1850,7 @@ export function createMenu(ctx) {
       const s = r.splits[i] || {
         time: null,
         delta: null,
-        name: (cps[i] && typeof cps[i].t === 'number') ? sectionNameAt(cps[i].t) : `Split ${i + 1}`,
+        name: (cps[i] && typeof cps[i].t === 'number') ? sectionNameAt(cps[i].t) : t('summary.split', i + 1),
       };
       const n = seen[s.name] = (seen[s.name] || 0) + 1;
       const label = n > 1 ? `${s.name} ${ROMAN[n] || n}` : s.name;
@@ -1771,7 +1866,7 @@ export function createMenu(ctx) {
       const fin = el('div', 'dm-split-row dm-final');
       fin.style.setProperty('--i', String(rowI++));
       fin.appendChild(el('div', 'dm-split-i dm-num', '✓'));
-      fin.appendChild(el('div', 'dm-split-n', 'Finish'));
+      fin.appendChild(el('div', 'dm-split-n', t('summary.finish')));
       fin.appendChild(el('div', 'dm-split-t dm-num', fmtTime(r.time)));
       fin.appendChild(el('div', 'dm-split-d dm-num ' + deltaClass(r.deltaTotal),
         r.deltaTotal == null ? '—' : fmtDelta(r.deltaTotal)));
@@ -1783,14 +1878,14 @@ export function createMenu(ctx) {
     const stats = el('div', 'dm-stats dm-stagger');
     stats.style.setProperty('--i', '2');
     const kmh = (r.topSpeed || 0) * 3.6;
-    stats.appendChild(statTile('Style', String(Math.round(r.score)), 'pts',
-      r.score > 0 ? 'air, whips, manuals, clean landings' : 'nothing scored this run', r.score > 0));
-    stats.appendChild(statTile('Top speed', kmh.toFixed(1), 'km/h',
-      `${(r.topSpeed || 0).toFixed(1)} m/s`, kmh > 60));
-    stats.appendChild(statTile('Biggest air', (r.airTime || 0).toFixed(2), 's',
-      (r.airDist != null) ? `${r.airDist.toFixed(1)} m carried` : 'hang time', (r.airTime || 0) > 1.2));
-    stats.appendChild(statTile('Crashes', String(Math.round(r.crashes)), '',
-      r.crashes === 0 ? 'clean run' : 'respawned at the last gate', false));
+    stats.appendChild(statTile(t('summary.style'), String(Math.round(r.score)), t('summary.stylePts'),
+      r.score > 0 ? t('summary.styleSub') : t('summary.styleNone'), r.score > 0));
+    stats.appendChild(statTile(t('summary.topSpeed'), kmh.toFixed(1), t('summary.kmh'),
+      t('summary.ms', (r.topSpeed || 0).toFixed(1)), kmh > 60));
+    stats.appendChild(statTile(t('summary.biggestAir'), (r.airTime || 0).toFixed(2), t('summary.seconds'),
+      (r.airDist != null) ? t('summary.carried', r.airDist.toFixed(1)) : t('summary.hangTime'), (r.airTime || 0) > 1.2));
+    stats.appendChild(statTile(t('summary.crashes'), String(Math.round(r.crashes)), '',
+      r.crashes === 0 ? t('summary.cleanRun') : t('summary.respawned'), false));
     sumStatsHost.appendChild(stats);
 
     // Keep our own fallback best in step.
@@ -1912,7 +2007,7 @@ export function createMenu(ctx) {
     unsubs.push(typeof off === 'function' ? off : () => ctx.events.off(name, fn));
   }
 
-  on('run:finish', (payload) => showSummary(payload));
+  on('run:finish', (payload) => atBreak(() => showSummary(payload)));
   on('run:start', () => {
     resetTelemetry();
     wantPaused = false;

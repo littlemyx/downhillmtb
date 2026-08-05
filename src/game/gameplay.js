@@ -47,6 +47,7 @@
 
 import * as THREE from 'three';
 import { clamp, clamp01, lerp } from '../core/rng.js';
+import { t as tr } from '../i18n/i18n.js';
 
 // -----------------------------------------------------------------------------
 // Tuning
@@ -1012,15 +1013,15 @@ export function createGameplay(ctx) {
 
       const rot = Math.abs(maxRot);
       if (rot >= ROT_FULL && !cased) {
-        nameParts[np++] = maxRot > 0 ? 'Frontflip' : 'Backflip';
+        nameParts[np++] = maxRot > 0 ? tr('trick.frontflip') : tr('trick.backflip');
         raw += 460 * Math.floor(rot / ROT_FULL);
       } else if (rot >= ROT_FULL * 0.55) {
-        nameParts[np++] = 'Suicide No-Hander';   // half rotation held and pulled back
+        nameParts[np++] = tr('trick.suicideNoHander');   // half rotation held and pulled back
         raw += 120;
       }
 
       if (maxWhip >= WHIP_MIN) {
-        nameParts[np++] = maxWhip > 0.95 ? 'Big Whip' : (maxWhip > 0.55 ? 'Whip' : 'Scrub');
+        nameParts[np++] = maxWhip > 0.95 ? tr('trick.bigWhip') : (maxWhip > 0.55 ? tr('trick.whip') : tr('trick.scrub'));
         raw += WHIP_RATE * (maxWhip - WHIP_MIN * 0.5);
       }
 
@@ -1028,9 +1029,9 @@ export function createGameplay(ctx) {
         const airPts = AIR_RATE * Math.pow(airTime, AIR_EXP);
         raw += airPts;
         airTotal += airTime;
-        if (airTime > 1.8) nameParts[np++] = 'Huge Air';
-        else if (airTime > 1.0 && np === 0) nameParts[np++] = 'Big Air';
-        else if (np === 0) nameParts[np++] = 'Air';
+        if (airTime > 1.8) nameParts[np++] = tr('trick.hugeAir');
+        else if (airTime > 1.0 && np === 0) nameParts[np++] = tr('trick.bigAir');
+        else if (np === 0) nameParts[np++] = tr('trick.air');
       }
 
       // Vertical drop from the top of the arc to the landing. A 4 m huck off a
@@ -1039,7 +1040,7 @@ export function createGameplay(ctx) {
       const drop = peakHeight - num(landY, peakHeight);
       if (drop > 2.5) {
         raw += 22 * (drop - 2.0);
-        if (np === 0 || drop > 6) nameParts[np++] = drop > 6 ? 'Huck' : 'Drop';
+        if (np === 0 || drop > 6) nameParts[np++] = drop > 6 ? tr('trick.huck') : tr('trick.drop');
       }
 
       if (cased) {
@@ -1059,8 +1060,8 @@ export function createGameplay(ctx) {
 
       if (raw <= 0) return;
 
-      if (quality >= LAND_PERFECT) { nameParts[np++] = 'Perfect Landing'; raw += 85; }
-      else if (quality >= LAND_CLEAN) { nameParts[np++] = 'Clean Landing'; raw += 40; }
+      if (quality >= LAND_PERFECT) { nameParts[np++] = tr('trick.perfectLanding'); raw += 85; }
+      else if (quality >= LAND_CLEAN) { nameParts[np++] = tr('trick.cleanLanding'); raw += 40; }
 
       let name = nameParts[0];
       for (let i = 1; i < np; i++) name += ' + ' + nameParts[i];
@@ -1155,8 +1156,8 @@ export function createGameplay(ctx) {
           } else if (manualTime > 0) {
             if (manualTime >= MANUAL_MIN) {
               const nm = manualKind === 2
-                ? (manualTime > 2.0 ? 'Long Nose Manual' : 'Nose Manual')
-                : (manualTime > 2.5 ? 'Long Manual' : 'Manual');
+                ? (manualTime > 2.0 ? tr('trick.longNoseManual') : tr('trick.noseManual'))
+                : (manualTime > 2.5 ? tr('trick.longManual') : tr('trick.manual'));
               award(nm, MANUAL_RATE * manualTime, 'manual');
             }
             manualTime = 0;
@@ -1165,7 +1166,7 @@ export function createGameplay(ctx) {
         } else if (manualTime > 0) {
           // Popped into the air out of a manual — still counts.
           if (manualTime >= MANUAL_MIN) {
-            award(manualKind === 2 ? 'Nose Manual' : 'Manual', MANUAL_RATE * manualTime, 'manual');
+            award(manualKind === 2 ? tr('trick.noseManual') : tr('trick.manual'), MANUAL_RATE * manualTime, 'manual');
           }
           manualTime = 0;
           manualKind = 0;
@@ -1178,7 +1179,7 @@ export function createGameplay(ctx) {
         const closeness = clamp01(1 - distance / NEARMISS_RADIUS);
         const speedK = clamp01((speed - NEARMISS_MIN_SPEED) / 9);
         const raw = 26 + 44 * closeness * (0.5 + 0.5 * speedK);
-        award(closeness > 0.65 ? 'Tree Skimmer' : 'Near Miss', raw, 'nearmiss');
+        award(closeness > 0.65 ? tr('trick.treeSkimmer') : tr('trick.nearMiss'), raw, 'nearmiss');
       },
 
       get manualTime() { return manualTime; },

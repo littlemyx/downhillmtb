@@ -39,6 +39,9 @@ function qaCapture() {
 
 export default defineConfig({
   plugins: [qaCapture()],
-  server: { port: 5178, host: '127.0.0.1' },
-  build: { target: 'esnext', sourcemap: true },
+  // Yandex Games serves the uploaded build from a per-draft path, so every asset
+  // reference has to be relative to index.html rather than to the origin root.
+  base: './',
+  server: { port: Number(process.env.PORT) || 5178, host: '127.0.0.1' },
+  build: { target: 'esnext', sourcemap: false },
 });

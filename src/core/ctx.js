@@ -60,7 +60,14 @@ export function createContext(container, options = {}) {
   const quality = options.quality || 'high';
   const settings = {
     ...QUALITY_PRESETS[quality],
-    pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+    // 1.5 is the sweet spot on retina: ~25% cheaper frames than native 2.0, and the
+    // difference is hidden behind SMAA + film grain. The engine's per-tier pixel
+    // budget and frame-time governor still trim this further on huge displays.
+    pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
+    // Render-loop frame cap (frames per second, 0 = uncapped). Enforced by main.js.
+    // Without it the game runs at display refresh — 120 Hz on ProMotion — and the GPU
+    // burns twice the power for no perceptible gain on a 60 fps-class game.
+    fpsCap: 60,
   };
 
   const ctx = {
@@ -83,6 +90,7 @@ export function createContext(container, options = {}) {
     collision: null, bike: null, bikeModel: null, rider: null, particles: null,
     chaseCamera: null, audio: null, gameplay: null, hud: null, menu: null,
     postfx: null,
+    platform: null,          // host-platform adapter (Yandex Games); null off-platform
 
     debug: {
       enabled: new URLSearchParams(location.search).has('debug'),

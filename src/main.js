@@ -23,6 +23,8 @@ import { createGameplay } from './game/gameplay.js';
 import { createHud } from './ui/hud.js';
 import { createMenu } from './ui/menu.js';
 import { createPostFX } from './core/postfx.js';
+import { createPlatform } from './platform/yandex.js';
+import { setLang } from './i18n/i18n.js';
 
 const MAX_DT = 1 / 20;
 
@@ -59,6 +61,11 @@ async function boot() {
   window.__DESCENT__ = ctx;
   window.__DESCENT_ERRORS__ = [];
 
+  // Platform init runs alongside terrain generation — by the time the UI waves
+  // need a language, it has long since settled. It never rejects.
+  ctx.platform = safe('platform', () => createPlatform());
+  const platformInit = ctx.platform ? ctx.platform.init({ timeoutMs: 3000 }) : null;
+
   // ---- wave 1: engine + input -------------------------------------------
   const engine = safe('engine', () => createEngine(ctx));
   ctx.engine = engine;
@@ -94,6 +101,16 @@ async function boot() {
     if (ctx[name]?.init) await safeAsync(`${name}.init`, () => ctx[name].init());
   }
 
+  // ---- platform: language and cloud record, both before any UI is built ----
+  // The language has to be in place before the HUD/menu factories run (they build
+  // their DOM eagerly), and the cloud personal best has to be in localStorage
+  // before gameplay reads it at construction.
+  const platformState = await safeAsync('platform.init', () => platformInit);
+  safe('i18n', () => setLang(platformState ? platformState.lang : navigator.language));
+  if (platformState && platformState.sdk) {
+    await safeAsync('platform.mergeCloudBest', () => ctx.platform.mergeCloudBest(ctx.seed));
+  }
+
   // ---- wave 5..8 ---------------------------------------------------------
   const rest = [
     ['collision', createCollision], ['bike', createBike],
@@ -105,6 +122,9 @@ async function boot() {
     ctx[name] = safe(name, () => factory(ctx));
     if (ctx[name]?.init) await safeAsync(`${name}.init`, () => ctx[name].init());
   }
+
+  // Gameplay marks, ad pauses and score submission all hang off ctx.events.
+  safe('platform.bind', () => ctx.platform?.bind(ctx));
 
   // ---- wave 9: post-processing (needs the finished scene) ----------------
   ctx.postfx = safe('postfx', () => createPostFX(ctx));
@@ -144,8 +164,20 @@ async function boot() {
   });
 
   let frameErrLogged = new Set();
+  // Frame cap: on high-refresh displays rAF fires at 120 Hz+; skipped ticks return
+  // before touching the clock, so the skipped time simply folds into the next dt.
+  // Paced off the previous deadline (not "now") so vsync jitter doesn't drift the
+  // rate; the 0.5 ms tolerance keeps a 60 cap from slipping to 40 on a 120 Hz panel.
+  let capDeadline = 0;
   function tick() {
     requestAnimationFrame(tick);
+    const cap = ctx.settings.fpsCap | 0;
+    if (cap > 0) {
+      const now = performance.now();
+      const interval = 1000 / cap;
+      if (now - capDeadline < interval - 0.5) return;
+      capDeadline = Math.max(capDeadline + interval, now - interval);
+    }
     const dt = Math.min(ctx.clock.getDelta(), MAX_DT);
     ctx.dt = dt;
     ctx.time += dt;
@@ -173,7 +205,11 @@ async function boot() {
     }
 
     // Signal for the automated visual-QA pass: the first fully rendered frame.
-    if (ctx.frame === 3) document.body.dataset.descentReady = '1';
+    // The same moment is what the platform means by "loaded" (requirement 1.19).
+    if (ctx.frame === 3) {
+      document.body.dataset.descentReady = '1';
+      ctx.platform?.markReady();
+    }
   }
   tick();
 

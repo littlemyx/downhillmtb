@@ -33,6 +33,7 @@
 //     comment is stale, and this module follows the code.
 
 import { clamp, clamp01, damp } from '../core/rng.js';
+import { t } from '../i18n/i18n.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1091,24 +1092,24 @@ export function createHud(ctx) {
   // ---- timer -------------------------------------------------------------
   const clTimer = h('div', 'cl cl-timer', frame);
   const timerRule = h('div', 'timer-rule', clTimer);
-  h('div', 'lbl', clTimer, 'Run Time');
+  h('div', 'lbl', clTimer, t('hud.runTime'));
   const elTimer = h('div', 'timer num', clTimer);
   const elTMain = h('span', 't-main', elTimer, '0:00');
   const elTFrac = h('span', 't-frac', elTimer, '.00');
   const timerSub = h('div', 'timer-sub', clTimer);
-  h('div', 'lbl', timerSub, 'Best');
+  h('div', 'lbl', timerSub, t('hud.best'));
   const elBest = h('div', 'best num', timerSub, '--:--.--');
   const elDelta = h('div', 'delta num', clTimer, '+0.00');
 
   // ---- trail progress ----------------------------------------------------
   const clProg = h('div', 'cl cl-prog', frame);
-  h('div', 'lbl', clProg, 'Start');
+  h('div', 'lbl', clProg, t('hud.start'));
   const progTrack = h('div', 'prog-track', clProg);
   h('div', 'prog-fill', progTrack);
   const progGhost = h('div', 'prog-ghost', progTrack);
   const progMarker = h('div', 'prog-marker', progTrack);
   const progCap = h('div', 'prog-cap', clProg);
-  h('div', 'lbl', progCap, 'Finish');
+  h('div', 'lbl', progCap, t('hud.finish'));
   const elProgPct = h('div', 'prog-pct num', progCap, '0%');
   let progPips = [];
 
@@ -1117,7 +1118,7 @@ export function createHud(ctx) {
   const airRow = h('div', 'air-row', clAir);
   const elAirVal = h('div', 'air-val num', airRow, '0.00');
   h('div', 'air-unit', airRow, 's');
-  h('div', 'lbl', clAir, 'Airtime');
+  h('div', 'lbl', clAir, t('hud.airtime'));
 
   // ---- style meter -------------------------------------------------------
   const clStyle = h('div', 'cl cl-style', frame);
@@ -1130,7 +1131,7 @@ export function createHud(ctx) {
     chipPool.push({ el: c, lbl: cl, val: cv, anim: null });
   }
   const styleHead = h('div', 'style-head', clStyle);
-  h('div', 'lbl', styleHead, 'Style');
+  h('div', 'lbl', styleHead, t('hud.style'));
   const elMult = h('div', 'style-mult num', styleHead, '×1.0');
   const styleBar = h('div', 'style-bar', clStyle);
   h('div', 'style-fill', styleBar);
@@ -1140,7 +1141,7 @@ export function createHud(ctx) {
   const clTele = h('div', 'cl cl-tele', frame);
 
   const modGrade = h('div', 'mod mod-grade', clTele);
-  h('div', 'lbl', modGrade, 'Grade');
+  h('div', 'lbl', modGrade, t('hud.grade'));
   const gradeBody = h('div', 'mod-body', modGrade);
   const inclBox = h('div', 'incl', gradeBody);
   const inclRot = h('div', 'incl-rot', inclBox);
@@ -1150,7 +1151,7 @@ export function createHud(ctx) {
 
   // ---- balance (R9) ------------------------------------------------------
   const modBal = h('div', 'mod mod-bal', clTele);
-  h('div', 'lbl', modBal, 'Balance');
+  h('div', 'lbl', modBal, t('hud.balance'));
   const balBody = h('div', 'mod-body', modBal);
   const balBox = h('div', 'bal', balBody);
   const balRot = h('div', 'bal-rot', balBox);
@@ -1161,7 +1162,7 @@ export function createHud(ctx) {
   const balCmdEl = h('div', 'bal-cmd', balRot);
   const balDot = h('div', 'bal-dot', balRot);
   const balCue = h('div', 'bal-cue', modBal);
-  const elBalCue = h('div', 'bal-cue-txt', balCue, 'Rear Light');
+  const elBalCue = h('div', 'bal-cue-txt', balCue, t('hud.rearLight'));
   const elBalKey = h('div', 'bal-key', balCue, 'S');
   // The band is fixed in wheelbase terms — it is the dot that moves — so it is
   // written once, here, from the same constants the warning states use.
@@ -1171,7 +1172,7 @@ export function createHud(ctx) {
     ((BAL_X1 - BAL_X0) * (1 - BAL_HI - BAL_FRONT_LO)).toFixed(4));
 
   const modBrake = h('div', 'mod mod-brake', clTele);
-  h('div', 'lbl', modBrake, 'Brakes');
+  h('div', 'lbl', modBrake, t('hud.brakes'));
   const brakeBody = h('div', 'mod-body', modBrake);
   const brkSet = h('div', 'brk-set', brakeBody);
   function makeBrake(key) {
@@ -1185,7 +1186,7 @@ export function createHud(ctx) {
   const brkRearFill = makeBrake('R');
 
   const modGear = h('div', 'mod mod-gear', clTele);
-  h('div', 'lbl', modGear, 'Gear');
+  h('div', 'lbl', modGear, t('hud.gear'));
   const gearBody = h('div', 'mod-body', modGear);
   const elGear = h('div', 'gear-num num', gearBody, '1');
   const gearPipsWrap = h('div', 'gear-pips', gearBody);
@@ -1249,7 +1250,7 @@ export function createHud(ctx) {
   const elSpeed = h('div', 'sp-val num', spRead, '0');
   h('div', 'sp-unit', spRead, 'km/h');
   const spFoot = h('div', 'sp-foot', clSpeed);
-  h('div', 'lbl', spFoot, 'Peak');
+  h('div', 'lbl', spFoot, t('hud.peak'));
   const elPeak = h('div', 'sp-peak-val num', spFoot, '0');
 
   // ---- full-bleed layers (outside .shake) --------------------------------
@@ -1257,11 +1258,11 @@ export function createHud(ctx) {
   const elVig = h('div', 'layer vig', root);
   const banner = h('div', 'banner', root);
   const bannerRule = h('div', 'banner-rule', banner);
-  const elBannerTtl = h('div', 'banner-ttl', banner, 'Checkpoint');
+  const elBannerTtl = h('div', 'banner-ttl', banner, t('hud.checkpoint'));
   const elBannerVal = h('div', 'banner-val num', banner, '');
   const countBox = h('div', 'count', root);
   const elCountN = h('div', 'count-n', countBox, '3');
-  h('div', 'lbl count-lbl', countBox, 'Get Ready');
+  h('div', 'lbl count-lbl', countBox, t('hud.getReady'));
 
   // ---- debug -------------------------------------------------------------
   const dbg = h('div', 'dbg', frame);
@@ -1306,7 +1307,7 @@ export function createHud(ctx) {
   // both wheel loads are zero and the fraction has no meaning.
   let balRear = 1 - 0.45;   // bike.js FRONT_BIAS — the static split, as a seed
   let balCueT = 0;
-  let balCueTxt = 'Rear Light';
+  let balCueTxt = t('hud.rearLight');
   let balCueKey = 'S';
 
   let airVisible = false;
@@ -1464,7 +1465,7 @@ export function createHud(ctx) {
     balCueT = 0;
     for (const p of progPips) setFlag(p, 'done', false);
     countBox.classList.remove('on');
-    showBanner('Go', '', 'good', 1100);
+    showBanner(t('hud.go'), '', 'good', 1100);
   });
 
   on('run:checkpoint', (p) => {
@@ -1496,21 +1497,21 @@ export function createHud(ctx) {
         { transform: 'translate3d(0,0,0) scale(1.16)' },
         { transform: 'translate3d(0,0,0) scale(1)' },
       ], { duration: 520, easing: 'cubic-bezier(0.22,1.35,0.36,1)' });
-      showBanner('Split ' + (idx + 1), fmtDelta(delta), good ? 'good' : 'bad', 1500);
+      showBanner(t('hud.split', idx + 1), fmtDelta(delta), good ? 'good' : 'bad', 1500);
       screenFlash(good ? 0.55 : 0.4,
         good ? 'linear-gradient(180deg, rgba(70,224,140,0.16), rgba(70,224,140,0) 36%)'
              : 'linear-gradient(180deg, rgba(255,74,94,0.14), rgba(255,74,94,0) 36%)');
     } else {
-      showBanner('Split ' + (idx + 1), now !== undefined ? fmtClock(now) : '', null, 1400);
+      showBanner(t('hud.split', idx + 1), now !== undefined ? fmtClock(now) : '', null, 1400);
       screenFlash(0.5, 'linear-gradient(180deg, rgba(125,238,255,0.14), rgba(125,238,255,0) 36%)');
     }
   });
 
   on('run:finish', (p) => {
     const gp = gameplay();
-    const t = pickNum(p && p.time, p && p.total, gp && gp.time);
+    const total = pickNum(p && p.time, p && p.total, gp && gp.time);
     const isBest = !!(p && (p.isBest || p.newBest || p.record));
-    showBanner(isBest ? 'New Best' : 'Finish', t !== undefined ? fmtClock(t) : '',
+    showBanner(isBest ? t('hud.newBest') : t('hud.finish'), total !== undefined ? fmtClock(total) : '',
       isBest ? 'good' : null, 2600);
     screenFlash(0.7, 'linear-gradient(180deg, rgba(125,238,255,0.18), rgba(125,238,255,0) 40%)');
     deltaHold = 0;
@@ -1523,7 +1524,7 @@ export function createHud(ctx) {
     const sev = raw > 1.5 ? clamp01(raw / 12) : clamp01(raw);
     damage = Math.min(1, damage + 0.52 + sev * 0.40);
     addShake(0.55 + sev * 0.55);
-    showBanner('Crash', '', 'bad', 1400);
+    showBanner(t('hud.crash'), '', 'bad', 1400);
   });
 
   on('bike:impact', (p) => {
@@ -1547,7 +1548,7 @@ export function createHud(ctx) {
       const pts = Math.round(at * 140 * (0.55 + q * 0.75));
       localScore += pts;
       styleCharge = clamp01(styleCharge + 0.20 + at * 0.10);
-      pushChip(at > 1.6 ? 'Huge Air' : 'Air', pts);
+      pushChip(at > 1.6 ? t('trick.hugeAir') : t('trick.air'), pts);
     }
   });
 
@@ -1759,7 +1760,7 @@ export function createHud(ctx) {
     else if (grounded && frontLight && balCmd < 0.75) cueTxt = 'front';
     if (cueTxt) {
       const pad = !!(ctx && ctx.input && ctx.input.hasGamepad);
-      balCueTxt = cueTxt === 'rear' ? 'Rear Light' : 'Front Light';
+      balCueTxt = cueTxt === 'rear' ? t('hud.rearLight') : t('hud.frontLight');
       balCueKey = cueTxt === 'rear' ? (pad ? '↓' : 'S') : (pad ? '↑' : 'W');
       balCueT = BAL_CUE_HOLD;
     } else if (balCueT > 0) {
@@ -1885,7 +1886,7 @@ export function createHud(ctx) {
         localCountdown = Math.max(0, localCountdown - d);
         cv = localCountdown;
       }
-      const n = cv <= 0.02 ? 'Go' : String(Math.ceil(cv));
+      const n = cv <= 0.02 ? t('hud.go') : String(Math.ceil(cv));
       countBox.classList.add('on');
       if (n !== last.countN) {
         last.countN = n;

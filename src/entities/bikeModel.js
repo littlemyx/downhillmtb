@@ -3480,6 +3480,9 @@ export function createBikeModel(ctx) {
     opacity: 1.0,
     depthWrite: false,
     blending: THREE.MultiplyBlending,
+    // r185+: MultiplyBlending only works with premultiplied alpha; the blob's
+    // alpha is 1 everywhere, so premultiplying is a no-op and dst *= rgb holds.
+    premultipliedAlpha: true,
     fog: false,
     toneMapped: false,
   });

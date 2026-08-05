@@ -13,6 +13,11 @@
   </head>
   <body>
     <div id="app"></div>
+    <!-- Yandex Games SDK. Served by the platform from the game's own origin —
+         an absolute yandex.ru URL 404s. A classic script, so it is settled before
+         the deferred module below runs; off-platform it simply fails and YaGames
+         stays undefined. -->
+    <script src="/sdk.js"></script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
