@@ -80,17 +80,6 @@
       "gain": 0
     },
     {
-      "id": "impact_soft_02",
-      "kind": "impact_soft",
-      "role": "oneshot",
-      "priority": 0,
-      "files": {
-        "opus": "impact_soft_02.ogg",
-        "aac": "impact_soft_02.m4a"
-      },
-      "gain": 0
-    },
-    {
       "id": "slide_01",
       "kind": "slide",
       "role": "oneshot",

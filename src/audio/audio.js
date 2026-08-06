@@ -1052,7 +1052,9 @@ export function createAudio(ctx) {
       osc.type = 'triangle';
       if (claimVoice(osc)) {
         osc.connect(b.lp);
-        b.send.gain.value = SEND_MECH;
+        // Dry while a recorded landing take is playing — low triangle through
+        // the convolver is exactly the "room" the samples are trying to avoid.
+        b.send.gain.value = impactSmpCool > 0 ? 0 : SEND_MECH;
         pset(b.lp.frequency, lowHz * 6);
         b.pan.pan.value = clamp(pan || 0, -1, 1);
         osc.frequency.setValueAtTime(lowHz * 1.9, t);
@@ -1068,7 +1070,7 @@ export function createAudio(ctx) {
       }
     }
     // Air/oil rush through the damper.
-    grain(t, 260 + rng() * 160, 1.1, amp * 0.55, 0.10, pan, 0.55 + rng() * 0.3, SEND_MECH);
+    grain(t, 260 + rng() * 160, 1.1, amp * 0.55, 0.10, pan, 0.55 + rng() * 0.3, impactSmpCool > 0 ? 0 : SEND_MECH);
     if (hard > 0.02) {
       // Bottom-out: a recorded damped clank when decoded — a real mechanical
       // thump that layers fine with the impact foley, unlike the synthesised
@@ -1188,7 +1190,9 @@ export function createAudio(ctx) {
     const smp = (sev > 0.12 && !smpActive)
       ? sfxPick(sev > 0.45 ? 'impact_hard' : 'impact_soft') : null;
     const sup = (smp || smpActive) ? 0.3 : 1;
-    const sendHit = (smp || smpActive) ? SEND_HIT * 0.1 : SEND_HIT;
+    // Zero send in the sample era: even a 5% share of the convolver return
+    // reads as room on a dry recording.
+    const sendHit = (smp || smpActive) ? 0 : SEND_HIT;
 
     // --- low body drop -------------------------------------------------------
     const b = takeBody(t);
