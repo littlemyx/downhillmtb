@@ -1,0 +1,177 @@
+{
+  "version": 1,
+  "bpm": 96,
+  "key": "Dm",
+  "beatsPerBar": 4,
+  "note": "Suno-generated stems (gu_engine/audio_gen/src/descent-music). window = tension trapezoid for layers; bands = phrase tension bands; priority = fetch stage.",
+  "assets": [
+    {
+      "id": "base",
+      "role": "layer",
+      "priority": 0,
+      "files": {
+        "opus": "base.ogg",
+        "aac": "base.m4a"
+      },
+      "bars": 8,
+      "gain": 0,
+      "loopStart": 0,
+      "loopEnd": 20,
+      "window": [
+        -1,
+        -1,
+        2,
+        2
+      ]
+    },
+    {
+      "id": "harm",
+      "role": "layer",
+      "priority": 1,
+      "files": {
+        "opus": "harm.ogg",
+        "aac": "harm.m4a"
+      },
+      "bars": 8,
+      "gain": 0,
+      "loopStart": 0,
+      "loopEnd": 20,
+      "window": [
+        0.15,
+        0.35,
+        0.9,
+        1.1
+      ]
+    },
+    {
+      "id": "rhythm",
+      "role": "layer",
+      "priority": 1,
+      "files": {
+        "opus": "rhythm.ogg",
+        "aac": "rhythm.m4a"
+      },
+      "bars": 4,
+      "gain": 0,
+      "loopStart": 0,
+      "loopEnd": 10,
+      "window": [
+        0.4,
+        0.6,
+        1.1,
+        1.2
+      ]
+    },
+    {
+      "id": "high",
+      "role": "layer",
+      "priority": 1,
+      "files": {
+        "opus": "high.ogg",
+        "aac": "high.m4a"
+      },
+      "bars": 4,
+      "gain": 0,
+      "loopStart": 0,
+      "loopEnd": 10,
+      "window": [
+        0.65,
+        0.85,
+        1.1,
+        1.2
+      ]
+    },
+    {
+      "id": "ph_low_01",
+      "role": "phrase",
+      "register": "low",
+      "priority": 2,
+      "files": {
+        "opus": "ph_low_01.ogg",
+        "aac": "ph_low_01.m4a"
+      },
+      "bars": 2,
+      "gain": 0,
+      "release": 0.4,
+      "bands": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "id": "ph_low_02",
+      "role": "phrase",
+      "register": "low",
+      "priority": 2,
+      "files": {
+        "opus": "ph_low_02.ogg",
+        "aac": "ph_low_02.m4a"
+      },
+      "bars": 2,
+      "gain": 0,
+      "release": 0.4,
+      "bands": [
+        0,
+        1
+      ]
+    },
+    {
+      "id": "ph_high_01",
+      "role": "phrase",
+      "register": "high",
+      "priority": 2,
+      "files": {
+        "opus": "ph_high_01.ogg",
+        "aac": "ph_high_01.m4a"
+      },
+      "bars": 2,
+      "gain": 0,
+      "release": 0.4,
+      "bands": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "id": "ph_high_02",
+      "role": "phrase",
+      "register": "high",
+      "priority": 2,
+      "files": {
+        "opus": "ph_high_02.ogg",
+        "aac": "ph_high_02.m4a"
+      },
+      "bars": 2,
+      "gain": 0,
+      "release": 0.4,
+      "bands": [
+        2,
+        3
+      ]
+    },
+    {
+      "id": "st_crash",
+      "role": "stinger",
+      "event": "crash",
+      "priority": 0,
+      "files": {
+        "opus": "st_crash.ogg",
+        "aac": "st_crash.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "st_finish",
+      "role": "stinger",
+      "event": "finish",
+      "priority": 0,
+      "files": {
+        "opus": "st_finish.ogg",
+        "aac": "st_finish.m4a"
+      },
+      "gain": 0
+    }
+  ]
+}

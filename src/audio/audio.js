@@ -1,11 +1,14 @@
 // =============================================================================
 // audio.js — DESCENT. Fully synthesised WebAudio engine (CONTRACT §8).
 //
-// Nothing here is loaded from disk or network: every buffer, impulse response
-// and waveform is generated in code at start-up from the deterministic PRNG in
-// core/rng.js. The graph is only built after a real user gesture, so the page
-// can never be autoplay-blocked and no AudioContext exists until the player has
-// touched something.
+// Almost nothing here is loaded from disk or network: every buffer, impulse
+// response and waveform is generated in code at start-up from the deterministic
+// PRNG in core/rng.js. The one exception (CONTRACT amendment) is a small set of
+// pre-produced Suno foley samples (impact/crash/slide/wind, public/sfx/) that
+// replace the harshest synthesised one-shots when decoded — with the synthesis
+// kept as the fallback. The graph is only built after a real user gesture, so
+// the page can never be autoplay-blocked and no AudioContext exists until the
+// player has touched something.
 //
 // CONTRACT-NOTE: "no per-frame allocations in update()" cannot be taken
 // literally for WebAudio one-shots — AudioBufferSourceNode and OscillatorNode
@@ -38,22 +41,26 @@
 //   busBike   tyre roll, grains, suspension, chain, freehub, brakes, skid,
 //             impacts, crashes, rider breathing and grunts
 //   busWind   wind noise (dry only — wind is not a reverberant source)
-//   busAmb    forest bed, birds, creek           -> ambDuck -> master
+//   busAmb    forest bed, birds, creek           -> ambDuck -> busSfx
 //   busUI     run-event tones
 //
-//   each bus -> (dry gain -> master) + (send gain -> revSend)
+//   each bus -> (dry gain -> busSfx) + (send gain -> revSend)
+//
+// busSfx is the effects volume stage: every non-music path (dry buses, reverb
+// returns) sums into it before master, so setSfxVolume scales effects only.
 //
 // Everything on busBike additionally carries a PER-VOICE reverb send, set at
 // trigger time, because the families sharing that bus want wildly different
 // space: a tyre grain wants almost none (it happens under you), a crash wants
 // a lot (it should sound like the whole valley heard it).
 //   revSend  -> convolverForest -> returnForest -\
-//            -> convolverOpen   -> returnOpen   --> master
+//            -> convolverOpen   -> returnOpen   --> busSfx -> master
 //   master   -> limiter (DynamicsCompressor, brick-ish) -> destination
 // =============================================================================
 
 import { makeRng, subSeed, clamp, clamp01, lerp, damp } from '../core/rng.js';
 import { Surface } from '../world/terrain.js';
+import { createSfxLoader } from './sfx/loader.js';
 
 // -----------------------------------------------------------------------------
 // Tuning constants
@@ -380,18 +387,22 @@ export function createAudio(ctx) {
   // Persisted / externally settable state. Valid before the graph exists.
   // ---------------------------------------------------------------------------
   let masterVolume = 0.85;
+  let musicVolume = 0.7;
+  let sfxVolume = 1.0;
   let muted = false;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const p = JSON.parse(raw);
       if (typeof p.volume === 'number') masterVolume = clamp01(p.volume);
+      if (typeof p.musicVolume === 'number') musicVolume = clamp01(p.musicVolume);
+      if (typeof p.sfxVolume === 'number') sfxVolume = clamp01(p.sfxVolume);
       if (typeof p.muted === 'boolean') muted = p.muted;
     }
   } catch (e) { /* private mode / disabled storage — defaults are fine */ }
 
   function persist() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ volume: masterVolume, muted })); }
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ volume: masterVolume, musicVolume, sfxVolume, muted })); }
     catch (e) { /* ignore */ }
   }
 
@@ -436,7 +447,7 @@ export function createAudio(ctx) {
   // Suspension trackers (previous travel, for a velocity we can trust even if
   // bike.js does not publish one).
   let prevFork = 0, prevShock = 0, forkDeep = 0, shockDeep = 0;
-  let thunkCool = 0, reboundCool = 0, clankCool = 0, slapCool = 0;
+  let thunkCool = 0, reboundCool = 0, slapCool = 0;
   let grainAcc = 0, birdTimer = 3.5, bloopTimer = 2.0;
   let envTimer = 0, creekTimer = 0, crashCool = 0;
   let runTime = 0;
@@ -446,7 +457,9 @@ export function createAudio(ctx) {
   // Graph handles. All null until build().
   // ---------------------------------------------------------------------------
   let master, limiter, shaper;
+  let busSfx;
   let busBike, busWind, busAmb, busUI, ambDuck;
+  let busMusic, musicDuck;
   let revSend, revForestGain, revOpenGain;
   let nWhite, nPink, nBrown;                       // shared noise buffers
 
@@ -455,6 +468,19 @@ export function createAudio(ctx) {
   let tySrcBrown, tySrcPink, tySrcWhite;
   // wind
   let wdSrcL, wdSrcR, wdBpL, wdBpR, wdGainL, wdGainR, wdPanL, wdPanR, wdLowSrc, wdLowLP, wdLowGain;
+  // Suno-sampled SFX (public/sfx/). Loader fetches lazily; every pick() has a
+  // procedural fallback, so none of this is load-bearing.
+  let sfxLoader = null;
+  let wdSmpSrc = null, wdSmpGain = null, wdSmpLP = null;
+  // While a sampled crash take is playing, impact() must not add its own
+  // recorded hit — two foley thuds 20 ms apart read as a flam/echo. The
+  // synthesised low body drop still fires; only the sample is suppressed.
+  // The cooldown also mutes the metallic one-shots (bottom-out clank, chain
+  // slap, pings) that read as chimes on top of a recording.
+  let impactSmpCool = 0;
+  // The last started impact take: a run:crash arriving in the same physics
+  // step stops it and substitutes the crash take, killing the comb/flam.
+  let lastImpactSmp = null, lastImpactSmpT = -9;
   // freehub
   let fhOsc, fhShape, fhHP, fhBpA, fhBpB, fhBpC, fhGain, fhJitterSrc, fhJitterLP, fhJitterAmt;
   // brakes
@@ -624,8 +650,13 @@ export function createAudio(ctx) {
     const revPre2 = mkFilter('lowpass', 7200, 0.7, null, null);
     revSend.connect(revPre);
     revPre.connect(revPre2);
-    revForestGain = mkGain(0.7, master);
-    revOpenGain = mkGain(0.0, master);
+    // Every non-music path sums into busSfx before master, so one gain scales
+    // effects (bike, wind, UI, ambience, reverb returns) without touching the
+    // music. Perceptual (v^2), same convention as busMusic.
+    busSfx = mkGain(sfxVolume * sfxVolume, master);
+
+    revForestGain = mkGain(0.7, busSfx);
+    revOpenGain = mkGain(0.0, busSfx);
     revPre2.connect(convForest);
     revPre2.connect(convOpen);
     convForest.connect(revForestGain);
@@ -635,7 +666,7 @@ export function createAudio(ctx) {
     // Each bus is a summing gain with a fixed dry path and a fixed reverb send.
     function mkBus(dry, send) {
       const b = mkGain(1.0);
-      const d = mkGain(dry, master);
+      const d = mkGain(dry, busSfx);
       b.connect(d);
       if (send > 0) { const s = mkGain(send, revSend); b.connect(s); }
       return b;
@@ -644,10 +675,16 @@ export function createAudio(ctx) {
     busBike = mkBus(1.0, 0.0);
     busWind = mkBus(1.0, 0.0);
     busUI = mkBus(1.0, 0.5);
+    // Music (src/audio/music/) sums here. No reverb send — the stems arrive
+    // with their own space baked in, and the game's convolvers would smear
+    // them. Volume is perceptual (v^2) and lives on the bus itself; the duck
+    // stage is driven by the music system (SFX activity, crash stingers).
+    musicDuck = mkGain(1.0, master);
+    busMusic = mkGain(musicVolume * musicVolume, musicDuck);
     // Ambience runs through a duck stage before its own bus split.
     ambDuck = mkGain(1.0);
     busAmb = mkGain(1.0, ambDuck);
-    const ambDry = mkGain(0.9, master);
+    const ambDry = mkGain(0.9, busSfx);
     const ambSend = mkGain(0.42, revSend);
     ambDuck.connect(ambDry);
     ambDuck.connect(ambSend);
@@ -866,6 +903,10 @@ export function createAudio(ctx) {
     wdLowGain = mkGain(0, busWind);
     wdLowLP = mkFilter('lowpass', 190, 1.1, null, wdLowGain);
     wdLowSrc = mkNoise(nBrown, 1.0, wdLowLP);
+
+    // The sampled wind-rush loop belongs to the previous context after a
+    // dispose/rebuild; update() lazily recreates it once a buffer is decoded.
+    wdSmpSrc = wdSmpGain = wdSmpLP = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -915,6 +956,52 @@ export function createAudio(ctx) {
   // ===========================================================================
   // One-shot voices
   // ===========================================================================
+
+  // Last sfxPick outcome, surfaced via api.sfxSamples — the one-line answer to
+  // "is the recording actually playing, or am I hearing the fallback?"
+  let dbgLastSfx = 'none';
+
+  /** Random decoded Suno sample of `kind`, or null (procedural fallback). */
+  function sfxPick(kind) {
+    const buf = sfxLoader ? sfxLoader.pick(kind, erng()) : null;
+    dbgLastSfx = (buf ? 'sample:' : 'fallback:') + kind;
+    return buf;
+  }
+
+  /**
+   * One-shot playback of a decoded sample. Impacts and crashes fire a few
+   * times a run at most, so the small node chain is allocated per event and
+   * torn down in onended — unlike the pooled grain/click families this can
+   * never run at granular rates. Counts against the same voice cap.
+   */
+  function sample(t, buf, amp, rate, pan, send, lpHz) {
+    if (!buf || !started) return false;
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = rate || 1;
+    if (!claimVoice(src)) return false;
+    const g = mkGain(amp);
+    const p = ac.createStereoPanner();
+    p.pan.value = clamp(pan || 0, -1, 1);
+    let head = src;
+    let lp = null;
+    if (lpHz) { lp = mkFilter('lowpass', lpHz, 0.7, null, null); src.connect(lp); head = lp; }
+    head.connect(g);
+    g.connect(p);
+    p.connect(busBike);
+    let s = null;
+    if (send > 0) { s = mkGain(send, revSend); p.connect(s); }
+    src.onended = () => {
+      releaseVoice.call(src);
+      try {
+        g.disconnect(); p.disconnect();
+        if (lp) lp.disconnect();
+        if (s) s.disconnect();
+      } catch (e) { /* context died first */ }
+    };
+    src.start(t);
+    return src;
+  }
 
   /**
    * A short filtered noise click. The tyre grain layer, the chain slap
@@ -982,7 +1069,10 @@ export function createAudio(ctx) {
     }
     // Air/oil rush through the damper.
     grain(t, 260 + rng() * 160, 1.1, amp * 0.55, 0.10, pan, 0.55 + rng() * 0.3, SEND_MECH);
-    if (hard > 0.02) {
+    // Bottom-out clank suppressed while a recorded take plays: its sine
+    // partials ring like chimes on top of real foley (a landing slams the
+    // suspension in the same instant the impact take fires).
+    if (hard > 0.02 && impactSmpCool <= 0) {
       // Bottom-out: three inharmonic partials plus a bright transient. Inharmonic
       // ratios (not 2:3:4) are what make it read as struck alloy rather than a note.
       const a = amp * hard;
@@ -1077,6 +1167,17 @@ export function createAudio(ctx) {
     if (x !== undefined) { spatialise(x, y, z, 9); pan = _pan.pan * 0.5; atten = lerp(0.6, 1.0, _pan.gain); }
     const amp = (0.10 + 0.5 * sev * sev) * atten;
 
+    // When a foley sample is available it IS the impact; the synthesised
+    // layers drop to a thin support bed (and lose most of their reverb send),
+    // otherwise they drown the recording in the old "bucket" sound.
+    // impactSmpCool > 0 means a crash take is already carrying this hit — no
+    // extra sample, but the support bed still ducks under the recording.
+    const smpActive = impactSmpCool > 0;
+    const smp = (sev > 0.12 && !smpActive)
+      ? sfxPick(sev > 0.45 ? 'impact_hard' : 'impact_soft') : null;
+    const sup = (smp || smpActive) ? 0.3 : 1;
+    const sendHit = (smp || smpActive) ? SEND_HIT * 0.1 : SEND_HIT;
+
     // --- low body drop -------------------------------------------------------
     const b = takeBody(t);
     if (b) {
@@ -1084,7 +1185,7 @@ export function createAudio(ctx) {
       osc.type = 'sine';
       if (claimVoice(osc)) {
         osc.connect(b.lp);
-        b.send.gain.value = SEND_HIT;
+        b.send.gain.value = sendHit;
         pset(b.lp.frequency, 600);
         b.pan.pan.value = pan * 0.3;
         const f0 = lerp(95, 165, sev);
@@ -1093,7 +1194,7 @@ export function createAudio(ctx) {
         const g = b.g.gain;
         g.cancelScheduledValues(t);
         g.setValueAtTime(0.0001, t);
-        g.linearRampToValueAtTime(amp * 1.15, t + 0.004);
+        g.linearRampToValueAtTime(amp * 1.15 * sup, t + 0.004);
         g.exponentialRampToValueAtTime(0.0001, t + 0.28 + sev * 0.2);
         osc.start(t);
         osc.stop(t + 0.52);
@@ -1102,10 +1203,23 @@ export function createAudio(ctx) {
     }
     // --- ground noise burst, coloured by the surface -------------------------
     const nf = lerp(surf.lp * 0.45, surf.lp * 0.9, sev);
-    grain(t, clamp(nf, 120, 6000), 0.9, amp * 0.85, 0.10 + sev * 0.11, pan, 0.6 + rng() * 0.5, SEND_HIT);
-    grain(t + 0.006, clamp(nf * 1.9, 180, 9000), 1.4, amp * 0.4, 0.055, pan, 1.2, SEND_HIT);
-    // --- bike body / metal ---------------------------------------------------
-    if (sev > 0.12) {
+    grain(t, clamp(nf, 120, 6000), 0.9, amp * 0.85 * sup, 0.10 + sev * 0.11, pan, 0.6 + rng() * 0.5, sendHit);
+    grain(t + 0.006, clamp(nf * 1.9, 180, 9000), 1.4, amp * 0.4 * sup, 0.055, pan, 1.2, sendHit);
+    // --- bike body -----------------------------------------------------------
+    // The sampled landing foley, played at full level and full bandwidth (it
+    // is already EQ'd); the synthesised metal pings read as falling pipes, so
+    // they are only the not-yet-loaded fallback.
+    if (smp) {
+      // Completely dry: the take carries its own space, any convolver share
+      // reads as "hit in a distant pot". The chain slap is also skipped — its
+      // sine partials chime over a recording.
+      const s = sample(t + 0.002, smp, clamp(amp * 1.8, 0, 1.0), 0.92 + rng() * 0.16, pan, 0);
+      if (s) {
+        impactSmpCool = Math.max(impactSmpCool, 0.25);
+        lastImpactSmp = s;
+        lastImpactSmpT = t;
+      }
+    } else if (sev > 0.12 && !smpActive) {
       const m = amp * (0.20 + sev * 0.45);
       metalPing(t + 0.004, 385 * (0.95 + rng() * 0.1), m * 0.6, 0.20, pan, SEND_HIT);
       metalPing(t + 0.006, 613 * (0.95 + rng() * 0.1), m * 0.42, 0.16, pan, SEND_HIT);
@@ -1120,47 +1234,73 @@ export function createAudio(ctx) {
     if (!started) return;
     const t = now();
     const sev = clamp01(severity === undefined ? 0.7 : severity);
+    // Pick the crash take BEFORE the impact layer: when one exists, it carries
+    // the hit itself, so impact() must skip its own recorded thud (and any
+    // bike:impact arriving in the same tumble stays sample-free too).
+    const cs = sfxPick('crash');
+    if (cs) impactSmpCool = 0.7;
     impact(t, Math.max(0.55, sev), (ctx.bike && ctx.bike.state && ctx.bike.state.surface) | 0, x, y, z);
     let pan = 0;
     if (x !== undefined) { spatialise(x, y, z, 9); pan = _pan.pan * 0.5; }
 
-    // Tumble: a decaying sequence of frame/wheel clanks at irregular intervals.
-    let tt = t + 0.09;
-    const n = 4 + Math.floor(erng() * 5);
-    for (let i = 0; i < n; i++) {
-      const a = (0.16 + sev * 0.2) * Math.pow(0.72, i) * (0.6 + erng() * 0.8);
-      metalPing(tt, (520 + erng() * 900) * (1 - i * 0.05), a, 0.09 + erng() * 0.1, pan + (erng() - 0.5) * 0.4, SEND_CRASH);
-      metalPing(tt + 0.003, (1400 + erng() * 1800), a * 0.5, 0.06, pan, SEND_CRASH);
-      grain(tt, 300 + erng() * 900, 0.9, a * 0.9, 0.09, pan, 0.5 + erng(), SEND_CRASH);
-      tt += 0.055 + erng() * 0.16;
-    }
-    // Body and bike sliding through dirt: broadband noise sweeping down.
-    const v = takeGrain(t);
-    if (v) {
-      const src = ac.createBufferSource();
-      src.buffer = nPink;
-      src.playbackRate.value = 0.9;
-      if (claimVoice(src)) {
-        src.connect(v.bp);
-        v.send.gain.value = SEND_CRASH;
-        v.pan.pan.value = pan;
-        pset(v.bp.Q, 0.8);
-        v.bp.frequency.cancelScheduledValues(t);
-        v.bp.frequency.setValueAtTime(1500, t + 0.05);
-        v.bp.frequency.exponentialRampToValueAtTime(320, t + 1.0);
-        const g = v.g.gain;
-        g.cancelScheduledValues(t);
-        g.setValueAtTime(0.0001, t + 0.04);
-        g.linearRampToValueAtTime(0.16 + sev * 0.16, t + 0.12);
-        g.exponentialRampToValueAtTime(0.0001, t + 1.15);
-        src.start(t + 0.04, erng() * 2.0, 1.2);
-        src.stop(t + 1.25);
-        v.until = t + 1.25;
+    // Tumble + slide. Sampled foley when decoded (a real crash take plus a
+    // dirt-scrape tail); otherwise the synthesised clank sequence.
+    if (cs) {
+      // A bike:impact from the same slam may have scheduled its own take a few
+      // milliseconds ago — stop it; two recordings 30 ms apart comb into a
+      // metallic "distant pot". The crash take owns the hit.
+      if (lastImpactSmp && t - lastImpactSmpT < 0.12) {
+        try { lastImpactSmp.stop(t); } catch (e) { /* already ended */ }
+        lastImpactSmp = null;
+      }
+      // Completely dry: the takes carry their own recorded space, and any
+      // convolver share turns them into a washed-out bucket.
+      sample(t + 0.02, cs, 0.6 + sev * 0.35, 0.94 + erng() * 0.12, pan, 0);
+      const sl = sfxPick('slide');
+      // The slide take starts as the tumble dies down, slower for big crashes.
+      if (sl) sample(t + 0.28 + erng() * 0.15, sl, 0.32 + sev * 0.2, 0.86 + erng() * 0.2, pan, 0);
+    } else {
+      // A decaying sequence of frame/wheel clanks at irregular intervals.
+      let tt = t + 0.09;
+      const n = 4 + Math.floor(erng() * 5);
+      for (let i = 0; i < n; i++) {
+        const a = (0.16 + sev * 0.2) * Math.pow(0.72, i) * (0.6 + erng() * 0.8);
+        metalPing(tt, (520 + erng() * 900) * (1 - i * 0.05), a, 0.09 + erng() * 0.1, pan + (erng() - 0.5) * 0.4, SEND_CRASH);
+        metalPing(tt + 0.003, (1400 + erng() * 1800), a * 0.5, 0.06, pan, SEND_CRASH);
+        grain(tt, 300 + erng() * 900, 0.9, a * 0.9, 0.09, pan, 0.5 + erng(), SEND_CRASH);
+        tt += 0.055 + erng() * 0.16;
+      }
+      // Body and bike sliding through dirt: broadband noise sweeping down.
+      const v = takeGrain(t);
+      if (v) {
+        const src = ac.createBufferSource();
+        src.buffer = nPink;
+        src.playbackRate.value = 0.9;
+        if (claimVoice(src)) {
+          src.connect(v.bp);
+          v.send.gain.value = SEND_CRASH;
+          v.pan.pan.value = pan;
+          pset(v.bp.Q, 0.8);
+          v.bp.frequency.cancelScheduledValues(t);
+          v.bp.frequency.setValueAtTime(1500, t + 0.05);
+          v.bp.frequency.exponentialRampToValueAtTime(320, t + 1.0);
+          const g = v.g.gain;
+          g.cancelScheduledValues(t);
+          g.setValueAtTime(0.0001, t + 0.04);
+          g.linearRampToValueAtTime(0.16 + sev * 0.16, t + 0.12);
+          g.exponentialRampToValueAtTime(0.0001, t + 1.15);
+          src.start(t + 0.04, erng() * 2.0, 1.2);
+          src.stop(t + 1.25);
+          v.until = t + 1.25;
+        }
       }
     }
     grunt(t + 0.02, 0.85 + erng() * 0.15, true);
     duck(0.75, 0.05, 1.6);
-    uiFall(t + 0.10);
+    // The descending "you lost the run" dyad reads as chimes-with-reverb ON TOP
+    // of the crash — with a real foley take playing it IS the perceived crash
+    // sound, and a wrong one. UI cue only for the synthesised fallback.
+    if (!cs) uiFall(t + 0.10);
   }
 
   /**
@@ -1494,12 +1634,10 @@ export function createAudio(ctx) {
       duck(0.3, 0.08, 1.2);
     });
 
-    on('trick:landed', (p) => {
-      if (!started) return;
-      const q = clamp01((p && (p.quality !== undefined ? p.quality : p.score / 500)) || 0.6);
-      const note = PENT[clamp(5 + Math.floor(q * 5), 0, PENT.length - 1)];
-      bell(now() + 0.01, note, 0.055 + q * 0.035, 0.42, 3.5, 1.3, (erng() - 0.5) * 0.5);
-    });
+    // trick:landed deliberately has NO sound. The pentatonic bell that used to
+    // ring here landed in the same instant as the impact foley and read as a
+    // metallic "pot" overtone on every jump — the style meter on the HUD is
+    // feedback enough.
 
     on('water:splash', (p) => {
       if (!started || !p) return;
@@ -1643,13 +1781,21 @@ export function createAudio(ctx) {
     S.pauseGain = damp(S.pauseGain, pauseTarget, 6, d);
     if (started && Math.abs(S.pauseGain - prevPause) > 1e-4) applyMaster();
 
+    // SFX samples: fetch strictly after platform ready (frame 3, same rule as
+    // music) — needs no AudioContext; decode drains once the graph exists.
+    if (!sfxLoader && context.frame > 3) {
+      sfxLoader = createSfxLoader('./sfx/');
+      sfxLoader.start();
+    }
     if (!started) return;
     if (ac.state === 'suspended') return;   // resumed by the next gesture
+    if (sfxLoader) sfxLoader.drainDecodes(ac);
 
     const t = ac.currentTime;
     const bike = context.bike;
     const st = bike && bike.state;
     if (crashCool > 0) crashCool -= d;
+    if (impactSmpCool > 0) impactSmpCool -= d;
 
     // ---- read the bike, defensively ---------------------------------------
     const speed = st ? (st.speed || 0) : 0;
@@ -1768,7 +1914,7 @@ export function createAudio(ctx) {
 
     // ---- suspension --------------------------------------------------------
     const susp = st && st.suspension;
-    thunkCool -= d; reboundCool -= d; clankCool -= d; slapCool -= d;
+    thunkCool -= d; reboundCool -= d; slapCool -= d;
     if (susp) {
       const fk = susp.fork, sh = susp.shock;
       const fkMax = (fk && fk.max) || 0.17;
@@ -1792,17 +1938,9 @@ export function createAudio(ctx) {
           const hard = clamp01((depth - 0.86) / 0.14) * clamp01((v - 1.1) / 2.0);
           thunk(t, amp, isFork ? 78 : 62, hard, isFork ? -0.14 : 0.10);
           thunkCool = 0.055 + rng() * 0.03;
-          if (hard > 0.25 && clankCool <= 0) {
-            // The frame rings after a real bottom-out.
-            metalPing(t + 0.012, 720, amp * 0.35 * hard, 0.22, 0, SEND_MECH);
-            metalPing(t + 0.014, 1130, amp * 0.24 * hard, 0.17, 0, SEND_MECH);
-            clankCool = 0.22;
-          }
-          // A hard compression always throws the chain.
-          if (amp > 0.11 && slapCool <= 0) {
-            chainSlap(t + 0.008, amp * 0.85, 0.18);
-            slapCool = 0.075 + rng() * 0.06;
-          }
+          // No frame-ring pings and no hard-compression chain slap here any
+          // more: their sine partials chimed over every landing ("pot lid"),
+          // and the landing itself is carried by the impact foley now.
         }
       }
       // Rebound whoosh: the shock extending fast out of a deep stroke.
@@ -1828,11 +1966,9 @@ export function createAudio(ctx) {
         slapCool = 0.05 + rng() * 0.09;
       }
     }
-    // Airborne: the chain rattles freely as the bike unloads.
-    if (S.airborne > 0.6 && slapCool <= 0 && rng() < d * 3.5) {
-      chainSlap(t, 0.03 + rng() * 0.04, (rng() - 0.5) * 0.5);
-      slapCool = 0.09 + rng() * 0.12;
-    }
+    // Airborne chain rattle removed: random chain-slap pings during every
+    // flight read as loose chimes, not as a bike. Flight is voiced by wind
+    // and the freehub buzz alone.
 
     // ---- freehub -----------------------------------------------------------
     // Click rate = ratchet engagements per second. Real hubs sit between about
@@ -1886,8 +2022,29 @@ export function createAudio(ctx) {
     // so at speed the wind wraps around you instead of sitting in the middle.
     const windAmp = Math.pow(S.speedN, 1.7) * 0.30 + S.speedN * 0.045;
     const windHz = 320 + 1250 * S.speedN;
-    gset(wdGainL.gain, windAmp, 0.05);
-    gset(wdGainR.gain, windAmp * 0.97, 0.05);
+    // Sampled wind-rush loop: created once its buffer decodes, then driven by
+    // the same speed curve. The synthesised bandpass wind stays underneath at
+    // reduced level — it carries the doppler drift and the stereo movement.
+    if (!wdSmpSrc && sfxLoader) {
+      const wb = sfxLoader.pick('wind', 0);
+      if (wb) {
+        wdSmpGain = mkGain(0, busWind);
+        wdSmpLP = mkFilter('lowpass', 900, 0.7, null, wdSmpGain);
+        wdSmpSrc = ac.createBufferSource();
+        wdSmpSrc.buffer = wb;
+        wdSmpSrc.loop = true;
+        wdSmpSrc.connect(wdSmpLP);
+        wdSmpSrc.start(t + 0.05);
+      }
+    }
+    const wProc = wdSmpSrc ? 0.45 : 1.0;
+    if (wdSmpSrc) {
+      gset(wdSmpGain.gain, windAmp * 1.15, 0.06);
+      pset(wdSmpLP.frequency, clamp(500 + 5200 * S.speedN, 300, 12000));
+      pset(wdSmpSrc.playbackRate, clamp(0.82 + 0.4 * S.speedN + S.drift * 0.6, 0.5, 1.6));
+    }
+    gset(wdGainL.gain, windAmp * wProc, 0.05);
+    gset(wdGainR.gain, windAmp * 0.97 * wProc, 0.05);
     pset(wdBpL.frequency, windHz);
     pset(wdBpR.frequency, windHz * 1.09);
     pset(wdBpL.Q, 0.6 + 0.5 * S.speedN);
@@ -1993,6 +2150,30 @@ export function createAudio(ctx) {
       persist();
       applyMaster();
     },
+    setMusicVolume(v) {
+      musicVolume = clamp01(typeof v === 'number' ? v : 0.7);
+      persist();
+      if (started) gset(busMusic.gain, musicVolume * musicVolume, 0.05);
+    },
+    get musicVolume() { return musicVolume; },
+
+    setSfxVolume(v) {
+      sfxVolume = clamp01(typeof v === 'number' ? v : 1.0);
+      persist();
+      if (started) gset(busSfx.gain, sfxVolume * sfxVolume, 0.05);
+    },
+    get sfxVolume() { return sfxVolume; },
+
+    /**
+     * Summing point for the sample-based music system. Null until the first
+     * user gesture builds the graph. `input` inherits master volume, mute,
+     * external (ad) mute and blur-zeroing; `duck` is the music system's own
+     * ducking stage (unity by default).
+     */
+    getMusicBus() {
+      return started ? { input: busMusic, duck: musicDuck } : null;
+    },
+
     setMuted(m) {
       muted = !!m;
       persist();
@@ -2051,6 +2232,8 @@ export function createAudio(ctx) {
       document.removeEventListener('visibilitychange', onVisibility);
       for (let i = 0; i < offs.length; i++) { try { offs[i](); } catch (e) { /* ignore */ } }
       offs.length = 0;
+      if (sfxLoader) { sfxLoader.dispose(); sfxLoader = null; }
+      wdSmpSrc = wdSmpGain = wdSmpLP = null;
       if (ac) {
         try {
           master.gain.cancelScheduledValues(ac.currentTime);
@@ -2065,6 +2248,14 @@ export function createAudio(ctx) {
 
     // --- debug aids ---------------------------------------------------------
     get debugState() { return S; },
+    /** Sampled-SFX status for the debug overlay / harness. */
+    get sfxSamples() {
+      return {
+        state: sfxLoader ? sfxLoader.state : 'off',
+        decoded: sfxLoader ? sfxLoader.decodedCount : 0,
+        last: dbgLastSfx,
+      };
+    },
     get voices() { return _voices; },
   };
 

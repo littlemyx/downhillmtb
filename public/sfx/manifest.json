@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "note": "Suno-generated SFX (gu_engine/audio_gen/src/descent-sfx). kind groups variants; the game picks one at random per event. wind is a seamless loop.",
+  "assets": [
+    {
+      "id": "crash_01",
+      "kind": "crash",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "crash_01.ogg",
+        "aac": "crash_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "crash_02",
+      "kind": "crash",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "crash_02.ogg",
+        "aac": "crash_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "crash_03",
+      "kind": "crash",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "crash_03.ogg",
+        "aac": "crash_03.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "crash_04",
+      "kind": "crash",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "crash_04.ogg",
+        "aac": "crash_04.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "impact_hard_01",
+      "kind": "impact_hard",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "impact_hard_01.ogg",
+        "aac": "impact_hard_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "impact_hard_02",
+      "kind": "impact_hard",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "impact_hard_02.ogg",
+        "aac": "impact_hard_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "impact_soft_01",
+      "kind": "impact_soft",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "impact_soft_01.ogg",
+        "aac": "impact_soft_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "impact_soft_02",
+      "kind": "impact_soft",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "impact_soft_02.ogg",
+        "aac": "impact_soft_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "slide_01",
+      "kind": "slide",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "slide_01.ogg",
+        "aac": "slide_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "slide_02",
+      "kind": "slide",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "slide_02.ogg",
+        "aac": "slide_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "wind",
+      "kind": "wind",
+      "role": "loop",
+      "priority": 1,
+      "files": {
+        "opus": "wind.ogg",
+        "aac": "wind.m4a"
+      },
+      "gain": 0,
+      "loop": true
+    }
+  ]
+}

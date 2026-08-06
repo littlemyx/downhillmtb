@@ -86,7 +86,8 @@ const KEYMAP = [
   {
     group: 'controls.group.system',
     items: [
-      { action: 'controls.pause', keys: [['Esc'], ['P']], pad: 'controls.padStart' },
+      { action: 'controls.pause', keys: [['Esc']], pad: 'controls.padStart' },
+      { action: 'controls.mute', keys: [['P']] },
       { action: 'controls.cycleCamera', note: 'controls.cycleCameraNote', keys: [['C']], pad: 'Y / △' },
       { action: 'controls.photo', note: 'controls.photoNote', keys: [['F']], pad: 'controls.padSelect' },
     ],
@@ -767,6 +768,8 @@ export function createMenu(ctx) {
     invertLook: false,
     fov: 62,
     volume: 0.8,
+    musicVolume: 0.7,
+    sfxVolume: 1,
     fpsCap: (ctx && ctx.settings && typeof ctx.settings.fpsCap === 'number') ? ctx.settings.fpsCap : 60,
     renderScale: (() => {
       const pr = ctx && ctx.settings && ctx.settings.pixelRatio;
@@ -784,6 +787,8 @@ export function createMenu(ctx) {
         if (typeof saved.invertLook === 'boolean') settings.invertLook = saved.invertLook;
         if (typeof saved.fov === 'number') settings.fov = clamp(saved.fov, 55, 95);
         if (typeof saved.volume === 'number') settings.volume = clamp(saved.volume, 0, 1);
+        if (typeof saved.musicVolume === 'number') settings.musicVolume = clamp(saved.musicVolume, 0, 1);
+        if (typeof saved.sfxVolume === 'number') settings.sfxVolume = clamp(saved.sfxVolume, 0, 1);
         if (FPS_OPTIONS.some((o) => o.value === saved.fpsCap)) settings.fpsCap = saved.fpsCap;
         if (RES_OPTIONS.some((o) => o.value === saved.renderScale)) settings.renderScale = saved.renderScale;
       }
@@ -802,6 +807,7 @@ export function createMenu(ctx) {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({
         quality: settings.quality, camera: settings.camera,
         invertLook: settings.invertLook, fov: settings.fov, volume: settings.volume,
+        musicVolume: settings.musicVolume, sfxVolume: settings.sfxVolume,
         fpsCap: settings.fpsCap, renderScale: settings.renderScale,
       }));
     } catch (e) { /* ignore */ }
@@ -854,6 +860,14 @@ export function createMenu(ctx) {
           else if (typeof ctx.audio.setVolume === 'function') ctx.audio.setVolume(value);
         }
         emit('audio:volume', value);
+        break;
+      case 'musicVolume':
+        if (ctx && ctx.audio && typeof ctx.audio.setMusicVolume === 'function') ctx.audio.setMusicVolume(value);
+        emit('audio:musicVolume', value);
+        break;
+      case 'sfxVolume':
+        if (ctx && ctx.audio && typeof ctx.audio.setSfxVolume === 'function') ctx.audio.setSfxVolume(value);
+        emit('audio:sfxVolume', value);
         break;
       case 'photoMode':
         if (ctx && ctx.settings) ctx.settings.photoMode = value;
@@ -1425,6 +1439,12 @@ export function createMenu(ctx) {
     addSlider(t('settings.volume'), t('settings.volumeNote'),
       0, 1, 0.05, () => settings.volume, (v) => applySetting('volume', v), (v) => `${Math.round(v * 100)}%`);
 
+    addSlider(t('settings.music'), t('settings.musicNote'),
+      0, 1, 0.05, () => settings.musicVolume, (v) => applySetting('musicVolume', v), (v) => `${Math.round(v * 100)}%`);
+
+    addSlider(t('settings.sfx'), t('settings.sfxNote'),
+      0, 1, 0.05, () => settings.sfxVolume, (v) => applySetting('sfxVolume', v), (v) => `${Math.round(v * 100)}%`);
+
     addSegmented(t('settings.fps'), t('settings.fpsNote'),
       FPS_OPTIONS, () => settings.fpsCap, (v) => applySetting('fpsCap', v));
 
@@ -1921,6 +1941,13 @@ export function createMenu(ctx) {
   }
 
   function onKeyDown(e) {
+    // Mute is global: works in gameplay, menus and photo mode alike. Kept here
+    // (not in input.js) because modal views swallow keydowns before input.js.
+    if (e.code === 'KeyP' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (ctx && ctx.audio && typeof ctx.audio.toggleMute === 'function') ctx.audio.toggleMute();
+      return;
+    }
+
     if (settings.photoMode) {
       if (e.code === 'KeyF' || e.code === 'Escape') {
         setPhotoMode(false);
@@ -1933,7 +1960,7 @@ export function createMenu(ctx) {
     if (!isBlocking()) {
       // Not modal: claim only the pause key, and deliberately let it through to
       // input.js so gameplay can pause itself (we reconcile in lateUpdate).
-      if ((e.code === 'Escape' || e.code === 'KeyP') && !e.repeat) openPause();
+      if (e.code === 'Escape' && !e.repeat) openPause();
       return;
     }
 
@@ -2144,6 +2171,8 @@ export function createMenu(ctx) {
       applySetting('invertLook', settings.invertLook, { persist: false });
       applySetting('fov', settings.fov, { persist: false });
       applySetting('volume', settings.volume, { persist: false });
+      applySetting('musicVolume', settings.musicVolume, { persist: false });
+      applySetting('sfxVolume', settings.sfxVolume, { persist: false });
       if (ctx && ctx.quality !== settings.quality) applySetting('quality', settings.quality, { persist: false });
       enterMenuState();
       lastGameplayState = (gp() && typeof gp().state === 'string') ? gp().state : '';

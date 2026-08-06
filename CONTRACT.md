@@ -72,7 +72,7 @@ All are optional. `main.js` calls whatever exists.
 4. `sky`, `water`, `vegetation`
 5. `collision`, `bike`
 6. `bikeModel`, `rider`, `particles`
-7. `chaseCamera`, `audio`
+7. `chaseCamera`, `audio`, `music`
 8. `gameplay`, `hud`, `menu`
 9. `postfx` (last — needs final scene + camera)
 
@@ -98,7 +98,7 @@ ctx = {
   events,             // { on(name, fn), off(name, fn), emit(name, payload) }
   // systems, assigned by main.js as they are created:
   terrain, trail, sky, water, vegetation, collision, bike, bikeModel,
-  rider, particles, chaseCamera, audio, gameplay, hud, menu, postfx,
+  rider, particles, chaseCamera, audio, music, gameplay, hud, menu, postfx,
   debug: { enabled: false, log(...a){} },
 }
 ```
@@ -438,6 +438,24 @@ thunk and rebound, chain slap and freehub buzz when coasting, wind noise scaling
 speed, impacts by severity, breathing/effort, crash, ambience bed (forest birds, creek,
 distant wind) with reverb by openness. Positional where it makes sense. Ducking and a
 master limiter so it never clips. Must start only after a user gesture.
+
+CONTRACT AMENDMENT (sfx samples): a second exception to "no downloaded files" —
+impact/crash/slide foley and a wind-rush loop are pre-produced Suno samples
+(`gu_engine/audio_gen/src/descent-sfx`) fetched lazily from `public/sfx/` by
+`src/audio/sfx/loader.js`, strictly after `platform.markReady()`, decoded after
+the gesture unlock. Every sample is optional: until (or unless) a kind decodes,
+audio.js plays its original synthesised fallback (metal pings, noise slide,
+bandpass wind), so a missing manifest just means the old sound.
+
+CONTRACT AMENDMENT (music): the "no downloaded files" rule has one deliberate
+exception — the ambient music system (`src/audio/music/`, module name `music`,
+updated between `audio` and `gameplay`). It lazily fetches pre-produced stems
+from `public/music/` strictly AFTER `platform.markReady()`, decodes them only
+after the audio gesture-unlock, and routes through audio.js's music bus (so it
+inherits the limiter, master volume, mute, ad-mute and blur handling). Every
+asset is optional: if the manifest or any stem never loads, music silently
+stays off and the game is fully functional. Arrangement decisions are
+deterministic per `ctx.seed` (see `src/audio/music/conductor.js`).
 
 ---
 

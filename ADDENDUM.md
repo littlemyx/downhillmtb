@@ -96,3 +96,13 @@ composer). Your module's budget:
 | water | ≤ 6 | |
 
 No `new THREE.Vector3()` inside any `update()`.
+
+CONTRACT-NOTE (audio/music allocations): WebAudio one-shot nodes are the one
+sanctioned per-event allocation — audio.js's pooled voices already rely on it,
+and `src/audio/music/` extends the same exception to its one-shot
+`AudioBufferSourceNode`s (phrases, stingers) plus one small RNG/string
+allocation per musical bar (every 2.5 s) for the seed-pure phrase decision.
+Known QA limitation: `qa/promo/bot.js` ticks physics per captured frame,
+wall-clock independent, so `AudioContext.currentTime`-driven music will not
+follow its captures — assert on `ctx.music.debugState.lastDecisions` (which is
+seed-pure) instead of on rendered audio.

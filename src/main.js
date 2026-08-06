@@ -19,6 +19,7 @@ import { createRider } from './entities/rider.js';
 import { createParticles } from './game/particles.js';
 import { createChaseCamera } from './camera/chaseCamera.js';
 import { createAudio } from './audio/audio.js';
+import { createMusic } from './audio/music/music.js';
 import { createGameplay } from './game/gameplay.js';
 import { createHud } from './ui/hud.js';
 import { createMenu } from './ui/menu.js';
@@ -131,7 +132,7 @@ async function boot() {
   const rest = [
     ['collision', createCollision], ['bike', createBike],
     ['bikeModel', createBikeModel], ['rider', createRider], ['particles', createParticles],
-    ['chaseCamera', createChaseCamera], ['audio', createAudio],
+    ['chaseCamera', createChaseCamera], ['audio', createAudio], ['music', createMusic],
     ['gameplay', createGameplay], ['hud', createHud], ['menu', createMenu],
   ];
   let restDone = 0;
@@ -158,7 +159,7 @@ async function boot() {
   const ORDER = [
     'input', 'terrain', 'trail', 'sky', 'water', 'vegetation',
     'collision', 'bike', 'bikeModel', 'rider', 'particles',
-    'chaseCamera', 'audio', 'gameplay', 'hud', 'menu', 'postfx',
+    'chaseCamera', 'audio', 'music', 'gameplay', 'hud', 'menu', 'postfx',
   ];
   for (const name of ORDER) {
     const s = ctx[name];
