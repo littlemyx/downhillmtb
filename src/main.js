@@ -25,6 +25,7 @@ import { createMenu } from './ui/menu.js';
 import { createPostFX } from './core/postfx.js';
 import { createPlatform } from './platform/yandex.js';
 import { setLang } from './i18n/i18n.js';
+import { beginStage, report, yieldFrame } from './core/bootProgress.js';
 
 const MAX_DT = 1 / 20;
 
@@ -67,6 +68,7 @@ async function boot() {
   const platformInit = ctx.platform ? ctx.platform.init({ timeoutMs: 3000 }) : null;
 
   // ---- wave 1: engine + input -------------------------------------------
+  beginStage(0.01, 0.03, 'boot');
   const engine = safe('engine', () => createEngine(ctx));
   ctx.engine = engine;
   if (engine?.init) await safeAsync('engine.init', () => engine.init());
@@ -78,27 +80,39 @@ async function boot() {
   if (ctx.input?.init) await safeAsync('input.init', () => ctx.input.init());
 
   // ---- wave 2/3: terrain then trail (trail carves, terrain commits) ------
+  // The build steps are async solely so they can yield to the compositor and
+  // move the boot progress bar; their work stays synchronous between yields.
+  beginStage(0.03, 0.38, 'world');
+  await yieldFrame();
   ctx.terrain = safe('terrain', () => createTerrain(ctx));
   if (ctx.terrain?.init) await safeAsync('terrain.init', () => ctx.terrain.init());
-  safe('terrain.buildBase', () => ctx.terrain?.buildBase());
+  await safeAsync('terrain.buildBase', () => ctx.terrain?.buildBase());
 
+  beginStage(0.38, 0.63, 'trail');
   ctx.trail = safe('trail', () => createTrail(ctx));
   if (ctx.trail?.init) await safeAsync('trail.init', () => ctx.trail.init());
-  safe('trail.build', () => ctx.trail?.build(ctx.terrain));
-  safe('terrain.applyCarve', () => {
+  await safeAsync('trail.build', () => ctx.trail?.build(ctx.terrain));
+  beginStage(0.63, 0.71, 'carve');
+  await safeAsync('terrain.applyCarve', () => {
     const stamps = ctx.trail?.getCarveStamps?.() || [];
-    ctx.terrain?.applyCarve(stamps);
+    return ctx.terrain?.applyCarve(stamps);
   });
-  safe('terrain.commit', () => ctx.terrain?.commit());
-  safe('trail.finalize', () => ctx.trail?.finalize(ctx.terrain));
+  beginStage(0.71, 0.78, 'chunks');
+  await safeAsync('terrain.commit', () => ctx.terrain?.commit());
+  beginStage(0.78, 0.83, 'detail');
+  await safeAsync('trail.finalize', () => ctx.trail?.finalize(ctx.terrain));
 
   // ---- wave 4: world dressing -------------------------------------------
+  beginStage(0.83, 0.91, 'dress');
   const wave4 = [
     ['sky', createSky], ['water', createWater], ['vegetation', createVegetation],
   ];
+  let wave4Done = 0;
   for (const [name, factory] of wave4) {
+    await yieldFrame();
     ctx[name] = safe(name, () => factory(ctx));
     if (ctx[name]?.init) await safeAsync(`${name}.init`, () => ctx[name].init());
+    report(++wave4Done / wave4.length);
   }
 
   // ---- platform: language and cloud record, both before any UI is built ----
@@ -112,23 +126,30 @@ async function boot() {
   }
 
   // ---- wave 5..8 ---------------------------------------------------------
+  beginStage(0.91, 0.95, 'ui');
+  await yieldFrame();
   const rest = [
     ['collision', createCollision], ['bike', createBike],
     ['bikeModel', createBikeModel], ['rider', createRider], ['particles', createParticles],
     ['chaseCamera', createChaseCamera], ['audio', createAudio],
     ['gameplay', createGameplay], ['hud', createHud], ['menu', createMenu],
   ];
+  let restDone = 0;
   for (const [name, factory] of rest) {
     ctx[name] = safe(name, () => factory(ctx));
     if (ctx[name]?.init) await safeAsync(`${name}.init`, () => ctx[name].init());
+    report(++restDone / rest.length);
   }
 
   // Gameplay marks, ad pauses and score submission all hang off ctx.events.
   safe('platform.bind', () => ctx.platform?.bind(ctx));
 
   // ---- wave 9: post-processing (needs the finished scene) ----------------
+  beginStage(0.95, 0.99, 'fx');
+  await yieldFrame();
   ctx.postfx = safe('postfx', () => createPostFX(ctx));
   if (ctx.postfx?.init) await safeAsync('postfx.init', () => ctx.postfx.init());
+  beginStage(0.99, 1, 'fx');
 
   // Ordered update lists, built once — no per-frame array churn.
   const updatables = [];
@@ -209,6 +230,7 @@ async function boot() {
     if (ctx.frame === 3) {
       document.body.dataset.descentReady = '1';
       ctx.platform?.markReady();
+      window.__DESCENT_BOOT__?.done();
     }
   }
   tick();
@@ -218,6 +240,7 @@ async function boot() {
 
 boot().catch((err) => {
   console.error('[boot] fatal', err);
+  window.__DESCENT_BOOT__?.fail();
   const el = document.createElement('pre');
   el.style.cssText = 'position:fixed;inset:0;padding:24px;color:#ff6b6b;background:#05070b;font:12px ui-monospace,monospace;white-space:pre-wrap;z-index:9999';
   el.textContent = 'DESCENT failed to start:\n\n' + (err && err.stack || err);

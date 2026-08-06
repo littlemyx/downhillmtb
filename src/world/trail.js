@@ -200,6 +200,7 @@
 import * as THREE from 'three';
 import { makeRng, subSeed, clamp, clamp01, lerp, smoothstep } from '../core/rng.js';
 import { Surface } from './terrain.js';
+import { report, maybeYield } from '../core/bootProgress.js';
 
 // ---------------------------------------------------------------------------
 // Physical constants for the design speed profile. These are *design* numbers —
@@ -8499,7 +8500,10 @@ export function createTrail(ctx) {
   // BUILD
   // =========================================================================
 
-  function build(terrain) {
+  // Async solely for the boot progress bar (see core/bootProgress.js): the
+  // solver stages are unchanged and stay synchronous between yields, so every
+  // RNG stream is consumed in the same order and the course is bit-identical.
+  async function build(terrain) {
     if (!terrain) return [];
     _terrainRef = terrain;
 
@@ -8556,6 +8560,8 @@ export function createTrail(ctx) {
     };
     for (let v = 0; v < ROUTE_VARIANTS_MAX; v++) {
       marchOne(v);
+      report(0.28 * Math.min(1, (v + 1) / ROUTE_VARIANTS));
+      { const y = maybeYield(); if (y) await y; }
       // Stop as soon as the ordinary budget has produced something admissible.
       if (v + 1 >= ROUTE_VARIANTS && (bestAdm || !SOLVER.feasible)) break;
     }
@@ -8618,7 +8624,10 @@ export function createTrail(ctx) {
       for (let wave = 0; wave < 2 && !ok; wave++) {
         if (wave === 1) {
           if (!SOLVER.feasible || cands.length >= ROUTE_VARIANTS_MAX) break;
-          for (let v = cands.length; v < ROUTE_VARIANTS_MAX; v++) marchOne(v);
+          for (let v = cands.length; v < ROUTE_VARIANTS_MAX; v++) {
+            marchOne(v);
+            { const y = maybeYield(); if (y) await y; }
+          }
           safety.routeVariants = routeAudit.length;
           safety.routeReseeded = true;
         }
@@ -8634,6 +8643,8 @@ export function createTrail(ctx) {
           if (tried.has(cand)) continue;
           tried.add(cand); built++;
           lastBuilt = cand;
+          report(0.28 + 0.14 * Math.min(1, built / STATION_TRIES));
+          { const y = maybeYield(); if (y) await y; }
           buildStations(terrain, cand);
           const m = measureBaseProfile();
           // THE PLAN RADIUS IS A PROPERTY OF THE BUILT LINE, NOT OF THE MARCHED
@@ -8722,6 +8733,8 @@ export function createTrail(ctx) {
     {
       const empty = new Uint8Array(S.n);
       for (let k = 0; k < 2; k++) {
+        report(0.42 + 0.04 * k);
+        { const y = maybeYield(); if (y) await y; }
         capCrestCurvature(empty);
         refreshBasis();
         computeVertKappa();
@@ -8734,6 +8747,8 @@ export function createTrail(ctx) {
       // bank, which moves the corner speed again.
       if (SOLVER.launch) {
         for (let k = 0; k < 3; k++) {
+          report(0.50 + 0.03 * k);
+          { const y = maybeYield(); if (y) await y; }
           capLaunchCurvature(empty);
           refreshBasis();
           computeVertKappa();
@@ -8785,8 +8800,9 @@ export function createTrail(ctx) {
     //
     // Cost: one extra feature build and joint solve per pass beyond the first,
     // which measures at 8-12% of build() per pass on these seeds.
-    const featurePass = () => {
+    const featurePass = async () => {
       buildFeatures();
+      { const y = maybeYield(); if (y) await y; }
       // The ballistic core has to exist before the next speed solve, or the
       // solve paces the jump line at the floor. See techSpeedCap().
       ballisticMask = buildBallisticMask(1.5, true);
@@ -8828,6 +8844,7 @@ export function createTrail(ctx) {
       const vm = buildAuthoredMask(
         ['jump', 'doubles', 'gap', 'stepDown', 'wallride', 'drop'], FEATURE_GUARD);
       safety.crestStage.afterFeatures = countCrestViol(vm);
+      { const y = maybeYield(); if (y) await y; }
       capCrestCurvature(vm);
       refreshBasis();
       computeVertKappa();
@@ -8847,6 +8864,7 @@ export function createTrail(ctx) {
       // is re-solved at whatever speed the flattening left. A berm built for a
       // speed the rider no longer arrives at is a lowside.
       for (let k = 0; k < 3; k++) {
+        { const y = maybeYield(); if (y) await y; }
         if (SOLVER.launch) {
           capLaunchCurvature(vm);
           refreshBasis();
@@ -8923,7 +8941,8 @@ export function createTrail(ctx) {
       for (; iter < iterBudget; iter++) {
         if (iter > 0) featureStateRestore(preFeat);
         lastIter = iter;
-        featurePass();
+        report(0.58 + 0.30 * (iter / iterBudget));
+        await featurePass();
         const sc = scoreFeaturePace();
         // Keep the pace vector that produced this pass, not the one it suggests.
         if (better(sc)) {
@@ -8950,7 +8969,7 @@ export function createTrail(ctx) {
         featPace.clear();
         for (const [k, v] of bestPace) featPace.set(k, v);
         featureStateRestore(preFeat);
-        featurePass();
+        await featurePass();
       }
       safety.jumpFitIters = lastIter + 1;
       safety.jumpFitResidual = bestBad === Infinity ? 0 : bestBad;
@@ -8975,6 +8994,8 @@ export function createTrail(ctx) {
     // set the final width/bank/height (it measures the real cross-section) and
     // BEFORE the curve rebuild and buildStamps() (it moves px/pz/py and adds the
     // shelf geometry). See the long note above applyExposureSafety().
+    report(0.90);
+    { const y = maybeYield(); if (y) await y; }
     applyExposureSafety(terrain);
     safety.crestStage.afterSafety = countCrestViol(crestMask);
     // applyExposureSafety() benches the line and re-runs capGradeRamp, both of
@@ -9177,6 +9198,8 @@ export function createTrail(ctx) {
       length = curve.getLength();
     }
 
+    report(0.96);
+    { const y = maybeYield(); if (y) await y; }
     buildStamps();
     buildIndex(terrain);
 
@@ -11062,7 +11085,8 @@ export function createTrail(ctx) {
     saggedCache.clear();
   }
 
-  function finalize(terrain) {
+  // Async for the boot progress bar only — see the note above build().
+  async function finalize(terrain) {
     if (!S || !curve) return;
     // Re-seat the start on the carved surface so the bike doesn't spawn buried.
     if (terrain) {
@@ -11076,6 +11100,8 @@ export function createTrail(ctx) {
     try {
       buildTreadMesh(terrain);
     } catch (e) { console.error('[trail] tread mesh failed', e); }
+    report(0.5);
+    { const y = maybeYield(); if (y) await y; }
     try {
       buildCourseFurniture(terrain);
     } catch (e) { console.error('[trail] course furniture failed', e); }

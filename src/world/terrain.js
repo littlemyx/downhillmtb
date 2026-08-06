@@ -201,6 +201,7 @@ import * as THREE from 'three';
 import { createNoise2D } from 'simplex-noise';
 import { makeRng, subSeed, clamp01, lerp, smoothstep } from '../core/rng.js';
 import { createTerrainMaterial } from './terrainMaterial.js';
+import { report, maybeYield } from '../core/bootProgress.js';
 
 export const Surface = {
   DIRT: 0, LOAM: 1, ROCK: 2, GRAVEL: 3, GRASS: 4, ROOT: 5, MUD: 6, SNOW: 7,
@@ -635,12 +636,16 @@ export function createTerrain(ctx) {
   const CRES = (RES + 1) >> 1;             // 769
   const CCELL = WORLD / (CRES - 1);        // 4.0 m
 
-  function passA() {
+  async function passA() {
     const coarse = new Float32Array(CRES * CRES);
     for (let j = 0; j < CRES; j++) {
       const z = minZ + j * CCELL;
       const row = j * CRES;
       for (let i = 0; i < CRES; i++) coarse[row + i] = baseHeight(minX + i * CCELL, z);
+      if ((j & 63) === 0) {
+        report(0.05 * 0.5 * (j / CRES));
+        const y = maybeYield(); if (y) await y;
+      }
     }
 
     let lo = Infinity, hi = -Infinity;
@@ -671,6 +676,10 @@ export function createTerrain(ctx) {
         if (h < lo) lo = h;
         if (h > hi) hi = h;
       }
+      if ((j & 63) === 0) {
+        report(0.05 * (0.5 + 0.5 * (j / RES)));
+        const y = maybeYield(); if (y) await y;
+      }
     }
     bounds.minY = lo;
     bounds.maxY = hi;
@@ -685,8 +694,12 @@ export function createTerrain(ctx) {
   // and risers. The strata are given a slight dip so the bands are not dead level.
   // -------------------------------------------------------------------------
 
-  function passB(tmp) {
+  async function passB(tmp) {
     for (let j = 0; j < RES; j++) {
+      if ((j & 63) === 0) {
+        report(0.05 + 0.10 * (j / RES));
+        const y = maybeYield(); if (y) await y;
+      }
       const z = minZ + j * CELL;
       const row = j * RES;
       for (let i = 0; i < RES; i++) {
@@ -762,7 +775,7 @@ export function createTerrain(ctx) {
   const GRAVITY = 5.0;
   const BRUSH_R = 3;
 
-  function passC(flowAcc) {
+  async function passC(flowAcc) {
     // Precompute the erosion brush (a cone kernel) so material is removed from a
     // patch rather than a single cell — single-cell erosion makes spiky noise.
     const bx = [], bz = [], bw = [];
@@ -783,6 +796,10 @@ export function createTerrain(ctx) {
     const total = dropletBudget;
 
     for (let d = 0; d < total; d++) {
+      if ((d & 2047) === 0) {
+        report(0.15 + 0.40 * (d / total));
+        const y = maybeYield(); if (y) await y;
+      }
       let px = 2 + dropRng() * (RES - 5);
       let pz = 2 + dropRng() * (RES - 5);
       let dx = 0, dz = 0, speed = 1, water = 1, sed = 0;
@@ -861,12 +878,16 @@ export function createTerrain(ctx) {
   // fans form. The moved volume is recorded and becomes the GRAVEL material.
   // -------------------------------------------------------------------------
 
-  function passD(delta, passes) {
+  async function passD(delta, passes) {
     const talus = new Float32Array(RES * RES);
     const diag = Math.SQRT1_2;
     for (let p = 0; p < passes; p++) {
       delta.fill(0);
       for (let j = 1; j < RES - 1; j++) {
+        if ((j & 63) === 0) {
+          report(0.55 + 0.20 * ((p + j / RES) / passes));
+          const y = maybeYield(); if (y) await y;
+        }
         const row = j * RES;
         for (let i = 1; i < RES - 1; i++) {
           const k = row + i;
@@ -912,9 +933,13 @@ export function createTerrain(ctx) {
   // 3×3 blur removes it without touching rock.
   // -------------------------------------------------------------------------
 
-  function passE(tmp) {
+  async function passE(tmp) {
     tmp.set(heights);
     for (let j = 1; j < RES - 1; j++) {
+      if ((j & 127) === 0) {
+        report(0.75 + 0.05 * (j / RES));
+        const y = maybeYield(); if (y) await y;
+      }
       const row = j * RES;
       for (let i = 1; i < RES - 1; i++) {
         const k = row + i;
@@ -951,7 +976,7 @@ export function createTerrain(ctx) {
   // the material pass (so slope-driven materials see the new relief).
   // -------------------------------------------------------------------------
 
-  function passG(flowAcc, tmp) {
+  async function passG(flowAcc, tmp) {
     // Same mean-relative soft knee passF uses, so "flow" means the same thing
     // in both passes.
     let sum = 0, n = 0;
@@ -960,6 +985,10 @@ export function createTerrain(ctx) {
 
     tmp.set(heights);
     for (let j = 1; j < RES - 1; j++) {
+      if ((j & 63) === 0) {
+        report(0.80 + 0.08 * (j / RES));
+        const y = maybeYield(); if (y) await y;
+      }
       const z = minZ + j * CELL;
       const row = j * RES;
       for (let i = 1; i < RES - 1; i++) {
@@ -1036,7 +1065,7 @@ export function createTerrain(ctx) {
   //   snow   — above the snowline, slope-limited, collecting in hollows
   // -------------------------------------------------------------------------
 
-  function passF(flowAcc) {
+  async function passF(flowAcc) {
     // Normalise drainage accumulation. A mean-relative soft knee keeps a handful of
     // huge trunk streams from flattening every tributary to zero.
     let sum = 0, n = 0;
@@ -1047,6 +1076,10 @@ export function createTerrain(ctx) {
     let creekSum = 0, creekN = 0;
 
     for (let j = 0; j < RES; j++) {
+      if ((j & 63) === 0) {
+        report(0.88 + 0.12 * (j / RES));
+        const y = maybeYield(); if (y) await y;
+      }
       const z = minZ + j * CELL;
       const row = j * RES;
       for (let i = 0; i < RES; i++) {
@@ -1171,30 +1204,33 @@ export function createTerrain(ctx) {
 
   let baseBuilt = false;
 
-  function buildBase() {
+  // Async solely for the boot progress bar: the passes yield to the compositor
+  // on a time budget (see core/bootProgress.js) but stay synchronous between
+  // yields, so RNG consumption order — and therefore the terrain — is unchanged.
+  async function buildBase() {
     if (baseBuilt) return;
     const t0 = Date.now();
-    passA();
+    await passA();
     const t1 = Date.now();
 
     const tmp = new Float32Array(RES * RES);
-    passB(tmp);
+    await passB(tmp);
     const t2 = Date.now();
 
     const flowAcc = new Float32Array(RES * RES);
-    passC(flowAcc);
+    await passC(flowAcc);
     const t3 = Date.now();
 
-    passD(tmp, lowSpec ? 2 : 3);
+    await passD(tmp, lowSpec ? 2 : 3);
     const t4 = Date.now();
 
-    passE(tmp);
+    await passE(tmp);
     const t5 = Date.now();
 
-    passG(flowAcc, tmp);
+    await passG(flowAcc, tmp);
     const t5b = Date.now();
 
-    passF(flowAcc);
+    await passF(flowAcc);
     const t6 = Date.now();
 
     // Refresh the vertical bounds after erosion moved material around.
@@ -3639,8 +3675,8 @@ export function createTerrain(ctx) {
     }
   }
 
-  function applyCarve(stamps) {
-    if (!baseBuilt) buildBase();
+  async function applyCarve(stamps) {
+    if (!baseBuilt) await buildBase();
     const list = Array.isArray(stamps) ? stamps.filter(
       (s) => s && isFinite(s.x) && isFinite(s.z) && isFinite(s.targetHeight),
     ) : [];
@@ -3671,6 +3707,10 @@ export function createTerrain(ctx) {
     const accMax = new Float32Array(RES * RES);
 
     for (let s = 0; s < list.length; s++) {
+      if ((s & 255) === 0) {
+        report(0.55 * (s / list.length));
+        const y = maybeYield(); if (y) await y;
+      }
       const st = list[s];
       const r = Math.max(0.6, st.radius || 2);
       const rl = stampReach(r, prep.spacing[s]);
@@ -3785,6 +3825,10 @@ export function createTerrain(ctx) {
     const dKapA = new Float32Array(dCells);
 
     for (let s = 0; s < list.length; s++) {
+      if ((s & 255) === 0) {
+        report(0.55 + 0.45 * (s / list.length));
+        const y = maybeYield(); if (y) await y;
+      }
       const st = list[s];
       const r = Math.max(0.6, st.radius || 2);
       const rl = stampReach(r, prep.spacing[s]);
@@ -4551,8 +4595,8 @@ export function createTerrain(ctx) {
     timings.farRingVerts = nv;
   }
 
-  function commit() {
-    if (!baseBuilt) buildBase();
+  async function commit() {
+    if (!baseBuilt) await buildBase();
     if (chunks.length) return;
     const t0 = Date.now();
 
@@ -4638,10 +4682,13 @@ export function createTerrain(ctx) {
     for (let j = 0; j < rootN; j++) {
       for (let i = 0; i < rootN; i++) {
         roots.push(buildTree(minX + i * rootSize, minZ + j * rootSize, rootSize, ROOT_DEPTH));
+        report((j * rootN + i + 1) / (rootN * rootN) * 0.9);
+        const y = maybeYield(); if (y) await y;
       }
     }
 
     // The world does not stop at the map boundary any more.
+    report(0.9);
     buildFarRing();
 
     group.updateMatrix();

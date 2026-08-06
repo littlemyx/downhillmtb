@@ -9,10 +9,90 @@
       body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; }
+      /* Boot splash: painted before any module byte is evaluated, removed by
+         __DESCENT_BOOT__.done() on the first rendered frame. Sits under the
+         fatal-error overlays (z-index 9999+). */
+      #boot { position: fixed; inset: 0; z-index: 9000; background: #05070b; display: flex;
+              flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+              color: #cfd8e3; transition: opacity 200ms ease; }
+      #boot.done { opacity: 0; pointer-events: none; }
+      #boot h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: 0.42em;
+                 text-indent: 0.42em; color: #e8eef6; }
+      #boot .track { position: relative; width: min(260px, 70vw); height: 4px; border-radius: 2px;
+                     background: rgba(207, 216, 227, 0.14); overflow: hidden; }
+      #boot .fill { position: absolute; inset: 0; border-radius: 2px; background: #7fb4ff;
+                    transform: scaleX(0); transform-origin: 0 50%;
+                    transition: transform 240ms linear; }
+      /* Compositor-driven shimmer: keeps moving even while the main thread is
+         blocked inside a generation pass. */
+      #boot .shine { position: absolute; inset: 0; width: 40%;
+                     background: linear-gradient(90deg, transparent, rgba(232, 238, 246, 0.35), transparent);
+                     animation: boot-shine 1.2s linear infinite; }
+      @keyframes boot-shine { from { transform: translateX(-100%); } to { transform: translateX(350%); } }
+      #boot .status { font-size: 12px; letter-spacing: 0.08em; opacity: 0.75; min-height: 1em; }
+      #boot .pct { font-size: 12px; font-variant-numeric: tabular-nums; opacity: 0.55; }
     </style>
   </head>
   <body>
     <div id="app"></div>
+    <div id="boot">
+      <h1>DESCENT</h1>
+      <div class="track"><div class="fill"></div><div class="shine"></div></div>
+      <div class="status"></div>
+      <div class="pct">0%</div>
+    </div>
+    <script>
+      // Boot progress API. A classic script on purpose: Vite leaves it inline in
+      // the built index.html, and it runs before the blocking /sdk.js request.
+      (function () {
+        var ru = false;
+        try {
+          var lang = localStorage.getItem('descent.lang') || navigator.language || '';
+          ru = /^ru/i.test(lang);
+        } catch (e) { /* private mode */ }
+        var STR = ru ? {
+          world: 'Генерация рельефа', trail: 'Прокладка трассы', carve: 'Врезка трассы в склон',
+          chunks: 'Сборка геометрии', detail: 'Детали трассы', dress: 'Растительность и небо',
+          ui: 'Интерфейс', fx: 'Компиляция шейдеров', boot: 'Загрузка',
+        } : {
+          world: 'Generating terrain', trail: 'Routing the trail', carve: 'Carving the hillside',
+          chunks: 'Building geometry', detail: 'Trail details', dress: 'Vegetation and sky',
+          ui: 'Interface', fx: 'Compiling shaders', boot: 'Loading',
+        };
+        var root = document.getElementById('boot');
+        var fill = root.querySelector('.fill');
+        var status = root.querySelector('.status');
+        var pctEl = root.querySelector('.pct');
+        var best = 0;
+        status.textContent = STR.boot;
+        // (t ms, fraction) pairs + the removal time — the QA pass reads this to
+        // check the bar kept moving instead of sitting on one long stall.
+        var trace = window.__BOOT_TRACE__ = { steps: [], doneAt: 0 };
+        window.__DESCENT_BOOT__ = {
+          set: function (frac, key) {
+            if (!root) return;
+            var f = Math.max(best, Math.min(1, Number(frac) || 0));
+            best = f;
+            fill.style.transform = 'scaleX(' + f.toFixed(4) + ')';
+            pctEl.textContent = Math.round(f * 100) + '%';
+            if (key && STR[key]) status.textContent = STR[key];
+            trace.steps.push([Math.round(performance.now()), Math.round(f * 1000) / 1000]);
+          },
+          done: function () {
+            if (!root) return;
+            var el = root; root = null;
+            trace.doneAt = Math.round(performance.now());
+            el.classList.add('done');
+            setTimeout(function () { el.remove(); }, 250);
+          },
+          fail: function () {
+            if (!root) return;
+            var el = root; root = null;
+            el.remove();
+          },
+        };
+      })();
+    </script>
     <!-- Yandex Games SDK. Served by the platform from the game's own origin —
          an absolute yandex.ru URL 404s. A classic script, so it is settled before
          the deferred module below runs; off-platform it simply fails and YaGames
