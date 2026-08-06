@@ -1069,17 +1069,22 @@ export function createAudio(ctx) {
     }
     // Air/oil rush through the damper.
     grain(t, 260 + rng() * 160, 1.1, amp * 0.55, 0.10, pan, 0.55 + rng() * 0.3, SEND_MECH);
-    // Bottom-out clank suppressed while a recorded take plays: its sine
-    // partials ring like chimes on top of real foley (a landing slams the
-    // suspension in the same instant the impact take fires).
-    if (hard > 0.02 && impactSmpCool <= 0) {
-      // Bottom-out: three inharmonic partials plus a bright transient. Inharmonic
-      // ratios (not 2:3:4) are what make it read as struck alloy rather than a note.
-      const a = amp * hard;
-      metalPing(t, 1180, a * 0.5, 0.13, pan, SEND_MECH);
-      metalPing(t + 0.002, 1830, a * 0.34, 0.10, pan, SEND_MECH);
-      metalPing(t + 0.004, 2870, a * 0.22, 0.075, pan, SEND_MECH);
-      grain(t, 3600, 2.0, a * 0.5, 0.045, pan, 1.6, SEND_MECH);
+    if (hard > 0.02) {
+      // Bottom-out: a recorded damped clank when decoded — a real mechanical
+      // thump that layers fine with the impact foley, unlike the synthesised
+      // pings, which stay fallback-only and never over a recording.
+      const cb = sfxPick('clank');
+      if (cb) {
+        sample(t + 0.002, cb, clamp(amp * hard * 1.6, 0, 0.5), 0.9 + rng() * 0.2, pan, 0);
+      } else if (impactSmpCool <= 0) {
+        // Three inharmonic partials plus a bright transient. Inharmonic
+        // ratios (not 2:3:4) are what make it read as struck alloy rather than a note.
+        const a = amp * hard;
+        metalPing(t, 1180, a * 0.5, 0.13, pan, SEND_MECH);
+        metalPing(t + 0.002, 1830, a * 0.34, 0.10, pan, SEND_MECH);
+        metalPing(t + 0.004, 2870, a * 0.22, 0.075, pan, SEND_MECH);
+        grain(t, 3600, 2.0, a * 0.5, 0.045, pan, 1.6, SEND_MECH);
+      }
     }
   }
 
@@ -1138,6 +1143,13 @@ export function createAudio(ctx) {
    */
   function chainSlap(t, amp, pan) {
     if (!started || amp < 0.01) return;
+    // A recorded chain-against-frame snap when decoded; the synthesised ping
+    // stack below is the fallback (its sine partials read as chimes).
+    const b = sfxPick('chain_slap');
+    if (b) {
+      sample(t, b, clamp(amp * 2.4, 0, 0.5), 0.88 + rng() * 0.28, pan, 0);
+      return;
+    }
     const detune = 0.92 + rng() * 0.18;
     metalPing(t, 1420 * detune, amp * 0.55, 0.075, pan, SEND_MECH);
     metalPing(t + 0.0015, 2130 * detune, amp * 0.42, 0.055, pan, SEND_MECH);
@@ -1297,10 +1309,13 @@ export function createAudio(ctx) {
     }
     grunt(t + 0.02, 0.85 + erng() * 0.15, true);
     duck(0.75, 0.05, 1.6);
-    // The descending "you lost the run" dyad reads as chimes-with-reverb ON TOP
-    // of the crash — with a real foley take playing it IS the perceived crash
-    // sound, and a wrong one. UI cue only for the synthesised fallback.
-    if (!cs) uiFall(t + 0.10);
+    // "You lost the run" cue: the recorded descending notes, half a second
+    // after the hit so they read as a comment, not as part of the crash. The
+    // old synthesised dyad (chimes-with-reverb over the foley) stays
+    // fallback-only.
+    const uf = sfxPick('ui_fall');
+    if (uf) sample(t + 0.5, uf, 0.2, 1, 0, 0);
+    else if (!cs) uiFall(t + 0.10);
   }
 
   /**
@@ -1634,10 +1649,15 @@ export function createAudio(ctx) {
       duck(0.3, 0.08, 1.2);
     });
 
-    // trick:landed deliberately has NO sound. The pentatonic bell that used to
-    // ring here landed in the same instant as the impact foley and read as a
-    // metallic "pot" overtone on every jump — the style meter on the HUD is
-    // feedback enough.
+    on('trick:landed', (p) => {
+      if (!started) return;
+      const q = clamp01((p && (p.quality !== undefined ? p.quality : p.score / 500)) || 0.6);
+      // Recorded UI pluck only. NO synth fallback: the old pentatonic bell
+      // landed in the same instant as the impact foley and read as a metallic
+      // "pot" overtone on every jump.
+      const b = sfxPick('ui_trick');
+      if (b) sample(now() + 0.01, b, 0.16 + q * 0.1, 0.96 + q * 0.08, 0, 0);
+    });
 
     on('water:splash', (p) => {
       if (!started || !p) return;
@@ -1938,9 +1958,14 @@ export function createAudio(ctx) {
           const hard = clamp01((depth - 0.86) / 0.14) * clamp01((v - 1.1) / 2.0);
           thunk(t, amp, isFork ? 78 : 62, hard, isFork ? -0.14 : 0.10);
           thunkCool = 0.055 + rng() * 0.03;
-          // No frame-ring pings and no hard-compression chain slap here any
-          // more: their sine partials chimed over every landing ("pot lid"),
-          // and the landing itself is carried by the impact foley now.
+          // A hard compression always throws the chain — a recorded slap via
+          // chainSlap() (which falls back to synth pings only when nothing is
+          // decoded). The old separate frame-ring pings stay gone: the clank
+          // take inside thunk() covers the bottom-out.
+          if (amp > 0.11 && slapCool <= 0) {
+            chainSlap(t + 0.008, amp * 0.85, 0.18);
+            slapCool = 0.075 + rng() * 0.06;
+          }
         }
       }
       // Rebound whoosh: the shock extending fast out of a deep stroke.
@@ -1966,9 +1991,14 @@ export function createAudio(ctx) {
         slapCool = 0.05 + rng() * 0.09;
       }
     }
-    // Airborne chain rattle removed: random chain-slap pings during every
-    // flight read as loose chimes, not as a bike. Flight is voiced by wind
-    // and the freehub buzz alone.
+    // Airborne: the chain rattles freely as the bike unloads. Recorded rattle
+    // snippets only — the old synthesised slap pings read as loose chimes, so
+    // with nothing decoded the flight stays wind-and-freehub.
+    if (S.airborne > 0.6 && slapCool <= 0 && rng() < d * 3.5) {
+      const rb = sfxPick('rattle');
+      if (rb) sample(t, rb, 0.10 + rng() * 0.08, 0.85 + rng() * 0.3, (rng() - 0.5) * 0.5, 0);
+      slapCool = 0.12 + rng() * 0.15;
+    }
 
     // ---- freehub -----------------------------------------------------------
     // Click rate = ratchet engagements per second. Real hubs sit between about

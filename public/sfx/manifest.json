@@ -113,6 +113,149 @@
       "gain": 0
     },
     {
+      "id": "chain_slap_01",
+      "kind": "chain_slap",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "chain_slap_01.ogg",
+        "aac": "chain_slap_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "chain_slap_02",
+      "kind": "chain_slap",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "chain_slap_02.ogg",
+        "aac": "chain_slap_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "clank_01",
+      "kind": "clank",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "clank_01.ogg",
+        "aac": "clank_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "clank_02",
+      "kind": "clank",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "clank_02.ogg",
+        "aac": "clank_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "ui_trick_01",
+      "kind": "ui_trick",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "ui_trick_01.ogg",
+        "aac": "ui_trick_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "ui_trick_02",
+      "kind": "ui_trick",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "ui_trick_02.ogg",
+        "aac": "ui_trick_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "ui_fall_01",
+      "kind": "ui_fall",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "ui_fall_01.ogg",
+        "aac": "ui_fall_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "ui_fall_02",
+      "kind": "ui_fall",
+      "role": "oneshot",
+      "priority": 0,
+      "files": {
+        "opus": "ui_fall_02.ogg",
+        "aac": "ui_fall_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "rattle_01",
+      "kind": "rattle",
+      "role": "oneshot",
+      "priority": 1,
+      "files": {
+        "opus": "rattle_01.ogg",
+        "aac": "rattle_01.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "rattle_02",
+      "kind": "rattle",
+      "role": "oneshot",
+      "priority": 1,
+      "files": {
+        "opus": "rattle_02.ogg",
+        "aac": "rattle_02.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "rattle_03",
+      "kind": "rattle",
+      "role": "oneshot",
+      "priority": 1,
+      "files": {
+        "opus": "rattle_03.ogg",
+        "aac": "rattle_03.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "rattle_04",
+      "kind": "rattle",
+      "role": "oneshot",
+      "priority": 1,
+      "files": {
+        "opus": "rattle_04.ogg",
+        "aac": "rattle_04.m4a"
+      },
+      "gain": 0
+    },
+    {
+      "id": "rattle_05",
+      "kind": "rattle",
+      "role": "oneshot",
+      "priority": 1,
+      "files": {
+        "opus": "rattle_05.ogg",
+        "aac": "rattle_05.m4a"
+      },
+      "gain": 0
+    },
+    {
       "id": "wind",
       "kind": "wind",
       "role": "loop",
