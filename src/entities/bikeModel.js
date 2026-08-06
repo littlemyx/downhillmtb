@@ -3657,8 +3657,12 @@ export function createBikeModel(ctx) {
     // ---- cranks -----------------------------------------------------------
     const pedalling = s.pedalling || 0;
     if (pedalling > 0.02 && wr) {
-      // Chain-driven: cadence follows the rear wheel through the gear.
-      crankOmega = wr.spinRate * gearRatio;
+      // Chain-driven: cadence follows the rear wheel through the gear — but
+      // capped. An unloaded rear wheel (airborne, or spinning up on loose dirt)
+      // is clamped at ±260 rad/s in the physics, which through the gear would be
+      // a ~1400 rpm cadence. Legs cannot do that; 13 rad/s ≈ 125 rpm is already
+      // a flat-out sprint.
+      crankOmega = clamp(wr.spinRate * gearRatio, -13, 13);
       crankAngle -= crankOmega * ad;
     } else {
       // Coasting: a downhill rider parks the cranks level. Ease to whichever
