@@ -961,6 +961,18 @@ export function createAudio(ctx) {
   // "is the recording actually playing, or am I hearing the fallback?"
   let dbgLastSfx = 'none';
 
+  /**
+   * True once any Suno sample is decoded — the cue to run the whole bike
+   * mechanics dry. Small hits below the sample threshold, suspension thunks
+   * and rebounds all used to carry convolver sends tuned for the synthesised
+   * era; next to dry recordings that share reads as "everything echoes"
+   * (most audible ploughing into an uphill: a burst of tiny impacts and
+   * compressions, each with its own puff of reverb).
+   */
+  function sfxReady() {
+    return !!(sfxLoader && sfxLoader.decodedCount > 0);
+  }
+
   /** Random decoded Suno sample of `kind`, or null (procedural fallback). */
   function sfxPick(kind) {
     const buf = sfxLoader ? sfxLoader.pick(kind, erng()) : null;
@@ -1052,9 +1064,9 @@ export function createAudio(ctx) {
       osc.type = 'triangle';
       if (claimVoice(osc)) {
         osc.connect(b.lp);
-        // Dry while a recorded landing take is playing — low triangle through
-        // the convolver is exactly the "room" the samples are trying to avoid.
-        b.send.gain.value = impactSmpCool > 0 ? 0 : SEND_MECH;
+        // Dry in the sample era — low triangle through the convolver is
+        // exactly the "room" the recordings are trying to avoid.
+        b.send.gain.value = (impactSmpCool > 0 || sfxReady()) ? 0 : SEND_MECH;
         pset(b.lp.frequency, lowHz * 6);
         b.pan.pan.value = clamp(pan || 0, -1, 1);
         osc.frequency.setValueAtTime(lowHz * 1.9, t);
@@ -1070,7 +1082,7 @@ export function createAudio(ctx) {
       }
     }
     // Air/oil rush through the damper.
-    grain(t, 260 + rng() * 160, 1.1, amp * 0.55, 0.10, pan, 0.55 + rng() * 0.3, impactSmpCool > 0 ? 0 : SEND_MECH);
+    grain(t, 260 + rng() * 160, 1.1, amp * 0.55, 0.10, pan, 0.55 + rng() * 0.3, (impactSmpCool > 0 || sfxReady()) ? 0 : SEND_MECH);
     if (hard > 0.02) {
       // Bottom-out: a recorded damped clank when decoded — a real mechanical
       // thump that layers fine with the impact foley, unlike the synthesised
@@ -1100,7 +1112,7 @@ export function createAudio(ctx) {
     src.playbackRate.value = 0.85 + rng() * 0.3;
     if (!claimVoice(src)) return;
     src.connect(v.bp);
-    v.send.gain.value = SEND_MECH;
+    v.send.gain.value = sfxReady() ? 0 : SEND_MECH;
     v.pan.pan.value = clamp(pan || 0, -1, 1);
     pset(v.bp.Q, 1.3);
     v.bp.frequency.cancelScheduledValues(t);
@@ -1190,9 +1202,9 @@ export function createAudio(ctx) {
     const smp = (sev > 0.12 && !smpActive)
       ? sfxPick(sev > 0.45 ? 'impact_hard' : 'impact_soft') : null;
     const sup = (smp || smpActive) ? 0.3 : 1;
-    // Zero send in the sample era: even a 5% share of the convolver return
-    // reads as room on a dry recording.
-    const sendHit = (smp || smpActive) ? 0 : SEND_HIT;
+    // Zero send in the sample era — including the tiny hits (sev <= 0.12)
+    // that never trigger a sample: even a small convolver share reads as room.
+    const sendHit = (smp || smpActive || sfxReady()) ? 0 : SEND_HIT;
 
     // --- low body drop -------------------------------------------------------
     const b = takeBody(t);
