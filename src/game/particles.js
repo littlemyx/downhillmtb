@@ -2135,7 +2135,16 @@ export function createParticles(ctx) {
     refreshLighting();
     tracks.uniforms.uTime.value = elapsed;
 
-    try { emit(d); } catch (err) { /* never let an effect kill the frame */ }
+    // bike.js holds its sim while the run is held (paused / menu / finished) but
+    // publishes its last live state — emitting from that state sprays roost and
+    // dust out of a bike that is not moving. Existing particles still settle.
+    const gp = (c && c.gameplay) || ctx.gameplay;
+    const mode = gp && gp.state;
+    const simFrozen = mode === 'paused' || mode === 'menu' || mode === 'finished';
+
+    if (!simFrozen) {
+      try { emit(d); } catch (err) { /* never let an effect kill the frame */ }
+    }
 
     drawn = 0;
     for (let i = 0; i < systemList.length; i++) {

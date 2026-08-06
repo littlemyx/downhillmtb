@@ -3638,9 +3638,15 @@ export function createBikeModel(ctx) {
     poseSuspension(ft, st);
 
     // ---- wheel spin -------------------------------------------------------
+    // bike.js holds its sim while the run is held (paused / menu / finished) but
+    // wheels[].spinRate keeps its last live value — integrating it with real dt
+    // would keep the wheels of a frozen bike spinning. Pose above still tracks.
+    const gp = context && context.gameplay;
+    const gmode = gp && gp.state;
+    const ad = (gmode === 'paused' || gmode === 'menu' || gmode === 'finished') ? 0 : d;
     const wf = s.wheels && s.wheels[0], wr = s.wheels && s.wheels[1];
-    spinFront += (wf ? wf.spinRate : 0) * d;
-    spinRear += (wr ? wr.spinRate : 0) * d;
+    spinFront += (wf ? wf.spinRate : 0) * ad;
+    spinRear += (wr ? wr.spinRate : 0) * ad;
     // Keep the accumulator bounded — at 90 rad/s an unbounded float loses
     // precision in a few minutes and the wheel starts to judder.
     if (spinFront > 1e4 || spinFront < -1e4) spinFront %= Math.PI * 2;
@@ -3653,13 +3659,13 @@ export function createBikeModel(ctx) {
     if (pedalling > 0.02 && wr) {
       // Chain-driven: cadence follows the rear wheel through the gear.
       crankOmega = wr.spinRate * gearRatio;
-      crankAngle -= crankOmega * d;
+      crankAngle -= crankOmega * ad;
     } else {
       // Coasting: a downhill rider parks the cranks level. Ease to whichever
       // level position is closer so the feet never swing through the arc.
       crankOmega = 0;
       const target = Math.round(crankAngle / Math.PI) * Math.PI;
-      crankAngle = damp(crankAngle, target, 5.0, d);
+      crankAngle = damp(crankAngle, target, 5.0, ad);
     }
     if (crankAngle > 1e4 || crankAngle < -1e4) crankAngle %= Math.PI * 2;
     crankPivot.rotation.x = crankAngle;
@@ -3671,7 +3677,7 @@ export function createBikeModel(ctx) {
     // ---- chain -------------------------------------------------------------
     // The chain is driven by the chainring, so it only moves when you pedal —
     // exactly like the real thing, where coasting leaves the chain still.
-    chainOffset += crankOmega * chainringR * d;
+    chainOffset += crankOmega * chainringR * ad;
     if (chainOffset > 1e4 || chainOffset < -1e4) chainOffset = 0;
     poseChain();
 

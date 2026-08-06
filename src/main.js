@@ -168,6 +168,14 @@ async function boot() {
     if (typeof s.resize === 'function') resizables.push([name, s]);
   }
 
+  // While the run is held, everything that animates off bike.state must hold with
+  // it. bike.js freezes its sim on pause, but it publishes the LAST LIVE state —
+  // speed, wheel spinRate, slip — so any module integrating that state with real
+  // dt keeps moving: wheels spin in place, the camera keeps its speed shake, and
+  // particles roost from the frozen contact patch for the whole pause. Input,
+  // gameplay (it un-pauses), UI and audio (it ducks itself) stay live.
+  const HELD_WHILE_PAUSED = new Set(['bike', 'bikeModel', 'rider', 'particles', 'chaseCamera']);
+
   function onResize() {
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
@@ -204,12 +212,15 @@ async function boot() {
     ctx.time += dt;
     ctx.frame++;
 
+    const held = !!(ctx.gameplay && ctx.gameplay.state === 'paused');
     for (const [name, s] of updatables) {
+      if (held && HELD_WHILE_PAUSED.has(name)) continue;
       try { s.update(dt, ctx); } catch (e) {
         if (!frameErrLogged.has(name)) { frameErrLogged.add(name); console.error(`[update] ${name}`, e); window.__DESCENT_ERRORS__.push({ module: `${name}.update`, message: String(e && e.message || e) }); }
       }
     }
     for (const [name, s] of lateUpdatables) {
+      if (held && HELD_WHILE_PAUSED.has(name)) continue;
       try { s.lateUpdate(dt, ctx); } catch (e) {
         if (!frameErrLogged.has(name + ':late')) { frameErrLogged.add(name + ':late'); console.error(`[lateUpdate] ${name}`, e); window.__DESCENT_ERRORS__.push({ module: `${name}.lateUpdate`, message: String(e && e.message || e) }); }
       }
