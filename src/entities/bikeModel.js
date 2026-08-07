@@ -815,6 +815,10 @@ function makeFinishMaterial(maps, normalScale, shared) {
     roughnessMap: maps ? maps.rough : null,
     envMapIntensity: 1.0,
     dithering: true,
+    // The FP chest camera looks at the cockpit from above-behind — angles no
+    // outside camera ever hits. Open tube ends (stem, clamps, crown) read as
+    // x-ray holes with front-face culling, so the bike renders double-sided.
+    side: THREE.DoubleSide,
   });
   if (mat.normalScale) mat.normalScale.set(normalScale, normalScale);
   return patchBikeMaterial(mat, shared);

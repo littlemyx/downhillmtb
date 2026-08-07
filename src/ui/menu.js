@@ -800,6 +800,9 @@ export function createMenu(ctx) {
   if (ctx && ctx.settings) {
     ctx.settings.fpsCap = settings.fpsCap;
     ctx.settings.pixelRatio = settings.renderScale;
+    // Gameplay reads this when a run starts (any start path, including the
+    // Escape-at-title shortcut that never goes through startRun below).
+    ctx.settings.cameraMode = settings.camera;
   }
 
   function saveSettings() {
@@ -825,6 +828,7 @@ export function createMenu(ctx) {
         if (ctx && typeof ctx.setQuality === 'function') ctx.setQuality(value);
         break;
       case 'camera':
+        if (ctx && ctx.settings) ctx.settings.cameraMode = value;
         if (ctx && ctx.chaseCamera && typeof ctx.chaseCamera.setMode === 'function') ctx.chaseCamera.setMode(value);
         break;
       case 'invertLook':

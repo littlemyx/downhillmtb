@@ -683,6 +683,9 @@ export function createGameplay(ctx) {
     prevState = state;
     state = next;
     stateTime = 0;
+    // Back at the title, the shot-list cinematic owns the camera again; the
+    // manual override only means "my choice, for this session's riding".
+    if (next === 'menu') manualCameraOverride = false;
     api.state = next;
     evStateChange.from = prevState;
     evStateChange.to = next;
@@ -699,7 +702,12 @@ export function createGameplay(ctx) {
     try {
       if (s === 'menu') cam.setMode('cinematic');
       else if (s === 'finished') cam.setMode('chaseFar');
-      else if (s === 'running' || s === 'countdown' || s === 'crashed') cam.setMode('chase');
+      else if (s === 'running' || s === 'countdown' || s === 'crashed') {
+        // The persisted settings choice, when there is one — cinematic makes
+        // no sense as a riding camera, so it falls back to chase.
+        const pref = ctx.settings && ctx.settings.cameraMode;
+        cam.setMode(pref && pref !== 'cinematic' ? pref : 'chase');
+      }
     } catch (e) { /* camera module is someone else's problem */ }
   }
 
@@ -1719,7 +1727,9 @@ export function createGameplay(ctx) {
 
     // ---- discrete input (edge-triggered by input.js, one frame each) -------
     if (input) {
-      if (input.cameraCycle) manualCameraOverride = true;
+      // A C press with the title menu open cycles nothing visible — it must
+      // not silently disable the cinematic for the rest of the session.
+      if (input.cameraCycle && state !== 'menu') manualCameraOverride = true;
       // R — always a full restart, whatever state we are in. bike.js consumes
       // the same edge and resets itself to the gate, so the two agree.
       if (input.reset && !edgeReset) restart();

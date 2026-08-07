@@ -450,6 +450,8 @@ export function createAudio(ctx) {
   let thunkCool = 0, reboundCool = 0, slapCool = 0;
   let grainAcc = 0, birdTimer = 3.5, bloopTimer = 2.0;
   let envTimer = 0, creekTimer = 0, crashCool = 0;
+  // Helmet-cam wind emphasis, damped so a camera cycle never steps the gain.
+  let fpWind = 1;
   let runTime = 0;
   let lastCheckpoint = 0;
 
@@ -561,7 +563,11 @@ export function createAudio(ctx) {
     const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-3;
     // Camera right axis is the first basis column of the world matrix.
     const p = (dx * e[0] + dy * e[1] + dz * e[2]) / d;
-    _pan.pan = clamp(p * 1.25, -1, 1);
+    // Inside ~a metre the direction vector is numerically arbitrary (a helmet
+    // cam sits *on* the source), so the pan fades to centre rather than
+    // snapping to a random hard side. Full stereo returns beyond ~3 m.
+    const prox = clamp01((d - 0.8) / 2.2);
+    _pan.pan = clamp(p * 1.25, -1, 1) * prox * prox * (3 - 2 * prox);
     _pan.dist = d;
     const r = refDist || 6;
     _pan.gain = clamp01(r / (r + d * d * 0.06));
@@ -2066,7 +2072,12 @@ export function createAudio(ctx) {
     // ---- wind --------------------------------------------------------------
     // Gain and brightness both rise with speed; the stereo image opens as well,
     // so at speed the wind wraps around you instead of sitting in the middle.
-    const windAmp = Math.pow(S.speedN, 1.7) * 0.30 + S.speedN * 0.045;
+    // In first person the wind is the dominant speed cue — the bike sits under
+    // you instead of three metres ahead, so the balance shifts toward the air.
+    const cc = ctx && ctx.chaseCamera;
+    const fpT = (cc && cc.mode === 'firstPerson' && !cc.isPhotoMode) ? 1.18 : 1.0;
+    fpWind = damp(fpWind, fpT, 3, d);
+    const windAmp = (Math.pow(S.speedN, 1.7) * 0.30 + S.speedN * 0.045) * fpWind;
     const windHz = 320 + 1250 * S.speedN;
     // Sampled wind-rush loop: created once its buffer decodes, then driven by
     // the same speed curve. The synthesised bandpass wind stays underneath at
