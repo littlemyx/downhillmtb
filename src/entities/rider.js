@@ -3128,6 +3128,74 @@ export function createRider(ctx) {
   const { mats, windU } = buildMaterials(tex, ctx);
   let photoMats = null, photoOn = false;
 
+  // ---- first-person head hide ---------------------------------------------
+  // One shared uniform across every rider material (photo set included): the
+  // camera publishes its distance to the head each frame, and any vertex whose
+  // skin weight is dominated by neck/head/visor collapses to a point at the
+  // base of the neck. Collapsing in the *visible* materials only keeps the
+  // stock depth material untouched, so the helmet still casts its shadow —
+  // which is exactly what a real POV rig shows on the ground ahead.
+  const headHideU = { value: 0 };
+  function injectHeadHide(mat) {
+    const prev = mat.onBeforeCompile;
+    mat.onBeforeCompile = (sh, renderer) => {
+      if (prev) prev(sh, renderer);
+      sh.uniforms.uHeadHide = headHideU;
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', `#include <common>
+        uniform float uHeadHide;
+        varying float vArmHide;`)
+        .replace('#include <skinning_vertex>', `#include <skinning_vertex>
+        vArmHide = 0.0;
+        #ifdef USE_SKINNING
+        if (uHeadHide > 0.001) {
+          // Bones 0..8 and 11,12: trunk (pelvis and full spine), neck, head,
+          // visor, clavicles and upper arms. The FP near plane sits at 0.02 m
+          // and the lens is INSIDE the spine2 jersey, so the trunk has to go
+          // bone-by-bone. The upper arms go with it because the rig-follow in
+          // update() parks the ELBOWS just outside the bottom of frame — the
+          // discard isoline at the elbow is therefore off-screen, and the
+          // visible forearms (9,13) + hands (10,14) read as whole arms coming
+          // up from behind the camera. Hidden in the FRAGMENT stage only, and
+          // never by moving vertices — a partial vertex collapse renders as a
+          // crumpled jersey balloon right in front of the lens.
+          vec4 hb = vec4(1.0) - step(vec4(8.5), skinIndex)
+                  + step(vec4(10.5), skinIndex) - step(vec4(12.5), skinIndex);
+          vArmHide = uHeadHide * dot(max(hb, vec4(0.0)), skinWeight);
+        }
+        #endif`);
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying float vArmHide;')
+        .replace('#include <clipping_planes_fragment>',
+          'if (vArmHide > 0.5) discard;\n#include <clipping_planes_fragment>');
+    };
+    const prevKey = mat.customProgramCacheKey;
+    mat.customProgramCacheKey = prevKey
+      ? () => prevKey.call(mat) + '|headHide'
+      : () => mat.name + '|headHide';
+  }
+  for (const m of mats) injectHeadHide(m);
+
+  // Binary with hysteresis: hidden when the lens closes inside 1.0 m, shown
+  // again beyond 1.25 m. The discard is a hard cut, so the uniform must be a
+  // hard state too — a mid-fade value just slides the cut isoline through the
+  // shoulders. The FP chest camera sits ~0.5 m from the head, far inside the
+  // band, so impact shake never flickers it.
+  let headHidden = false;
+  function setHeadProximity(d) {
+    if (!isFinite(d)) headHidden = false;
+    else if (d < 1.0) headHidden = true;
+    else if (d > 1.25) headHidden = false;
+    headHideU.value = headHidden ? 1 : 0;
+    // The FP crop opens the hollow sleeve/short tubes at the discard isoline —
+    // with front-face culling those cuts read as holes straight through the
+    // arm. Render the kit's interior while cropped so the cut shows cloth
+    // lining instead. FrontSide again the moment the crop lifts; the helmet
+    // stays FrontSide always (see buildMaterials C1).
+    const side = headHidden ? THREE.DoubleSide : THREE.FrontSide;
+    for (const m of mats) if (m.name === 'riderKit' && m.side !== side) m.side = side;
+  }
+
   const group = new THREE.Group();
   group.name = 'rider';
 
@@ -3145,6 +3213,30 @@ export function createRider(ctx) {
   const skeleton = new THREE.Skeleton(rig.bones);
   mesh.bind(skeleton);
 
+  // ---- first-person shadow twin -------------------------------------------
+  // In first person the visible skeleton is dragged to the lens (rig follow in
+  // update()), and a stretched puppet shadow on the trail would give the trick
+  // away. This twin holds the UNMOVED pose and exists only for the shadow map:
+  // colorWrite/depthWrite are off, so the colour pass rasterises nothing.
+  const shadowBones = rig.bones.map((b) => { const n = new THREE.Bone(); n.name = b.name + 'Shadow'; return n; });
+  for (let i = 0; i < shadowBones.length; i++) {
+    if (rig.parent[i] >= 0) shadowBones[rig.parent[i]].add(shadowBones[i]);
+    shadowBones[i].position.copy(rig.bones[i].position);
+  }
+  const shadowMat = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false });
+  shadowMat.name = 'riderShadowProxy';
+  const shadowMesh = new THREE.SkinnedMesh(geo, shadowMat);
+  shadowMesh.name = 'riderShadow';
+  shadowMesh.castShadow = true;
+  shadowMesh.receiveShadow = false;
+  shadowMesh.frustumCulled = false;
+  shadowMesh.visible = false;
+  group.add(shadowBones[0]);
+  group.add(shadowMesh);
+  group.updateMatrixWorld(true);
+  const shadowSkeleton = new THREE.Skeleton(shadowBones);
+  shadowMesh.bind(shadowSkeleton);
+
   if (ctx.scene) ctx.scene.add(group);
 
   // Respect the shadow flag, including live quality changes.
@@ -3156,6 +3248,52 @@ export function createRider(ctx) {
   if (ctx.events && ctx.events.on) offQuality = ctx.events.on('quality:changed', applySettings);
 
   const rag = makeRagdoll(rig);
+
+  // First-person rig follow tuning. Head target relative to the LENS: slightly
+  // behind (-fwd) and above, which parks the shoulders behind the camera so the
+  // arms recede off-frame toward the bars. Each FP_LIMB is [root, mid, end]:
+  // root and mid travel rigidly with the trunk, end stays pinned to its anchor
+  // (grip / pedal) and the mid→end segment is re-aimed and stretched to reach.
+  const FP_BODY_FWD = -0.06;
+  const FP_BODY_UP = 0.30;
+  // Elbow parking spot in LENS space: behind the lens plane (invisible), below
+  // it and out to the side, so each forearm enters the frame from its lower
+  // corner and runs to the grip as one straight stretched tube. Keeping the
+  // bend angle small is what keeps linear-blend skinning from crumpling.
+  // Deep enough below/behind the frame that the elbow blend seam (hidden upper
+  // arm meets stretched forearm) never peeks into the bottom corners.
+  const FP_ELBOW_BACK = 0.24, FP_ELBOW_DOWN = 0.36, FP_ELBOW_OUT = 0.46;
+  const FP_LEGS = [
+    [B_THIGHL, B_SHINL, B_FOOTL], [B_THIGHR, B_SHINR, B_FOOTR],
+  ];
+  const fpCamL = new THREE.Vector3(), fpFwdL = new THREE.Vector3(),
+        fpRightL = new THREE.Vector3(), fpUpL = new THREE.Vector3();
+  // Forearm stretch plumbing: the forearm BONE is scaled along its own bind
+  // axis by writing the bone matrix directly (T*R*S with S an axial scale), so
+  // the sleeve genuinely elongates as one tube instead of leaving a skinning
+  // blend gap. The hand pre-multiplies the inverse scale so the glove keeps
+  // its shape. fpForeDir* are the bind-space forearm axes (bind rotations are
+  // identity, so bone-local == rider-local here).
+  const fpForeDir = [
+    new THREE.Vector3().subVectors(rig.restPos[B_HANDL], rig.restPos[B_LARML]).normalize(),
+    new THREE.Vector3().subVectors(rig.restPos[B_HANDR], rig.restPos[B_LARMR]).normalize(),
+  ];
+  const fpForeLen = [
+    rig.restPos[B_HANDL].distanceTo(rig.restPos[B_LARML]),
+    rig.restPos[B_HANDR].distanceTo(rig.restPos[B_LARMR]),
+  ];
+  const fpM0 = new THREE.Matrix4(), fpM1 = new THREE.Matrix4();
+  const fpOne = new THREE.Vector3(1, 1, 1);
+  const FP_SCALED_BONES = [B_LARML, B_HANDL, B_LARMR, B_HANDR];
+  function axialScale(out, d, k) {
+    const a = k - 1;
+    out.set(
+      1 + a * d.x * d.x, a * d.x * d.y, a * d.x * d.z, 0,
+      a * d.y * d.x, 1 + a * d.y * d.y, a * d.y * d.z, 0,
+      a * d.z * d.x, a * d.z * d.y, 1 + a * d.z * d.z, 0,
+      0, 0, 0, 1);
+    return out;
+  }
 
   // ---- persistent animation state (all preallocated) ----------------------
   const aGripL = new THREE.Vector3(), aGripR = new THREE.Vector3();
@@ -3622,10 +3760,14 @@ export function createRider(ctx) {
         .applyQuaternion(rig.worldQuat[B_SPINE3]);
       _v2.copy(rig.worldPos[iU]).addScaledVector(_v1, 0.72);
 
-      // Hand: fingers wrap the bar (long axis inboard), back of the hand follows
-      // the forearm so the wrist does not read as broken.
+      // Hand: fingers wrap the bar (long axis inboard). The roll reference must
+      // be the frame the glove was AUTHORED in — bike-up (the hand's restRef is
+      // +Y) — not the forearm direction: the forearm meets the wrist at ~140°
+      // to vertical, and using it rolled the whole grip top-and-backwards. Real
+      // hands stay wrapped around the bar however the elbows move.
       _v11.copy(bar);
-      solveLimb(iU, iL, iH, _v0, _v2, _v11, null);
+      _v9.set(0, 1, 0);
+      solveLimb(iU, iL, iH, _v0, _v2, _v11, _v9);
     }
 
     // ---- legs --------------------------------------------------------------
@@ -3679,6 +3821,122 @@ export function createRider(ctx) {
 
     writeBones();
 
+    // ---- first-person rig follow -------------------------------------------
+    // FP: the trunk is BOLTED to the lens. The pose above stays untouched in
+    // rig.worldPos/worldQuat — it is what the shadow twin shows and what
+    // getHeadPosition() feeds the camera, so there is no feedback loop between
+    // the camera spring and the body that follows it. The delta between the
+    // lens-mounted head target and the solved head is added to the THREE bones
+    // after writeBones(); hands and feet are counter-pinned to the bars and
+    // pedals, so the shoulders travel with the trunk and only the forearms and
+    // shins stretch — deliberately, joints be damned.
+    const cc = c.chaseCamera;
+    let followOn = false;
+    if (!photoOn && ragBlend < 0.01 && !rag.active && c.camera && cc &&
+        cc.mode === 'firstPerson' && !cc.blending) {
+      _v0.set(0, 0, -1).applyQuaternion(c.camera.quaternion);
+      _v0.y = 0;
+      if (_v0.lengthSq() > 1e-6) {
+        _v0.normalize();
+        // Head target in lens space: just behind and above the lens, so the
+        // shoulders sit BEHIND the camera and the arms recede out of frame
+        // instead of hanging in front of it.
+        _v1.copy(c.camera.position).addScaledVector(_v0, FP_BODY_FWD);
+        _v1.y += FP_BODY_UP;
+        getHeadPosition(_v2);
+        _v1.sub(_v2);                                  // world-space delta
+        if (_v1.lengthSq() < 4) {                      // sanity: < 2 m
+          followOn = true;
+          // Shadow twin freezes the unmoved pose before the drag.
+          for (let i = 0; i < NBONES; i++) {
+            shadowBones[i].position.copy(rig.bones[i].position);
+            shadowBones[i].quaternion.copy(rig.bones[i].quaternion);
+          }
+          _v1.applyQuaternion(invQ);                   // rider-local delta
+          rig.bones[B_PELVIS].position.add(_v1);
+          // Camera frame in rider-local space, for the elbow parking spots.
+          fpCamL.copy(c.camera.position).sub(group.position).applyQuaternion(invQ);
+          fpFwdL.copy(_v0).applyQuaternion(invQ);      // _v0 = lens fwd, horiz
+          _v2.set(0, 1, 0);
+          fpUpL.copy(_v2).applyQuaternion(invQ);
+          _v2.crossVectors(_v0, _v2).normalize();      // lens right, horiz
+          fpRightL.copy(_v2).applyQuaternion(invQ);
+          // Arms: shoulder rides with the trunk, elbow parks in LENS space just
+          // behind/below the frame corner, hand stays pinned to the grip. Both
+          // segments are re-aimed along their new directions so the stretch
+          // runs along the bone axis and the sleeve stays a clean tube.
+          for (let k = 0; k < 2; k++) {
+            const iC = k ? B_CLAVR : B_CLAVL, iU = k ? B_UARMR : B_UARML,
+                  iL = k ? B_LARMR : B_LARML, iH = k ? B_HANDR : B_HANDL;
+            _v2.copy(rig.worldPos[iU]).add(_v1);       // shoulder, moved
+            _v4.copy(rig.worldPos[iH]);                // hand, pinned
+            _v3.copy(fpCamL)
+              .addScaledVector(fpFwdL, -FP_ELBOW_BACK)
+              .addScaledVector(fpUpL, -FP_ELBOW_DOWN)
+              .addScaledVector(fpRightL, (k ? 1 : -1) * FP_ELBOW_OUT); // elbow target
+            // upper arm: aim shoulder -> elbow
+            _v5.copy(rig.worldPos[iL]).sub(rig.worldPos[iU]);
+            _v6.copy(_v3).sub(_v2);
+            if (_v5.lengthSq() < 1e-8 || _v6.lengthSq() < 1e-8) continue;
+            _qb.setFromUnitVectors(_v5.normalize(), _v6.normalize()).multiply(rig.worldQuat[iU]);
+            _q0.copy(rig.worldQuat[iC]).invert();
+            rig.bones[iU].quaternion.multiplyQuaternions(_q0, _qb);
+            _q0.copy(_qb).invert();
+            _v5.copy(_v3).sub(_v2).applyQuaternion(_q0);
+            rig.bones[iL].position.copy(_v5);
+            // forearm: aim elbow -> hand
+            _v5.copy(rig.worldPos[iH]).sub(rig.worldPos[iL]);
+            _v6.copy(_v4).sub(_v3);
+            if (_v5.lengthSq() < 1e-8 || _v6.lengthSq() < 1e-8) continue;
+            _qc.setFromUnitVectors(_v5.normalize(), _v6.normalize()).multiply(rig.worldQuat[iL]);
+            _q0.copy(_qb).invert();
+            rig.bones[iL].quaternion.multiplyQuaternions(_q0, _qc);
+            _q0.copy(_qc).invert();
+            _v5.copy(_v4).sub(_v3).applyQuaternion(_q0);
+            rig.bones[iH].position.copy(_v5);
+            rig.bones[iH].quaternion.multiplyQuaternions(_q0, rig.worldQuat[iH]);
+            // Stretch the forearm BONE along its bind axis so the sleeve mesh
+            // itself elongates to span elbow->hand; the glove pre-multiplies
+            // the inverse scale and keeps its shape.
+            const kS = Math.max(0.2, _v5.length() / Math.max(1e-4, fpForeLen[k]));
+            const bL = rig.bones[iL], bH = rig.bones[iH];
+            bL.matrixAutoUpdate = false; bH.matrixAutoUpdate = false;
+            fpM0.compose(bL.position, bL.quaternion, fpOne);
+            bL.matrix.multiplyMatrices(fpM0, axialScale(fpM1, fpForeDir[k], kS));
+            fpM0.compose(bH.position, bH.quaternion, fpOne);
+            bH.matrix.multiplyMatrices(axialScale(fpM1, fpForeDir[k], 1 / kS), fpM0);
+          }
+          // Legs: knee rides with the trunk, foot stays on the pedal; the shin
+          // is re-aimed at the pinned foot. Any blend crumple sits at the
+          // pedals, below the bottom edge of the FP frame.
+          for (let k = 0; k < FP_LEGS.length; k++) {
+            const iR = FP_LEGS[k][0], iM = FP_LEGS[k][1], iE = FP_LEGS[k][2];
+            _v2.copy(rig.worldPos[iM]).add(_v1);       // knee, moved
+            _v3.copy(rig.worldPos[iE]);                // foot, pinned
+            _v4.copy(_v3).sub(rig.worldPos[iM]);
+            _v5.copy(_v3).sub(_v2);
+            if (_v4.lengthSq() < 1e-8 || _v5.lengthSq() < 1e-8) continue;
+            _q1.setFromUnitVectors(_v4.normalize(), _v5.normalize()).multiply(rig.worldQuat[iM]);
+            _q0.copy(rig.worldQuat[iR]).invert();
+            rig.bones[iM].quaternion.multiplyQuaternions(_q0, _q1);
+            _q0.copy(_q1).invert();
+            _v3.sub(_v2).applyQuaternion(_q0);
+            rig.bones[iE].position.copy(_v3);
+            rig.bones[iE].quaternion.multiplyQuaternions(_q0, rig.worldQuat[iE]);
+          }
+        }
+      }
+    }
+    if (!followOn) {
+      for (let k = 0; k < FP_SCALED_BONES.length; k++) {
+        const b = rig.bones[FP_SCALED_BONES[k]];
+        if (!b.matrixAutoUpdate) b.matrixAutoUpdate = true;
+      }
+    }
+    const shadowsOn = !(c.settings && c.settings.shadows === false);
+    mesh.castShadow = followOn ? false : shadowsOn;
+    shadowMesh.visible = followOn && shadowsOn;
+
     // ---- cloth wind --------------------------------------------------------
     const windAmp = (0.006 + clamp01(speed / 24) * 0.032) * (1 - ragBlend * 0.5);
     windU.uWindAmp.value = damp(windU.uWindAmp.value, windAmp, 5, dtc);
@@ -3699,7 +3957,11 @@ export function createRider(ctx) {
     const want = !!on;
     if (want === photoOn) return;
     photoOn = want;
-    if (want && !photoMats) photoMats = buildPhotoMaterials(tex, mats);
+    if (want && !photoMats) {
+      photoMats = buildPhotoMaterials(tex, mats);
+      // The kit material is shared with the gameplay set and already injected.
+      for (const m of photoMats) if (mats.indexOf(m) < 0) injectHeadHide(m);
+    }
     mesh.material = want ? photoMats : mats;
   }
 
@@ -3710,6 +3972,8 @@ export function createRider(ctx) {
     if (photoMats) for (const m of photoMats) if (mats.indexOf(m) < 0) m.dispose();
     for (const k in tex) if (tex[k] && tex[k].dispose) tex[k].dispose();
     if (skeleton.dispose) skeleton.dispose();
+    if (shadowSkeleton.dispose) shadowSkeleton.dispose();
+    shadowMat.dispose();
     if (ctx.scene) ctx.scene.remove(group);
   }
 
@@ -3720,7 +3984,7 @@ export function createRider(ctx) {
 
   return {
     group, mesh, skeleton, bones: rig.bones, materials: mats,
-    update, dispose, getHeadPosition, setPhotoMode,
+    update, dispose, getHeadPosition, setHeadProximity, setPhotoMode,
     isRagdoll: () => rag.active,
     drivers: D,
   };

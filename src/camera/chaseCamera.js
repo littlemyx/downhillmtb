@@ -206,11 +206,29 @@ const RIGS = {
   firstPerson: {
     dist: 0, distSpeed: 0, height: 0, heightSpeed: 0,
     flow: 0.30, flowAir: 0.10, lookMix: 0.36, lookMixSpeed: 0.20,
-    side: 0, lookSide: 0.9, roll: 0.46,
+    side: 0, lookSide: 0.9, roll: 0.40,
     azOff: 0, azCurve: 0,
-    fovOff: 10, fovSpan: 14,
-    omegaPos: 26, omegaY: 22, omegaLook: 17, ff: 1.0,
-    shake: 1.35, noise: 1.25, clearance: 0.35, avoid: false, sweep: false,
+    // GoPro-wide on purpose: a wide lens is also what keeps the macro-range
+    // gloves small at the frame corners instead of filling the screen.
+    fovOff: 16, fovSpan: 10,
+    // Stiffer than chase on purpose: any lag between the head and the eye
+    // reads as swimming, and the authored bob shouldn't fight a slow spring.
+    omegaPos: 30, omegaY: 27, omegaLook: 17, ff: 1.0,
+    // The eye sits at zero lever arm from the impacts — raw impulses that read
+    // as "energy" three metres back read as nausea here.
+    shake: 0.85, noise: 0.95, clearance: 0.35, avoid: false, sweep: false,
+    // How much the mount is pulled off the animated rider head onto the rigid
+    // chassis frame. The rider rig absorbs bike motion through arms and spine,
+    // so a pure head mount floats on the body; a share of chassis keeps the
+    // camera coupled to the front end.
+    mount: 0.55,
+    // Direct fork-compression dip (fraction of travel) and the share of steer
+    // angle the view yaws with — both are what "bolted near the bars" reads as.
+    forkDip: 0.35, steerYaw: 0.20,
+    // Keep the bar centre no lower than this fraction of the lower half-FOV.
+    // The trail-pull lifts the gaze at speed and quietly pushes the whole
+    // cockpit out the bottom of frame; this is the floor under that.
+    barFrame: 0.85,
     // There is no hero to frame from inside the hero's own helmet.
     frameHero: false, leadScale: 0,
   },
@@ -826,6 +844,12 @@ export function createChaseCamera(ctx) {
 
   // ---- first person -------------------------------------------------------
   let bobPhase = 0;
+  // Landing dip: the rider's knees, not the camera spring. A sprung offset that
+  // takes a downward kick on the airborne→contact edge and recovers in ~0.4 s.
+  let fpWasAir = false, fpAirT = 0, dipY = 0, dipV = 0;
+  // Slow-tracked head offset in the chassis frame (up/forward/right components).
+  // This is what the rig.mount blend anchors to — see solveFirstPerson.
+  let fpMntU = 0, fpMntF = 0, fpMntR = 0, fpMntOk = false;
   const headPos = new THREE.Vector3();
 
   function solveFirstPerson(p, s, rig, dt) {
@@ -843,9 +867,32 @@ export function createChaseCamera(ctx) {
       if (isFinite(headPos.x) && headPos.distanceToSquared(s.position) < 9) gotHead = true;
     }
     if (!gotHead) {
+      // Approximates the head; the chest-mount offset below is applied on top.
       headPos.copy(s.position);
       headPos.addScaledVector(s.up, 1.28);
       headPos.addScaledVector(s.forward, 0.12);
+    } else if (rig.mount) {
+      // Pull the mount partway off the animated head onto the chassis frame —
+      // anchored to a SLOW-TRACKED copy of the head's chassis-frame offset, not
+      // a fixed point. A fixed point cannot match both the gate stance and the
+      // attack tuck (the head moves ~15 cm between them in the chassis frame),
+      // and the static error walks the eye into the hollow sleeve meshes.
+      // Sustained pose passes through; only the fast divergence — arms and
+      // spine soaking up chassis motion — is suppressed by the blend.
+      _v3.copy(headPos).sub(s.position);
+      const hu = _v3.dot(s.up), hf = _v3.dot(s.forward);
+      const hr = s.right ? _v3.dot(s.right) : 0;
+      if (!fpMntOk || Math.abs(hu - fpMntU) + Math.abs(hf - fpMntF) > 0.6) {
+        fpMntU = hu; fpMntF = hf; fpMntR = hr; fpMntOk = true;
+      } else {
+        const k = 1 - Math.exp(-dt / 0.35);
+        fpMntU += (hu - fpMntU) * k;
+        fpMntF += (hf - fpMntF) * k;
+        fpMntR += (hr - fpMntR) * k;
+      }
+      _v3.copy(s.position).addScaledVector(s.up, fpMntU).addScaledVector(s.forward, fpMntF);
+      if (s.right) _v3.addScaledVector(s.right, fpMntR);
+      if (isFinite(_v3.x)) headPos.lerp(_v3, rig.mount);
     }
 
     // Head bob: cadence from ground speed, amplitude from surface roughness and
@@ -854,20 +901,41 @@ export function createChaseCamera(ctx) {
     const rough = clamp01(s.roughness !== undefined ? s.roughness : 0.25);
     const contact = s.airborne ? 0 : 1;
     bobPhase += dt * (2.2 + speed * 0.55);
-    const bobAmp = contact * (0.008 + rough * 0.034) * (0.35 + sn * 0.9);
+    const bobAmp = contact * (0.007 + rough * 0.022) * (0.35 + sn * 0.9);
     const bobY = Math.sin(bobPhase) * bobAmp;
-    const bobX = Math.sin(bobPhase * 0.5 + 1.1) * bobAmp * 0.8;
+    const bobX = Math.sin(bobPhase * 0.5 + 1.1) * bobAmp * 0.6;
+
+    if (s.airborne) fpAirT = Math.max(fpAirT, s.airTime || 0);
+    if (fpWasAir && !s.airborne) {
+      dipV -= clamp(fpAirT / 0.9, 0.25, 1.0) * 1.6;
+      fpAirT = 0;
+    }
+    fpWasAir = !!s.airborne;
+    oscDecay(dipY, dipV, 16, 0.60, dt); dipY = _sx; dipV = _sv;
 
     _v0.copy(s.forward); _v0.y = 0;
     if (_v0.lengthSq() < 1e-6) _v0.set(0, 0, -1); else _v0.normalize();
+    // A bar-mounted camera yaws with the steering; a chest cam does not. Take a
+    // share so the cockpit leads into the turn. Sign matches the physics:
+    // + steer = right = negative yaw (bike.js steer solver).
+    if (rig.steerYaw) _v0.applyAxisAngle(_up, -(s.steer || 0) * rig.steerYaw);
     _right.crossVectors(_v0, _up).normalize();
 
     p.pos.copy(headPos);
-    p.pos.y += bobY;
+    p.pos.y += bobY + dipY;
+    // Fork compression reaches the eye directly — this is the high-frequency
+    // "front wheel just hit something" signal the rider rig otherwise absorbs.
+    const fork = s.suspension && s.suspension.fork;
+    if (fork && rig.forkDip) p.pos.addScaledVector(s.up, -(fork.travel || 0) * rig.forkDip);
     p.pos.addScaledVector(_right, bobX);
-    // A touch forward of the head so the bars and the front wheel enter the
-    // bottom of frame instead of the rider's own chest.
-    p.pos.addScaledVector(_v0, 0.10);
+    // Chest mount, not helmet mount. In the attack position the head hangs
+    // directly over the grips (measured: bars 0.03 m BEHIND the eyes, 0.54 m
+    // below) — no FOV shows the cockpit from up there. From the sternum the
+    // bars sit ~43° below the lens axis and enter the bottom of frame. The
+    // offset lives in the BIKE frame so pitching up a steep face keeps the
+    // lens on the sternum instead of drifting behind the rider's back.
+    p.pos.addScaledVector(s.forward, -0.34);
+    p.pos.addScaledVector(s.up, -0.22);
 
     // Riders look through the corner, so the helmet cam gets a share of the
     // trail tangent too — just less than the chase rig.
@@ -887,21 +955,45 @@ export function createChaseCamera(ctx) {
     p.look.copy(p.pos).addScaledVector(_fwd, 12);
     // Look down the hill, not at the horizon: a fixed drop plus the trail's own
     // gradient. This is what puts the bars in shot without faking geometry.
-    p.look.y -= 1.55 + clamp(-(s.forward ? s.forward.y : 0), -0.4, 0.8) * 5.0;
+    p.look.y -= 2.6 + clamp(-(s.forward ? s.forward.y : 0), -0.4, 0.8) * 5.0;
     if (trust > 0.01) {
       _v3.copy(_trPos); _v3.y += 1.1;
       p.look.lerp(_v3, (rig.lookMix + rig.lookMixSpeed * sn) * trust * 0.7);
     }
     p.look.addScaledVector(_right, curve * rig.lookSide);
 
+    const base = baseFov();
+    p.fov = base - 4 + rig.fovOff + Math.pow(sn, 1.1) * rig.fovSpan;
+
+    // The whole point of a helmet cam is that the bike is in shot. The
+    // trail-pull above lifts the gaze with speed, and past ~8 m/s it walks the
+    // entire cockpit out the bottom of frame — so after all the look shaping,
+    // pitch the gaze back down just enough to hold the bar centre at
+    // rig.barFrame of the lower half-FOV. Down only: at the gate the bars sit
+    // well inside the frame and this must not touch the shot.
+    const anch = rig.barFrame && ctx.bikeModel && ctx.bikeModel.anchors;
+    if (anch && anch.bar) {
+      anch.bar.getWorldPosition(_v3);
+      if (isFinite(_v3.x) && _v3.distanceToSquared(s.position) < 9) {
+        _v3.sub(p.pos);
+        const dB = _v3.length();
+        if (dB > 0.2) {
+          const pitchBar = Math.asin(clamp(_v3.y / dB, -1, 1));
+          _v3.copy(p.look).sub(p.pos);
+          const dL = _v3.length() || 1;
+          const pitchLook = Math.asin(clamp(_v3.y / dL, -1, 1));
+          const dpMax = Math.atan(Math.tan(p.fov * 0.5 * Math.PI / 180) * rig.barFrame);
+          const over = (pitchLook - pitchBar) - dpMax;
+          if (over > 0) p.look.y -= Math.tan(over) * dL;
+        }
+      }
+    }
+
     p.anchor.copy(p.pos);
     p.frameHero = false; p.heroR = HERO_R; p.leadX = 0; p.leadY = 0; p.fillMin = 0;
     // The helmet is bolted to the rider, so it takes more roll than the chase
     // rig — but still not all of it.
-    p.roll = clamp((s.lean || 0) * rig.roll, -0.45, 0.45);
-
-    const base = baseFov();
-    p.fov = base - 4 + rig.fovOff + Math.pow(sn, 1.1) * rig.fovSpan;
+    p.roll = clamp((s.lean || 0) * rig.roll, -0.38, 0.38);
 
     p.omegaPos = rig.omegaPos; p.omegaY = rig.omegaY;
     p.omegaLook = rig.omegaLook; p.ff = rig.ff;
@@ -1627,8 +1719,14 @@ export function createChaseCamera(ctx) {
   }
   function applyFov(v) {
     const f = clamp(v, 12, 120);
-    if (Math.abs(f - cam.fov) > 0.004) {
+    // First person puts the lens centimetres from the rider's own forearms, and
+    // the stock 0.1 m near plane saws visible slices off them. Pull it in for
+    // that rig only — tightening it globally would cost depth precision across
+    // an 8 km world for a problem only the helmet cam has.
+    const near = mode === 'firstPerson' ? 0.02 : 0.1;
+    if (Math.abs(f - cam.fov) > 0.004 || cam.near !== near) {
       cam.fov = f;
+      cam.near = near;
       cam.updateProjectionMatrix();
     }
   }
@@ -1742,6 +1840,19 @@ export function createChaseCamera(ctx) {
   // =========================================================================
   // FRAME
   // =========================================================================
+  // The rider hides its own head when the lens gets close (first person, or a
+  // photo-mode fly-through). Distance is the whole criterion: it covers the
+  // 0.6 s mode blend, the crash orbit pulling out to show the ragdoll, and
+  // hard cuts — all without knowing which mode asked. Runs after the camera is
+  // final for the frame, so a cut never flashes the helmet interior.
+  function publishHeadProximity() {
+    const r = ctx.rider;
+    if (!r || typeof r.setHeadProximity !== 'function' ||
+        typeof r.getHeadPosition !== 'function') return;
+    r.getHeadPosition(_v0);
+    r.setHeadProximity(isFinite(_v0.x) ? cam.position.distanceTo(_v0) : Infinity);
+  }
+
   function lateUpdate(rawDt, c) {
     if (!cam) return;
     const dt = clamp(rawDt || 0, 0, MAX_DT);
@@ -1757,13 +1868,15 @@ export function createChaseCamera(ctx) {
     photoEdge = pEdge;
 
     const cEdge = !!(inp && inp.cameraCycle);
-    if (cEdge && !cycleEdge && !photo) {
+    // No cycling out of the title cinematic: it is not in CYCLE, and a stray C
+    // on the menu screen should not replace the shot list with a chase cam.
+    if (cEdge && !cycleEdge && !photo && mode !== 'cinematic') {
       const i = CYCLE.indexOf(mode);
       setMode(i < 0 ? CYCLE[0] : CYCLE[(i + 1) % CYCLE.length]);
     }
     cycleEdge = cEdge;
 
-    if (photo) { updatePhoto(dt); return; }
+    if (photo) { updatePhoto(dt); publishHeadProximity(); return; }
 
     const s = bikeState();
     // Cached for constrain(): the trunk response only makes sense when there is a
@@ -1909,6 +2022,8 @@ export function createChaseCamera(ctx) {
 
     // ---- FOV ---------------------------------------------------------------
     updateFov(dt, s, pose);
+
+    publishHeadProximity();
 
     cam.updateMatrixWorld();
   }
