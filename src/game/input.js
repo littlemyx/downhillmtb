@@ -104,7 +104,7 @@ export function createInput(ctx) {
     let manual = held('KeyM');
 
     let reset = tapped('KeyR');
-    let pause = tapped('Escape', 'KeyP');
+    let pause = tapped('Escape');
     let cameraCycle = tapped('KeyC');
     let photoMode = tapped('KeyF');
     let anyKeyboard = down.size > 0;

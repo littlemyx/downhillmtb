@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>DESCENT — Downhill</title>
     <style>
-      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #05070b; }
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #05070b;
+                   -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
+                   -webkit-tap-highlight-color: transparent; }
       body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; }
@@ -45,6 +47,9 @@
       // Boot progress API. A classic script on purpose: Vite leaves it inline in
       // the built index.html, and it runs before the blocking /sdk.js request.
       (function () {
+        // Yandex Games § 1.6: no browser context menu anywhere in the game area
+        // (right click on desktop, long-press on touch).
+        document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
         var ru = false;
         try {
           var lang = localStorage.getItem('descent.lang') || navigator.language || '';
