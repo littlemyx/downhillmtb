@@ -117,6 +117,15 @@ combined.
   every tick, play at 30 fps → true 4×. Real time: `dt = 1/60`, capture every 2nd tick.
 - Bot camera: position behind the bike along the **velocity** direction (chassis forward
   at low speed), `lerp 0.14` smoothing, clamped above `terrain.sampleHeight`.
+- **Dust occlusion is the #1 footage killer.** The roost is thrown straight back along the
+  velocity (and *forward* under braking), so a dead-astern camera spends whole takes inside
+  the plume. `CAM.side` offsets the camera off the travel axis; raise `CAM.up` too. In
+  narrow gully segments (t≈0.95 finish) side cameras hide behind the berm walls instead —
+  there use a **front camera**: `CAM.back` negative (camera leads the rider, looking back),
+  e.g. `{ back: -9, side: 1.4, up: 2.4, lookAhead: 0.5, lookUp: 1.0 }` — the dust then
+  trails behind the rider and never enters the frame. Verified takes 2026-08-06:
+  chase `{ back: 7, side: ±2.4–2.6, up: 3.2–3.8 }` for open segments (berms/jumps/forest),
+  front cam for the finish gully.
 
 ## Takes and retries
 

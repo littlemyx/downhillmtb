@@ -246,7 +246,11 @@ function makeDriver(cap) {
 // =============================================================================
 // Bot camera — smoothed follow, aimed along velocity, never inside the hill
 // =============================================================================
-const CAM = { back: 6.5, up: 2.3, lookAhead: 9, lookUp: 0.9, lerp: 0.14, fov: 66, clearance: 0.5 };
+// `side` offsets the camera off the travel axis: the tyre roost is thrown straight back
+// along the velocity, so a dead-astern camera spends half the take inside the dust plume
+// (session 2026-08-06: whole takes lost to whiteout). Off-axis + higher keeps the rider
+// clear of the plume without touching the particle system.
+const CAM = { back: 7.0, side: 2.6, up: 3.2, lookAhead: 7, lookUp: 0.8, lerp: 0.14, fov: 66, clearance: 0.5 };
 
 function makeCamera() {
   const d = g();
@@ -261,9 +265,9 @@ function makeCamera() {
     if (v && (v.x * v.x + v.z * v.z) > 4) dir.set(v.x, 0, v.z).normalize();
     else { dir.set(0, 0, -1).applyQuaternion(b.quaternion); dir.y = 0; dir.normalize(); }
     const desired = V3(
-      b.position.x - dir.x * CAM.back,
+      b.position.x - dir.x * CAM.back + dir.z * CAM.side,
       b.position.y + CAM.up,
-      b.position.z - dir.z * CAM.back,
+      b.position.z - dir.z * CAM.back - dir.x * CAM.side,
     );
     const gy = d.terrain.sampleHeight(desired.x, desired.z);
     if (Number.isFinite(gy) && desired.y < gy + CAM.clearance) desired.y = gy + CAM.clearance;
@@ -345,8 +349,10 @@ export async function recordTake({ t, name, frames = 240, v0 = 9.5, cap = 12.5,
   const dt = slow > 1 ? 1 / (30 * slow) : 1 / 60;
   const ticksPerFrame = slow > 1 ? 1 : 2;
 
-  // warm frames: TAA / adaptive exposure / LOD settle before frame 0000
-  for (let i = 0; i < 10; i++) { tickGame(dt, drive); cam(); pin(); drawFrame(dt); }
+  // warm frames: TAA / adaptive exposure / LOD settle before frame 0000.
+  // 20, not 10 — at 10 the first captured frame still showed vegetation/LOD pop-in
+  // at freshly teleported-to spots (v2-forest, session 2026-08-06).
+  for (let i = 0; i < 20; i++) { tickGame(dt, drive); cam(); pin(); drawFrame(dt); }
 
   let crashedAt = -1;
   for (let f = 0; f < frames; f++) {
