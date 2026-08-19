@@ -433,12 +433,17 @@ const TIERS = {
     tetrahedralLUT: false,
   },
   medium: {
-    aoSamples: 12, aoDenoise: 4, aoDenoiseIterations: 1, aoHalfRes: true,
+    // Every shader-variant-generating knob here must equal its `high` or `low` counterpart,
+    // *including combinations*: N8AO over a non-multisampled composer buffer (ao on, msaa 0)
+    // was a configuration only medium ever ran, and ANGLE's GL translator turns it into a
+    // full-screen grey wash (silent — no compile error, no context loss). `high` proves
+    // ao+msaa2 and `low` proves no-ao+msaa0, so medium now runs the `high` combination.
+    aoSamples: 16, aoDenoise: 4, aoDenoiseIterations: 1, aoHalfRes: true,
     bloomLevels: 5,
     dofScale: 0.5,
-    mbSamples: 8,
-    smaa: SMAAPreset.MEDIUM,
-    msaa: 0,
+    mbSamples: 10,
+    smaa: SMAAPreset.HIGH,
+    msaa: 2,
     lutSize: 25,
     tetrahedralLUT: false,
   },
